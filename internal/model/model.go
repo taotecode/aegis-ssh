@@ -5,26 +5,25 @@ import "encoding/json"
 type Status string
 
 const (
-	StatusReady           Status = "ready"
-	StatusLocked          Status = "locked"
-	StatusPendingApproval Status = "pending_approval"
-	StatusApproved        Status = "approved"
-	StatusDenied          Status = "denied"
-	StatusSucceeded       Status = "succeeded"
-	StatusFailed          Status = "failed"
+	StatusReady            Status = "ready"
+	StatusLocked           Status = "locked"
+	StatusCompleted        Status = "completed"
+	StatusRequiresApproval Status = "requires_approval"
+	StatusDenied           Status = "denied"
+	StatusFailed           Status = "failed"
 )
 
 type ErrorCode string
 
 const (
-	ErrorAuthentication    ErrorCode = "authentication_failed"
-	ErrorHostKey           ErrorCode = "host_key_verification_failed"
-	ErrorTimeout           ErrorCode = "timeout"
-	ErrorUnavailableDaemon ErrorCode = "daemon_unavailable"
-	ErrorLockedVault       ErrorCode = "vault_locked"
-	ErrorValidation        ErrorCode = "validation_failed"
-	ErrorApproval          ErrorCode = "approval_failed"
-	ErrorAudit             ErrorCode = "audit_failed"
+	CodeAuthentication    ErrorCode = "authentication_failed"
+	CodeHostKey           ErrorCode = "host_key_verification_failed"
+	CodeTimeout           ErrorCode = "timeout"
+	CodeUnavailableDaemon ErrorCode = "daemon_unavailable"
+	CodeLockedVault       ErrorCode = "vault_locked"
+	CodeValidation        ErrorCode = "validation_failed"
+	CodeApproval          ErrorCode = "approval_failed"
+	CodeAudit             ErrorCode = "audit_failed"
 )
 
 type CodedError struct {
@@ -48,26 +47,26 @@ func (e *CodedError) MarshalJSON() ([]byte, error) {
 }
 
 var (
-	ErrAuthentication    = &CodedError{code: ErrorAuthentication, message: "authentication failed"}
-	ErrHostKey           = &CodedError{code: ErrorHostKey, message: "host key verification failed"}
-	ErrTimeout           = &CodedError{code: ErrorTimeout, message: "operation timed out"}
-	ErrUnavailableDaemon = &CodedError{code: ErrorUnavailableDaemon, message: "broker daemon unavailable"}
-	ErrLockedVault       = &CodedError{code: ErrorLockedVault, message: "credential vault is locked"}
-	ErrValidation        = &CodedError{code: ErrorValidation, message: "request validation failed"}
-	ErrApproval          = &CodedError{code: ErrorApproval, message: "request approval failed"}
-	ErrAudit             = &CodedError{code: ErrorAudit, message: "audit operation failed"}
+	ErrAuthentication    = &CodedError{code: CodeAuthentication, message: "authentication failed"}
+	ErrHostKey           = &CodedError{code: CodeHostKey, message: "host key verification failed"}
+	ErrTimeout           = &CodedError{code: CodeTimeout, message: "operation timed out"}
+	ErrUnavailableDaemon = &CodedError{code: CodeUnavailableDaemon, message: "broker daemon unavailable"}
+	ErrLockedVault       = &CodedError{code: CodeLockedVault, message: "credential vault is locked"}
+	ErrValidation        = &CodedError{code: CodeValidation, message: "request validation failed"}
+	ErrApproval          = &CodedError{code: CodeApproval, message: "request approval failed"}
+	ErrAudit             = &CodedError{code: CodeAudit, message: "audit operation failed"}
 )
 
 type ExecuteRequest struct {
-	Server         string `json:"server"`
+	ServerAlias    string `json:"server_alias"`
 	Command        string `json:"command"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 	MaxOutputBytes int64  `json:"max_output_bytes,omitempty"`
 }
 
 type ApprovedRequest struct {
-	Request  ExecuteRequest `json:"request"`
-	Approval ApprovalInfo   `json:"approval"`
+	ApprovalID   string `json:"approval_id"`
+	ApprovalCode string `json:"approval_code"`
 }
 
 type ExecuteResult struct {
@@ -76,6 +75,7 @@ type ExecuteResult struct {
 	Stderr     string           `json:"stderr,omitempty"`
 	ExitCode   int              `json:"exit_code"`
 	DurationMS int64            `json:"duration_ms,omitempty"`
+	Truncated  bool             `json:"truncated"`
 	Error      *CodedError      `json:"error,omitempty"`
 	Approval   *ApprovalInfo    `json:"approval,omitempty"`
 	Redactions RedactionSummary `json:"redactions"`
@@ -83,26 +83,26 @@ type ExecuteResult struct {
 
 type ApprovalInfo struct {
 	ID        string `json:"id"`
-	Status    Status `json:"status"`
-	Reason    string `json:"reason,omitempty"`
+	Code      string `json:"code"`
+	Message   string `json:"message,omitempty"`
 	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 type RedactionSummary struct {
-	Applied     bool `json:"applied"`
-	InputCount  int  `json:"input_count,omitempty"`
-	OutputCount int  `json:"output_count,omitempty"`
+	Applied bool           `json:"applied"`
+	Counts  map[string]int `json:"counts,omitempty"`
 }
 
 type ServerSummary struct {
-	Name        string `json:"name"`
+	Alias       string `json:"alias"`
 	Description string `json:"description,omitempty"`
 	Available   bool   `json:"available"`
 }
 
 type BrokerStatus struct {
-	Status          Status          `json:"status"`
-	VaultLocked     bool            `json:"vault_locked"`
-	AuditFailClosed bool            `json:"audit_fail_closed"`
-	Servers         []ServerSummary `json:"servers"`
+	DaemonReachable bool   `json:"daemon_reachable"`
+	VaultLocked     bool   `json:"vault_locked"`
+	Version         string `json:"version"`
+	PolicyVersion   string `json:"policy_version"`
+	AuditFailClosed bool   `json:"audit_fail_closed"`
 }

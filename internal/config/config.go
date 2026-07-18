@@ -16,6 +16,9 @@ var (
 	ErrUnsafePath        = errors.New("unsafe config path")
 	ErrUnsafePermissions = errors.New("unsafe config permissions")
 	ErrUnsafeOwner       = errors.New("unsafe config owner")
+
+	renameFile    = os.Rename
+	syncDirectory = syncDirectoryToDisk
 )
 
 type Config struct {
@@ -93,6 +96,10 @@ func Save(path string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}
+	return writeAtomic(path, data)
+}
+
+func writeAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	temp, err := os.CreateTemp(dir, ".config-*.tmp")
 	if err != nil {
@@ -116,10 +123,25 @@ func Save(path string, cfg Config) error {
 	if err := temp.Close(); err != nil {
 		return fmt.Errorf("close temporary config: %w", err)
 	}
-	if err := os.Rename(tempPath, path); err != nil {
+	if err := renameFile(tempPath, path); err != nil {
 		return fmt.Errorf("replace config: %w", err)
 	}
+	if err := syncDirectory(dir); err != nil {
+		return fmt.Errorf("sync config directory: %w", err)
+	}
 	return nil
+}
+
+func syncDirectoryToDisk(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 func validatePrivateFile(info os.FileInfo) error {
