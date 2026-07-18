@@ -210,6 +210,92 @@ func TestOpenRejectsMalformedUnknownAndHostileEnvelopes(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsDuplicateEnvelopeFields(t *testing.T) {
+	valid, err := Seal([]byte("master"), Data{}, testKDFParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := decodeTestEnvelope(t, valid)
+
+	rootFields := []struct {
+		name  string
+		value string
+	}{
+		{"version", jsonValue(t, decoded.Version)},
+		{"kdf", jsonValue(t, decoded.KDF)},
+		{"salt", jsonValue(t, decoded.Salt)},
+		{"nonce", jsonValue(t, decoded.Nonce)},
+		{"ciphertext", jsonValue(t, decoded.Ciphertext)},
+	}
+	for _, field := range rootFields {
+		t.Run("root "+field.name, func(t *testing.T) {
+			duplicated := appendObjectField(t, valid, field.name, field.value)
+			_, err := Open([]byte("master"), duplicated)
+			assertSanitizedError(t, err, ErrInvalidEnvelope, string(duplicated))
+		})
+	}
+
+	kdfFields := []struct {
+		name  string
+		value string
+	}{
+		{"memory_kib", jsonValue(t, decoded.KDF.MemoryKiB)},
+		{"iterations", jsonValue(t, decoded.KDF.Iterations)},
+		{"parallelism", jsonValue(t, decoded.KDF.Parallelism)},
+	}
+	for _, field := range kdfFields {
+		t.Run("kdf "+field.name, func(t *testing.T) {
+			duplicated := appendKDFField(t, valid, field.name, field.value)
+			_, err := Open([]byte("master"), duplicated)
+			assertSanitizedError(t, err, ErrInvalidEnvelope, string(duplicated))
+		})
+	}
+}
+
+func TestOpenRejectsCaseVariantEnvelopeFields(t *testing.T) {
+	valid, err := Seal([]byte("master"), Data{}, testKDFParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := decodeTestEnvelope(t, valid)
+
+	rootFields := []struct {
+		name    string
+		variant string
+		value   string
+	}{
+		{"version", "Version", jsonValue(t, decoded.Version)},
+		{"kdf", "KDF", jsonValue(t, decoded.KDF)},
+		{"salt", "Salt", jsonValue(t, decoded.Salt)},
+		{"nonce", "Nonce", jsonValue(t, decoded.Nonce)},
+		{"ciphertext", "Ciphertext", jsonValue(t, decoded.Ciphertext)},
+	}
+	for _, field := range rootFields {
+		t.Run("root "+field.name, func(t *testing.T) {
+			variant := appendObjectField(t, valid, field.variant, field.value)
+			_, err := Open([]byte("master"), variant)
+			assertSanitizedError(t, err, ErrInvalidEnvelope, string(variant))
+		})
+	}
+
+	kdfFields := []struct {
+		name    string
+		variant string
+		value   string
+	}{
+		{"memory_kib", "MEMORY_KIB", jsonValue(t, decoded.KDF.MemoryKiB)},
+		{"iterations", "Iterations", jsonValue(t, decoded.KDF.Iterations)},
+		{"parallelism", "Parallelism", jsonValue(t, decoded.KDF.Parallelism)},
+	}
+	for _, field := range kdfFields {
+		t.Run("kdf "+field.name, func(t *testing.T) {
+			variant := appendKDFField(t, valid, field.variant, field.value)
+			_, err := Open([]byte("master"), variant)
+			assertSanitizedError(t, err, ErrInvalidEnvelope, string(variant))
+		})
+	}
+}
+
 func TestZeroOverwritesByteSlice(t *testing.T) {
 	secret := []byte("sensitive bytes")
 	Zero(secret)
@@ -251,6 +337,43 @@ func replaceEnvelopeField(t *testing.T, data []byte, field, value string) []byte
 		t.Fatal(err)
 	}
 	return result
+}
+
+func appendKDFField(t *testing.T, data []byte, field, value string) []byte {
+	t.Helper()
+	decoded := decodeTestEnvelope(t, data)
+	canonicalKDF := jsonValue(t, decoded.KDF)
+	mutatedKDF := string(appendObjectField(t, []byte(canonicalKDF), field, value))
+	needle := `"kdf":` + canonicalKDF
+	replacement := `"kdf":` + mutatedKDF
+	mutated := strings.Replace(string(data), needle, replacement, 1)
+	if mutated == string(data) {
+		t.Fatal("canonical kdf object not found")
+	}
+	return []byte(mutated)
+}
+
+func appendObjectField(t *testing.T, object []byte, field, value string) []byte {
+	t.Helper()
+	if len(object) == 0 || object[len(object)-1] != '}' {
+		t.Fatalf("object = %q, want JSON object", object)
+	}
+	result := append([]byte(nil), object[:len(object)-1]...)
+	result = append(result, ',')
+	result = append(result, jsonValue(t, field)...)
+	result = append(result, ':')
+	result = append(result, value...)
+	result = append(result, '}')
+	return result
+}
+
+func jsonValue(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
 
 func assertSanitizedError(t *testing.T, err, want error, forbidden ...string) {

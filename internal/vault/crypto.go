@@ -114,7 +114,7 @@ func Open(master, encoded []byte) (Data, error) {
 	}
 
 	var sealed envelope
-	if err := decodeStrictJSON(encoded, &sealed); err != nil {
+	if err := decodeEnvelopeJSON(encoded, &sealed); err != nil {
 		return Data{}, ErrInvalidEnvelope
 	}
 	if sealed.Version != envelopeVersion || !validKDFParams(sealed.KDF) {
@@ -175,6 +175,63 @@ func associatedData(params KDFParams) []byte {
 	binary.BigEndian.PutUint32(data[8:12], params.Iterations)
 	data[12] = params.Parallelism
 	return data
+}
+
+func decodeEnvelopeJSON(data []byte, target *envelope) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decodeExactObject(decoder, map[string]func() error{
+		"version": func() error { return decoder.Decode(&target.Version) },
+		"kdf": func() error {
+			return decodeExactObject(decoder, map[string]func() error{
+				"memory_kib":  func() error { return decoder.Decode(&target.KDF.MemoryKiB) },
+				"iterations":  func() error { return decoder.Decode(&target.KDF.Iterations) },
+				"parallelism": func() error { return decoder.Decode(&target.KDF.Parallelism) },
+			})
+		},
+		"salt":       func() error { return decoder.Decode(&target.Salt) },
+		"nonce":      func() error { return decoder.Decode(&target.Nonce) },
+		"ciphertext": func() error { return decoder.Decode(&target.Ciphertext) },
+	}); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return ErrInvalidEnvelope
+	}
+	return nil
+}
+
+func decodeExactObject(decoder *json.Decoder, fields map[string]func() error) error {
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return ErrInvalidEnvelope
+	}
+	seen := make(map[string]struct{}, len(fields))
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return ErrInvalidEnvelope
+		}
+		name, ok := token.(string)
+		if !ok {
+			return ErrInvalidEnvelope
+		}
+		decode, ok := fields[name]
+		if !ok {
+			return ErrInvalidEnvelope
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return ErrInvalidEnvelope
+		}
+		seen[name] = struct{}{}
+		if err := decode(); err != nil {
+			return ErrInvalidEnvelope
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') || len(seen) != len(fields) {
+		return ErrInvalidEnvelope
+	}
+	return nil
 }
 
 func decodeStrictJSON(data []byte, target any) error {
