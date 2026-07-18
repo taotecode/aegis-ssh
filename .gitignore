@@ -1,0 +1,10 @@
+/aegis-ssh
+/dist/
+/.aegis-ssh/
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
