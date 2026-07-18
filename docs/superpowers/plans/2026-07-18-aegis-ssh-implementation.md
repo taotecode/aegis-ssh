@@ -68,7 +68,7 @@ utility layer.
 - Create: `internal/config/config.go`
 - Create: `internal/config/config_test.go`
 
-- [ ] **Step 1: Create the module manifest and ignore runtime artifacts**
+- [x] **Step 1: Create the module manifest and ignore runtime artifacts**
 
 ```go
 module github.com/chenjw/aegis-ssh
@@ -87,7 +87,7 @@ require (
 `.gitignore` must contain `/aegis-ssh`, `/dist/`, `/.aegis-ssh/`, and common
 editor files. Run `go mod tidy` only after the first importing package exists.
 
-- [ ] **Step 2: Write failing path and configuration tests**
+- [x] **Step 2: Write failing path and configuration tests**
 
 ```go
 func TestEnsureLayoutCreatesPrivatePaths(t *testing.T) {
@@ -115,13 +115,13 @@ func TestConfigDoesNotAcceptConnectionFields(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Run tests and confirm the red state**
+- [x] **Step 3: Run tests and confirm the red state**
 
 Run: `go test ./internal/paths ./internal/config`
 
 Expected: FAIL because the packages or exported functions do not exist.
 
-- [ ] **Step 4: Implement minimal paths, model, and strict YAML configuration**
+- [x] **Step 4: Implement minimal paths, model, and strict YAML configuration**
 
 Define:
 
@@ -157,7 +157,7 @@ locked vault, validation, and approval failures so callers can use `errors.Is`
 without receiving raw dependency errors. Do not include host, port, username,
 password, or fingerprint in any public result type.
 
-- [ ] **Step 5: Verify green state and commit**
+- [x] **Step 5: Verify green state and commit**
 
 Run: `go mod tidy && go test ./internal/paths ./internal/config && git diff --check`
 
