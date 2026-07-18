@@ -55,6 +55,9 @@ func ensurePrivateDir(path string) error {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			return fmt.Errorf("create private directory: %w", err)
 		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			return fmt.Errorf("secure private directory: %w", err)
+		}
 		info, err = os.Lstat(path)
 	}
 	if err != nil {

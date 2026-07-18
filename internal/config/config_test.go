@@ -73,6 +73,23 @@ func TestSaveCreatesPrivateFile(t *testing.T) {
 	assertOwnedByCurrentUser(t, info)
 }
 
+func TestSaveCreatesPrivateFileWithRestrictiveUmask(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	previousUmask := syscall.Umask(0o777)
+	t.Cleanup(func() { syscall.Umask(previousUmask) })
+
+	if err := config.Save(path, config.Config{Version: 1}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestLoadRejectsOverPermissiveFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("version: 1\n"), 0o644); err != nil {

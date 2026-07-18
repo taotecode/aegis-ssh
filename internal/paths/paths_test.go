@@ -57,6 +57,27 @@ func TestEnsureLayoutCreatesPrivateDirectories(t *testing.T) {
 	}
 }
 
+func TestEnsureLayoutCreatesPrivateDirectoriesWithRestrictiveUmask(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "aegis")
+	previousUmask := syscall.Umask(0o777)
+	t.Cleanup(func() { syscall.Umask(previousUmask) })
+
+	got, err := paths.EnsureLayout(root)
+	if err != nil {
+		t.Fatalf("EnsureLayout() error = %v", err)
+	}
+
+	for _, dir := range []string{got.Root, got.AuditDir, got.RunDir} {
+		info, statErr := os.Lstat(dir)
+		if statErr != nil {
+			t.Fatalf("Lstat(%q): %v", dir, statErr)
+		}
+		if info.Mode().Perm() != 0o700 {
+			t.Errorf("mode for %q = %04o, want 0700", dir, info.Mode().Perm())
+		}
+	}
+}
+
 func TestEnsureLayoutRejectsOverPermissiveRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "aegis")
 	if err := os.Mkdir(root, 0o755); err != nil {

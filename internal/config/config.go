@@ -101,6 +101,10 @@ func Save(path string, cfg Config) error {
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
 
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return fmt.Errorf("secure temporary config: %w", err)
+	}
 	if _, err := temp.Write(data); err != nil {
 		temp.Close()
 		return fmt.Errorf("write temporary config: %w", err)
