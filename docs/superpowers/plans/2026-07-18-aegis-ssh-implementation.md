@@ -175,7 +175,7 @@ git commit -m "feat: establish secure local configuration"
 - Create: `internal/vault/store.go`
 - Create: `internal/vault/vault_test.go`
 
-- [ ] **Step 1: Write failing crypto and persistence tests**
+- [x] **Step 1: Write failing crypto and persistence tests**
 
 ```go
 func TestRoundTripAndWrongPassword(t *testing.T) {
@@ -217,13 +217,13 @@ func TestStoreWritesMode0600AndPreservesOldVaultOnRenameFailure(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and confirm the red state**
+- [x] **Step 2: Run the focused test and confirm the red state**
 
 Run: `go test ./internal/vault -run 'TestRoundTrip|TestTampering|TestStore' -v`
 
 Expected: FAIL because `Seal`, `Open`, `Store`, and vault types are missing.
 
-- [ ] **Step 3: Implement the versioned authenticated envelope**
+- [x] **Step 3: Implement the versioned authenticated envelope**
 
 Define:
 
@@ -249,7 +249,7 @@ three iterations, and parallelism two. Tests use intentionally cheap parameters.
 Map all AEAD authentication failures to `ErrInvalidPassword` without leaking
 whether the password or file was wrong.
 
-- [ ] **Step 4: Implement atomic store operations**
+- [x] **Step 4: Implement atomic store operations**
 
 ```go
 type AtomicWriteFunc func(path string, data []byte, mode fs.FileMode) error
@@ -263,7 +263,7 @@ The writer must create a random same-directory temporary file with `0600`, write
 and sync it, close it, rename it, and sync the parent directory. Reject symlink
 targets and broad file modes before load or save.
 
-- [ ] **Step 5: Verify vault behavior and commit**
+- [x] **Step 5: Verify vault behavior and commit**
 
 Run: `go test ./internal/vault -v && go test ./...`
 
