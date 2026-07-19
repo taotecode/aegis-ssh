@@ -1,0 +1,215 @@
+package policy
+
+import (
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestAnalyzerClassifiesCoreSensitiveOperations(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"ssh private key", `cat ~/.ssh/id_ed25519`, []Category{SSHSecret}},
+		{"encoded root ssh key", `base64 /root/.ssh/id_rsa`, []Category{SSHSecret}},
+		{"process environment pipeline", `env | sort`, []Category{ProcessEnvironment}},
+		{"network route", `ip route`, []Category{NetworkIdentity}},
+		{"kubernetes directory archive", `tar -cf /tmp/kube.tar /etc/kubernetes`, []Category{KubernetesSecret}},
+		{"nested shell private key", `sh -c 'cat /srv/keys/server.key'`, []Category{PrivateKey}},
+		{"ordinary command", `systemctl status nginx`, nil},
+	}
+
+	analyzer := NewAnalyzer()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := analyzer.Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+			if len(got.Findings) != len(tt.want) {
+				t.Fatalf("Analyze() findings = %#v, want %d", got.Findings, len(tt.want))
+			}
+		})
+	}
+}
+
+func TestAnalyzerRejectsInvalidShellWithoutEchoingInput(t *testing.T) {
+	for _, command := range []string{"", "# comment only", `cat "private-input-marker`} {
+		_, err := NewAnalyzer().Analyze(command)
+		if !errors.Is(err, ErrInvalidShell) {
+			t.Fatalf("Analyze(%q) error = %v, want ErrInvalidShell", command, err)
+		}
+		if err.Error() != ErrInvalidShell.Error() {
+			t.Fatalf("Analyze() error = %q, want sanitized %q", err, ErrInvalidShell)
+		}
+	}
+}
+
+func TestAnalyzerClassifiesSensitiveRuleFamilies(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"ssh home variable", `grep host "$HOME/.ssh/config"`, []Category{SSHSecret}},
+		{"ssh braced home variable", `sed -n 1p "${HOME}/.ssh/known_hosts"`, []Category{SSHSecret}},
+		{"ssh authorized keys", `awk '{print $1}' /home/deploy/.ssh/authorized_keys`, []Category{SSHSecret}},
+		{"ssh host private key", `xxd /etc/ssh/ssh_host_ed25519_key`, []Category{SSHSecret}},
+		{"ssh etc private key", `cat /etc/ssh/id_rsa`, []Category{SSHSecret}},
+		{"aws credentials", `cat ~/.aws/credentials`, []Category{CloudCredential}},
+		{"aws config", `cat "$HOME/.aws/config"`, []Category{CloudCredential}},
+		{"aws directory", `tar -cf /tmp/aws.tar ~/.aws`, []Category{CloudCredential}},
+		{"gcloud credentials", `strings ~/.config/gcloud/credentials.db`, []Category{CloudCredential}},
+		{"azure credentials", `tar -cf /tmp/a.tar ~/.azure`, []Category{CloudCredential}},
+		{"cloud environment", `printenv AWS_SECRET_ACCESS_KEY`, []Category{CloudCredential, ProcessEnvironment}},
+		{"cloud variable expansion", `printf '%s' "$AWS_SECRET_ACCESS_KEY"`, []Category{CloudCredential}},
+		{"print environment", `printenv`, []Category{ProcessEnvironment}},
+		{"set environment", `set`, []Category{ProcessEnvironment}},
+		{"export environment", `export -p`, []Category{ProcessEnvironment}},
+		{"proc environment", `cat /proc/123/environ`, []Category{ProcessEnvironment}},
+		{"postgres credentials", `cat ~/.pgpass`, []Category{DatabaseCredential}},
+		{"mysql credentials", `sed -n 1p ~/.my.cnf`, []Category{DatabaseCredential}},
+		{"database credential file", `base64 /run/secrets/database_credentials.json`, []Category{DatabaseCredential}},
+		{"kube config", `cat "${HOME}/.kube/config"`, []Category{KubernetesSecret}},
+		{"service account token", `cat /var/run/secrets/kubernetes.io/serviceaccount/token`, []Category{KubernetesSecret}},
+		{"private key suffix", `openssl rsa -in /srv/tls/server.key -check`, []Category{PrivateKey}},
+		{"private pem name", `cat /run/secrets/private-key.pem`, []Category{PrivateKey}},
+		{"private pem directory", `openssl pkey -in /etc/ssl/private/server.pem -noout`, []Category{PrivateKey}},
+		{"network address", `ip addr show`, []Category{NetworkIdentity}},
+		{"network option before link", `ip -json link`, []Category{NetworkIdentity}},
+		{"network neighbor", `ip neigh`, []Category{NetworkIdentity}},
+		{"ifconfig", `ifconfig -a`, []Category{NetworkIdentity}},
+		{"hostname addresses", `hostname -I`, []Category{NetworkIdentity}},
+		{"socket listing", `ss -lntp`, []Category{NetworkIdentity}},
+		{"legacy socket listing", `netstat -rn`, []Category{NetworkIdentity}},
+		{"legacy route", `route -n`, []Category{NetworkIdentity}},
+		{"proc network", `cat /proc/net/tcp`, []Category{NetworkIdentity}},
+		{"hosts file", `grep example /etc/hosts`, []Category{NetworkIdentity}},
+		{"resolver config", `cat /etc/resolv.conf`, []Category{NetworkIdentity}},
+		{"public ip curl", `curl -s https://api.ipify.org`, []Category{NetworkIdentity}},
+		{"public ip dig", `dig +short myip.opendns.com @resolver1.opendns.com`, []Category{NetworkIdentity}},
+	}
+
+	analyzer := NewAnalyzer()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := analyzer.Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerTraversesCompleteShellAST(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"assignment", `KEY_FILE=~/.ssh/id_rsa true`, []Category{SSHSecret}},
+		{"input redirect", `cat < ~/.ssh/config`, []Category{SSHSecret}},
+		{"output redirect", `printf x > /etc/kubernetes/admin.conf`, []Category{KubernetesSecret}},
+		{"command substitution", `printf '%s\n' "$(cat ~/.pgpass)"`, []Category{DatabaseCredential}},
+		{"process substitution", `diff <(cat ~/.ssh/config) <(printf x)`, []Category{SSHSecret}},
+		{"subshell and block", `(cat /proc/1/environ); { ip link; }`, []Category{NetworkIdentity, ProcessEnvironment}},
+		{"multiline pipeline", "cat \\\n+~/.aws/credentials |\nstrings", []Category{CloudCredential}},
+		{"find exec", `find /root/.ssh -type f -exec cat {} \;`, []Category{SSHSecret}},
+		{"nested bash", `bash -c 'cat ~/.kube/config'`, []Category{KubernetesSecret}},
+		{"nested dash", `dash -c "cat /etc/hosts"`, []Category{NetworkIdentity}},
+	}
+
+	analyzer := NewAnalyzer()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := analyzer.Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerAvoidsOrdinaryCommandFalsePositives(t *testing.T) {
+	commands := []string{
+		`journalctl -u nginx --since today`,
+		`cat /var/log/application.log`,
+		`cat ./config.yaml`,
+		`cat /etc/ssl/certs/site.pem`,
+		`app --version 1.2.3`,
+		`echo 192.0.2.10`,
+		`printf '%s\n' public-key.pem`,
+	}
+
+	for _, command := range commands {
+		got, err := NewAnalyzer().Analyze(command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", command, err)
+		}
+		if len(got.Categories) != 0 || len(got.Findings) != 0 {
+			t.Errorf("Analyze(%q) = %#v, want no findings", command, got)
+		}
+	}
+}
+
+func TestAnalyzerResultsAreDeterministicDeduplicatedAndSanitized(t *testing.T) {
+	const marker = "user-secret-path-marker"
+	command := "cat /proc/1/environ /proc/2/environ; env; ip route; cat /tmp/" + marker + "/server.key"
+	analyzer := NewAnalyzer()
+	first, err := analyzer.Analyze(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := analyzer.Analyze(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("Analyze() is nondeterministic: first=%#v second=%#v", first, second)
+	}
+	wantCategories := []Category{NetworkIdentity, PrivateKey, ProcessEnvironment}
+	if !reflect.DeepEqual(first.Categories, wantCategories) {
+		t.Fatalf("Analyze() categories = %#v, want %#v", first.Categories, wantCategories)
+	}
+	if len(first.Findings) != 4 {
+		t.Fatalf("Analyze() findings = %#v, want four distinct rules", first.Findings)
+	}
+	for _, finding := range first.Findings {
+		if len(finding.Rule) > 128 || len(finding.Evidence) > 128 {
+			t.Errorf("finding label exceeds 128 characters: %#v", finding)
+		}
+		if strings.Contains(finding.Rule, marker) || strings.Contains(finding.Evidence, marker) {
+			t.Errorf("finding echoes command content: %#v", finding)
+		}
+	}
+}
+
+func TestAnalyzerRejectsOversizedCommand(t *testing.T) {
+	command := "echo " + strings.Repeat("x", (128<<10)+1)
+	_, err := NewAnalyzer().Analyze(command)
+	if !errors.Is(err, ErrInvalidShell) || err.Error() != ErrInvalidShell.Error() {
+		t.Fatalf("Analyze(oversized) error = %v, want sanitized ErrInvalidShell", err)
+	}
+}
+
+func TestAnalyzerIgnoresDynamicNestedShellWithoutPanicking(t *testing.T) {
+	got, err := NewAnalyzer().Analyze(`read -r script; sh -c "$script"`)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if len(got.Categories) != 0 {
+		t.Fatalf("Analyze() categories = %#v, want best-effort no match", got.Categories)
+	}
+}
