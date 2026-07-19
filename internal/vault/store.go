@@ -15,10 +15,6 @@ var (
 	ErrUnsafePermissions  = errors.New("unsafe vault permissions")
 	ErrUnsafeOwner        = errors.New("unsafe vault owner")
 	ErrAlreadyInitialized = errors.New("vault already initialized")
-
-	createTemporaryFile = createTempFile
-	renameFile          = os.Rename
-	syncDirectory       = syncDirectoryToDisk
 )
 
 type AtomicWriteFunc func(path string, data []byte, mode fs.FileMode) error
@@ -26,6 +22,7 @@ type AtomicWriteFunc func(path string, data []byte, mode fs.FileMode) error
 type Store struct {
 	Path        string
 	WriteAtomic AtomicWriteFunc
+	ops         fileOps
 }
 
 type temporaryFile interface {
@@ -34,6 +31,44 @@ type temporaryFile interface {
 	Write([]byte) (int, error)
 	Sync() error
 	Close() error
+}
+
+type fileOps struct {
+	createTemp func(string, string) (temporaryFile, error)
+	rename     func(string, string) error
+	link       func(string, string) error
+	remove     func(string) error
+	syncDir    func(string) error
+}
+
+func defaultFileOps() fileOps {
+	return fileOps{
+		createTemp: createTempFile,
+		rename:     os.Rename,
+		link:       os.Link,
+		remove:     os.Remove,
+		syncDir:    syncDirectoryToDisk,
+	}
+}
+
+func (ops fileOps) withDefaults() fileOps {
+	defaults := defaultFileOps()
+	if ops.createTemp == nil {
+		ops.createTemp = defaults.createTemp
+	}
+	if ops.rename == nil {
+		ops.rename = defaults.rename
+	}
+	if ops.link == nil {
+		ops.link = defaults.link
+	}
+	if ops.remove == nil {
+		ops.remove = defaults.remove
+	}
+	if ops.syncDir == nil {
+		ops.syncDir = defaults.syncDir
+	}
+	return ops
 }
 
 func (store Store) Initialize(master []byte) error {
@@ -52,42 +87,62 @@ func (store Store) Initialize(master []byte) error {
 	}
 	defer Zero(sealed)
 
-	file, err := os.OpenFile(store.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	dir := filepath.Dir(store.Path)
+	ops := store.ops.withDefaults()
+	file, err := ops.createTemp(dir, ".vault-init-*.tmp")
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return ErrAlreadyInitialized
-		}
-		return fmt.Errorf("create vault: %w", err)
+		return fmt.Errorf("create temporary vault: %w", err)
 	}
-	created := true
+	temporaryPath := file.Name()
+	temporaryExists := true
 	closed := false
 	defer func() {
 		if !closed {
 			_ = file.Close()
 		}
-		if created {
-			_ = os.Remove(store.Path)
+		if temporaryExists {
+			_ = ops.remove(temporaryPath)
 		}
 	}()
 
 	if err := file.Chmod(0o600); err != nil {
-		return fmt.Errorf("secure vault: %w", err)
+		return fmt.Errorf("secure temporary vault: %w", err)
 	}
 	if err := writeAll(file, sealed); err != nil {
-		return fmt.Errorf("write vault: %w", err)
+		return fmt.Errorf("write temporary vault: %w", err)
 	}
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync vault: %w", err)
+		return fmt.Errorf("sync temporary vault: %w", err)
 	}
 	if err := file.Close(); err != nil {
 		closed = true
-		return fmt.Errorf("close vault: %w", err)
+		return fmt.Errorf("close temporary vault: %w", err)
 	}
 	closed = true
-	if err := syncDirectory(filepath.Dir(store.Path)); err != nil {
-		return fmt.Errorf("sync vault directory: %w", err)
+
+	if err := ops.link(temporaryPath, store.Path); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return ErrAlreadyInitialized
+		}
+		return fmt.Errorf("publish vault: %w", err)
 	}
-	created = false
+	if err := ops.syncDir(dir); err != nil {
+		rollbackErr := removeLinkedFile(ops, temporaryPath, store.Path)
+		removeTempErr := ops.remove(temporaryPath)
+		if removeTempErr == nil || errors.Is(removeTempErr, fs.ErrNotExist) {
+			temporaryExists = false
+			removeTempErr = nil
+		}
+		resyncErr := ops.syncDir(dir)
+		return fmt.Errorf("sync published vault directory: %w", errors.Join(err, rollbackErr, removeTempErr, resyncErr))
+	}
+	if err := ops.remove(temporaryPath); err != nil {
+		return fmt.Errorf("remove temporary vault: %w", err)
+	}
+	temporaryExists = false
+	if err := ops.syncDir(dir); err != nil {
+		return fmt.Errorf("sync temporary vault removal: %w", err)
+	}
 	return nil
 }
 
@@ -108,9 +163,12 @@ func (store Store) Load(master []byte) (Data, error) {
 	if err := validatePrivateFile(info); err != nil {
 		return Data{}, err
 	}
-	sealed, err := io.ReadAll(file)
+	if info.Size() <= 0 || info.Size() > MaxEnvelopeBytes {
+		return Data{}, ErrInvalidEnvelope
+	}
+	sealed, err := readEnvelope(file)
 	if err != nil {
-		return Data{}, fmt.Errorf("read vault: %w", err)
+		return Data{}, err
 	}
 	defer Zero(sealed)
 	return Open(master, sealed)
@@ -131,18 +189,26 @@ func (store Store) Save(master []byte, data Data) error {
 	}
 	defer Zero(sealed)
 	writer := store.WriteAtomic
-	if writer == nil {
-		writer = writeAtomic
+	if writer != nil {
+		if err := writer(store.Path, sealed, 0o600); err != nil {
+			return fmt.Errorf("save vault: %w", err)
+		}
+		return nil
 	}
-	if err := writer(store.Path, sealed, 0o600); err != nil {
+	if err := writeAtomicWithOps(store.Path, sealed, 0o600, store.ops); err != nil {
 		return fmt.Errorf("save vault: %w", err)
 	}
 	return nil
 }
 
 func writeAtomic(path string, data []byte, mode fs.FileMode) error {
+	return writeAtomicWithOps(path, data, mode, fileOps{})
+}
+
+func writeAtomicWithOps(path string, data []byte, mode fs.FileMode, ops fileOps) error {
+	ops = ops.withDefaults()
 	dir := filepath.Dir(path)
-	temporary, err := createTemporaryFile(dir, ".vault-*.tmp")
+	temporary, err := ops.createTemp(dir, ".vault-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temporary vault: %w", err)
 	}
@@ -152,7 +218,7 @@ func writeAtomic(path string, data []byte, mode fs.FileMode) error {
 		if !closed {
 			_ = temporary.Close()
 		}
-		_ = os.Remove(temporaryPath)
+		_ = ops.remove(temporaryPath)
 	}()
 
 	if err := temporary.Chmod(mode); err != nil {
@@ -169,13 +235,31 @@ func writeAtomic(path string, data []byte, mode fs.FileMode) error {
 		return fmt.Errorf("close temporary vault: %w", err)
 	}
 	closed = true
-	if err := renameFile(temporaryPath, path); err != nil {
+	if err := ops.rename(temporaryPath, path); err != nil {
 		return fmt.Errorf("replace vault: %w", err)
 	}
-	if err := syncDirectory(dir); err != nil {
+	if err := ops.syncDir(dir); err != nil {
 		return fmt.Errorf("sync vault directory: %w", err)
 	}
 	return nil
+}
+
+func removeLinkedFile(ops fileOps, temporaryPath, finalPath string) error {
+	temporaryInfo, err := os.Lstat(temporaryPath)
+	if err != nil {
+		return err
+	}
+	finalInfo, err := os.Lstat(finalPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(temporaryInfo, finalInfo) {
+		return ErrUnsafePath
+	}
+	return ops.remove(finalPath)
 }
 
 func createTempFile(dir, pattern string) (temporaryFile, error) {
@@ -225,4 +309,16 @@ func writeAll(writer io.Writer, data []byte) error {
 		data = data[written:]
 	}
 	return nil
+}
+
+func readEnvelope(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, MaxEnvelopeBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read vault: %w", err)
+	}
+	if len(data) == 0 || len(data) > MaxEnvelopeBytes {
+		Zero(data)
+		return nil, ErrInvalidEnvelope
+	}
+	return data, nil
 }

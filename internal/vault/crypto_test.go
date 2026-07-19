@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -207,6 +208,32 @@ func TestOpenRejectsMalformedUnknownAndHostileEnvelopes(t *testing.T) {
 
 	if _, err := Open(nil, valid); !errors.Is(err, ErrInvalidPassword) {
 		t.Fatalf("Open(empty master) error = %v, want ErrInvalidPassword", err)
+	}
+}
+
+func TestOpenRejectsEmptyAndOversizedEnvelopesBeforeCrypto(t *testing.T) {
+	if _, err := Open([]byte("master"), nil); !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("Open(empty) error = %v, want ErrInvalidEnvelope", err)
+	}
+
+	validShape := []byte(`{"version":2,"kdf":{"memory_kib":64,"iterations":1,"parallelism":1},"salt":"","nonce":"","ciphertext":""}`)
+	if len(validShape) >= MaxEnvelopeBytes {
+		t.Fatal("test envelope unexpectedly exceeds MaxEnvelopeBytes")
+	}
+	exactMax := append(append([]byte(nil), validShape...), bytes.Repeat([]byte{' '}, MaxEnvelopeBytes-len(validShape))...)
+	if len(exactMax) != MaxEnvelopeBytes {
+		t.Fatalf("exact envelope length = %d, want %d", len(exactMax), MaxEnvelopeBytes)
+	}
+	if _, err := Open([]byte("master"), exactMax); !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("Open(exact max invalid shape) error = %v, want ErrInvalidEnvelope", err)
+	}
+
+	overMax := append(append([]byte(nil), exactMax...), ' ')
+	if len(overMax) != MaxEnvelopeBytes+1 {
+		t.Fatalf("oversized envelope length = %d, want %d", len(overMax), MaxEnvelopeBytes+1)
+	}
+	if _, err := Open([]byte("master"), overMax); !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("Open(over max) error = %v, want ErrInvalidEnvelope", err)
 	}
 }
 

@@ -2,6 +2,7 @@ package vault
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -111,6 +112,234 @@ func TestStoreInitializeDoesNotOverwriteExistingVault(t *testing.T) {
 	}
 }
 
+func TestStoreInitializeDoesNotOverwriteSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.json")
+	original := []byte("target content")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "vault.json")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (Store{Path: path}).Initialize([]byte("master"))
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("Initialize() error = %v, want ErrUnsafePath", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("symlink target = %q, want unchanged %q", got, original)
+	}
+}
+
+func TestStoreInitializePublishesOnlySyncedClosedTempByLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.json")
+	master := []byte("master")
+	var events []string
+	var temporaryPath string
+	ops := fileOps{
+		createTemp: func(dir, pattern string) (temporaryFile, error) {
+			file, err := os.CreateTemp(dir, pattern)
+			if err != nil {
+				return nil, err
+			}
+			temporaryPath = file.Name()
+			return &recordingTemporaryFile{File: file, events: &events}, nil
+		},
+		link: func(oldPath, newPath string) error {
+			events = append(events, "link")
+			if _, err := os.Lstat(newPath); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("final exists before link: %v", err)
+			}
+			if oldPath != temporaryPath || newPath != path {
+				t.Errorf("link(%q, %q), want (%q, %q)", oldPath, newPath, temporaryPath, path)
+			}
+			info, err := os.Lstat(oldPath)
+			if err != nil {
+				return err
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Errorf("temporary mode = %04o, want 0600", info.Mode().Perm())
+			}
+			sealed, err := os.ReadFile(oldPath)
+			if err != nil {
+				return err
+			}
+			if _, err := Open(master, sealed); err != nil {
+				t.Errorf("temporary vault is not complete: %v", err)
+			}
+			wantBeforeLink := []string{"chmod", "write", "sync file", "close", "link"}
+			if !reflect.DeepEqual(events, wantBeforeLink) {
+				t.Errorf("events before link = %v, want %v", events, wantBeforeLink)
+			}
+			return os.Link(oldPath, newPath)
+		},
+		remove: func(path string) error {
+			events = append(events, "remove temp")
+			return os.Remove(path)
+		},
+		syncDir: func(got string) error {
+			events = append(events, "sync directory")
+			if got != dir {
+				t.Errorf("synced directory = %q, want %q", got, dir)
+			}
+			return nil
+		},
+	}
+
+	if err := (Store{Path: path, ops: ops}).Initialize(master); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	wantEvents := []string{
+		"chmod", "write", "sync file", "close", "link",
+		"sync directory", "remove temp", "sync directory",
+	}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events = %v, want %v", events, wantEvents)
+	}
+	assertNoTemporaryVaultFiles(t, dir)
+	if _, err := (Store{Path: path}).Load(master); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestStoreInitializeFailuresBeforePublishLeaveNoFinal(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		ops  func(error) fileOps
+	}{
+		{
+			name: "write",
+			err:  errors.New("write failed"),
+			ops: func(failure error) fileOps {
+				return fileOps{createTemp: createWrappedTemporaryFile(func(file *os.File) temporaryFile {
+					return &failingWriteTemporaryFile{File: file, err: failure}
+				})}
+			},
+		},
+		{
+			name: "file sync",
+			err:  errors.New("file sync failed"),
+			ops: func(failure error) fileOps {
+				return fileOps{createTemp: createWrappedTemporaryFile(func(file *os.File) temporaryFile {
+					return &failingSyncTemporaryFile{File: file, err: failure}
+				})}
+			},
+		},
+		{
+			name: "close",
+			err:  errors.New("close failed"),
+			ops: func(failure error) fileOps {
+				return fileOps{createTemp: createWrappedTemporaryFile(func(file *os.File) temporaryFile {
+					return &failingCloseTemporaryFile{File: file, err: failure}
+				})}
+			},
+		},
+		{
+			name: "link",
+			err:  errors.New("link failed"),
+			ops: func(failure error) fileOps {
+				return fileOps{link: func(string, string) error { return failure }}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "vault.json")
+			err := (Store{Path: path, ops: tt.ops(tt.err)}).Initialize([]byte("master"))
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("Initialize() error = %v, want %v", err, tt.err)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("final exists after %s failure: %v", tt.name, err)
+			}
+			assertNoTemporaryVaultFiles(t, dir)
+		})
+	}
+}
+
+func TestStoreInitializeRollsBackWhenFirstDirectorySyncFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.json")
+	syncErr := errors.New("directory sync failed")
+	syncCalls := 0
+	ops := fileOps{syncDir: func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return syncErr
+		}
+		return nil
+	}}
+
+	err := (Store{Path: path, ops: ops}).Initialize([]byte("master"))
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("Initialize() error = %v, want directory sync failure", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("final exists after directory sync rollback: %v", err)
+	}
+	assertNoTemporaryVaultFiles(t, dir)
+	if syncCalls < 2 {
+		t.Fatalf("directory sync calls = %d, want rollback sync", syncCalls)
+	}
+}
+
+func TestConcurrentInitializePublishesExactlyOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vault.json")
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			results <- (Store{Path: path}).Initialize([]byte("master"))
+		}()
+	}
+
+	succeeded := 0
+	alreadyInitialized := 0
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrAlreadyInitialized):
+			alreadyInitialized++
+		default:
+			t.Fatalf("Initialize() error = %v", err)
+		}
+	}
+	if succeeded != 1 || alreadyInitialized != 1 {
+		t.Fatalf("results: success=%d already_initialized=%d, want 1 each", succeeded, alreadyInitialized)
+	}
+	if _, err := (Store{Path: path}).Load([]byte("master")); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestStoreInitializeCreatesPrivateFileWithRestrictiveUmask(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vault.json")
+	previousUmask := syscall.Umask(0o777)
+	t.Cleanup(func() { syscall.Umask(previousUmask) })
+
+	if err := (Store{Path: path}).Initialize([]byte("master")); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestStoreRejectsUnsafePathsAndPermissions(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.json")
@@ -173,6 +402,30 @@ func TestStoreRejectsUnsafePathsAndPermissions(t *testing.T) {
 	}
 }
 
+func TestStoreLoadRejectsOversizedSparseFileBeforeReading(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vault.json")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(MaxEnvelopeBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = (Store{Path: path}).Load([]byte("master"))
+	assertSanitizedError(t, err, ErrInvalidEnvelope, path)
+}
+
+func TestReadEnvelopeRejectsGrowthBeyondLimit(t *testing.T) {
+	reader := io.LimitReader(endlessSpaceReader{}, MaxEnvelopeBytes+1)
+	_, err := readEnvelope(reader)
+	assertSanitizedError(t, err, ErrInvalidEnvelope)
+}
+
 func TestValidatePrivateFileRejectsDifferentOwner(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("ownership validation uses syscall.Stat_t")
@@ -193,55 +446,49 @@ func TestDefaultAtomicWriterOrdersDurableReplacement(t *testing.T) {
 	var events []string
 	var temporaryPaths []string
 
-	originalCreate := createTemporaryFile
-	originalRename := renameFile
-	originalSyncDirectory := syncDirectory
-	createTemporaryFile = func(dir, pattern string) (temporaryFile, error) {
-		file, err := os.CreateTemp(dir, pattern)
-		if err != nil {
-			return nil, err
-		}
-		temporaryPaths = append(temporaryPaths, file.Name())
-		return &recordingTemporaryFile{File: file, events: &events}, nil
+	ops := fileOps{
+		createTemp: func(dir, pattern string) (temporaryFile, error) {
+			file, err := os.CreateTemp(dir, pattern)
+			if err != nil {
+				return nil, err
+			}
+			temporaryPaths = append(temporaryPaths, file.Name())
+			return &recordingTemporaryFile{File: file, events: &events}, nil
+		},
+		rename: func(oldPath, newPath string) error {
+			events = append(events, "rename")
+			if filepath.Dir(oldPath) != dir {
+				t.Errorf("temporary directory = %q, want %q", filepath.Dir(oldPath), dir)
+			}
+			if newPath != path {
+				t.Errorf("rename destination = %q, want %q", newPath, path)
+			}
+			info, err := os.Lstat(oldPath)
+			if err != nil {
+				return err
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Errorf("temporary mode = %04o, want 0600", info.Mode().Perm())
+			}
+			content, err := os.ReadFile(oldPath)
+			if err != nil {
+				return err
+			}
+			if string(content) != string(want) {
+				t.Errorf("temporary content = %q, want %q", content, want)
+			}
+			return os.Rename(oldPath, newPath)
+		},
+		syncDir: func(got string) error {
+			events = append(events, "sync directory")
+			if got != dir {
+				t.Errorf("synced directory = %q, want %q", got, dir)
+			}
+			return nil
+		},
 	}
-	renameFile = func(oldPath, newPath string) error {
-		events = append(events, "rename")
-		if filepath.Dir(oldPath) != dir {
-			t.Errorf("temporary directory = %q, want %q", filepath.Dir(oldPath), dir)
-		}
-		if newPath != path {
-			t.Errorf("rename destination = %q, want %q", newPath, path)
-		}
-		info, err := os.Lstat(oldPath)
-		if err != nil {
-			return err
-		}
-		if info.Mode().Perm() != 0o600 {
-			t.Errorf("temporary mode = %04o, want 0600", info.Mode().Perm())
-		}
-		content, err := os.ReadFile(oldPath)
-		if err != nil {
-			return err
-		}
-		if string(content) != string(want) {
-			t.Errorf("temporary content = %q, want %q", content, want)
-		}
-		return os.Rename(oldPath, newPath)
-	}
-	syncDirectory = func(got string) error {
-		events = append(events, "sync directory")
-		if got != dir {
-			t.Errorf("synced directory = %q, want %q", got, dir)
-		}
-		return nil
-	}
-	t.Cleanup(func() {
-		createTemporaryFile = originalCreate
-		renameFile = originalRename
-		syncDirectory = originalSyncDirectory
-	})
 
-	if err := writeAtomic(path, want, 0o600); err != nil {
+	if err := writeAtomicWithOps(path, want, 0o600, ops); err != nil {
 		t.Fatalf("writeAtomic() error = %v", err)
 	}
 	wantEvents := []string{"chmod", "write", "sync file", "close", "rename", "sync directory"}
@@ -265,11 +512,11 @@ func TestStoreSavePreservesExistingVaultWhenRenameFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	renameErr := errors.New("rename failed")
-	originalRename := renameFile
-	renameFile = func(string, string) error { return renameErr }
-	t.Cleanup(func() { renameFile = originalRename })
 
-	err := (Store{Path: path}).Save([]byte("master"), Data{})
+	err := (Store{
+		Path: path,
+		ops:  fileOps{rename: func(string, string) error { return renameErr }},
+	}).Save([]byte("master"), Data{})
 	if !errors.Is(err, renameErr) {
 		t.Fatalf("Save() error = %v, want rename failure", err)
 	}
@@ -287,11 +534,10 @@ func TestDefaultAtomicWriterReturnsDirectorySyncFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vault.json")
 	syncErr := errors.New("directory sync failed")
-	originalSyncDirectory := syncDirectory
-	syncDirectory = func(string) error { return syncErr }
-	t.Cleanup(func() { syncDirectory = originalSyncDirectory })
 
-	err := writeAtomic(path, []byte("encrypted"), 0o600)
+	err := writeAtomicWithOps(path, []byte("encrypted"), 0o600, fileOps{
+		syncDir: func(string) error { return syncErr },
+	})
 	if !errors.Is(err, syncErr) {
 		t.Fatalf("writeAtomic() error = %v, want directory sync failure", err)
 	}
@@ -301,17 +547,12 @@ func TestDefaultAtomicWriterCleansUpAfterWriteFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vault.json")
 	writeErr := errors.New("write failed")
-	originalCreate := createTemporaryFile
-	createTemporaryFile = func(dir, pattern string) (temporaryFile, error) {
-		file, err := os.CreateTemp(dir, pattern)
-		if err != nil {
-			return nil, err
-		}
-		return &failingWriteTemporaryFile{File: file, err: writeErr}, nil
-	}
-	t.Cleanup(func() { createTemporaryFile = originalCreate })
 
-	err := writeAtomic(path, []byte("encrypted"), 0o600)
+	err := writeAtomicWithOps(path, []byte("encrypted"), 0o600, fileOps{
+		createTemp: createWrappedTemporaryFile(func(file *os.File) temporaryFile {
+			return &failingWriteTemporaryFile{File: file, err: writeErr}
+		}),
+	})
 	if !errors.Is(err, writeErr) {
 		t.Fatalf("writeAtomic() error = %v, want write failure", err)
 	}
@@ -369,9 +610,37 @@ func (file *failingWriteTemporaryFile) Write([]byte) (int, error) {
 	return 0, file.err
 }
 
+type failingSyncTemporaryFile struct {
+	*os.File
+	err error
+}
+
+func (file *failingSyncTemporaryFile) Sync() error {
+	return file.err
+}
+
+type failingCloseTemporaryFile struct {
+	*os.File
+	err error
+}
+
+func (file *failingCloseTemporaryFile) Close() error {
+	_ = file.File.Close()
+	return file.err
+}
+
 type fakeFileInfo struct {
 	mode fs.FileMode
 	sys  any
+}
+
+type endlessSpaceReader struct{}
+
+func (endlessSpaceReader) Read(data []byte) (int, error) {
+	for i := range data {
+		data[i] = ' '
+	}
+	return len(data), nil
 }
 
 func (info fakeFileInfo) Name() string       { return "vault.json" }
@@ -389,5 +658,15 @@ func assertNoTemporaryVaultFiles(t *testing.T, dir string) {
 	}
 	if len(temps) != 0 {
 		t.Fatalf("temporary vault files remain: %v", temps)
+	}
+}
+
+func createWrappedTemporaryFile(wrap func(*os.File) temporaryFile) func(string, string) (temporaryFile, error) {
+	return func(dir, pattern string) (temporaryFile, error) {
+		file, err := os.CreateTemp(dir, pattern)
+		if err != nil {
+			return nil, err
+		}
+		return wrap(file), nil
 	}
 }

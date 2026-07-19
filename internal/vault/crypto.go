@@ -8,12 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"runtime"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
+	MaxEnvelopeBytes = 16 << 20
+
 	envelopeVersion = 1
 	saltSize        = 16
 	keySize         = 32
@@ -109,6 +112,9 @@ func Seal(master []byte, data Data, params KDFParams) ([]byte, error) {
 }
 
 func Open(master, encoded []byte) (Data, error) {
+	if len(encoded) == 0 || len(encoded) > MaxEnvelopeBytes {
+		return Data{}, ErrInvalidEnvelope
+	}
 	if len(master) == 0 {
 		return Data{}, ErrInvalidPassword
 	}
@@ -157,9 +163,8 @@ func Open(master, encoded []byte) (Data, error) {
 }
 
 func Zero(data []byte) {
-	for i := range data {
-		data[i] = 0
-	}
+	clear(data)
+	runtime.KeepAlive(data)
 }
 
 func validKDFParams(params KDFParams) bool {
