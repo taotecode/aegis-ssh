@@ -44,6 +44,40 @@ func TestSealOpenRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSealRejectsOversizedEnvelope(t *testing.T) {
+	data := dataWithPasswordSize(13 << 20)
+
+	sealed, err := Seal([]byte("master"), data, testKDFParams)
+	if !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("Seal() error = %v, want ErrInvalidEnvelope", err)
+	}
+	if len(sealed) != 0 {
+		t.Fatalf("Seal() returned %d bytes for oversized envelope", len(sealed))
+	}
+}
+
+func TestSealOpenNearEnvelopeLimit(t *testing.T) {
+	want := dataWithPasswordSize(8 << 20)
+
+	sealed, err := Seal([]byte("master"), want, testKDFParams)
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	if len(sealed) >= MaxEnvelopeBytes {
+		t.Fatalf("Seal() length = %d, want below %d", len(sealed), MaxEnvelopeBytes)
+	}
+	if len(sealed) < MaxEnvelopeBytes*3/4 {
+		t.Fatalf("Seal() length = %d, want a near-limit envelope", len(sealed))
+	}
+	got, err := Open([]byte("master"), sealed)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal("Open() data differs from near-limit input")
+	}
+}
+
 func TestOpenWrongMasterReturnsInvalidPasswordWithoutSecrets(t *testing.T) {
 	data := Data{Servers: map[string]ServerSecret{
 		"prod": {Host: "secret-host.internal", Password: []byte("server-password")},
@@ -401,6 +435,17 @@ func jsonValue(t *testing.T, value any) string {
 		t.Fatal(err)
 	}
 	return string(encoded)
+}
+
+func dataWithPasswordSize(size int) Data {
+	return Data{Servers: map[string]ServerSecret{
+		"large": {
+			Host:     "large.example.com",
+			Port:     22,
+			User:     "root",
+			Password: bytes.Repeat([]byte{'x'}, size),
+		},
+	}}
 }
 
 func assertSanitizedError(t *testing.T, err, want error, forbidden ...string) {

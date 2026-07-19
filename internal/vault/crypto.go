@@ -77,6 +77,9 @@ func Seal(master []byte, data Data, params KDFParams) ([]byte, error) {
 		return nil, ErrInvalidEnvelope
 	}
 	defer Zero(plaintext)
+	if !envelopeFits(plaintext, params) {
+		return nil, ErrInvalidEnvelope
+	}
 
 	salt := make([]byte, saltSize)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
@@ -106,6 +109,10 @@ func Seal(master []byte, data Data, params KDFParams) ([]byte, error) {
 		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
 	})
 	if err != nil {
+		return nil, ErrInvalidEnvelope
+	}
+	if len(encoded) > MaxEnvelopeBytes {
+		Zero(encoded)
 		return nil, ErrInvalidEnvelope
 	}
 	return encoded, nil
@@ -171,6 +178,30 @@ func validKDFParams(params KDFParams) bool {
 	return params.MemoryKiB >= minMemoryKiB && params.MemoryKiB <= maxMemoryKiB &&
 		params.Iterations >= minIterations && params.Iterations <= maxIterations &&
 		params.Parallelism >= minParallelism && params.Parallelism <= maxParallelism
+}
+
+func envelopeFits(plaintext []byte, params KDFParams) bool {
+	if len(plaintext) > MaxEnvelopeBytes {
+		return false
+	}
+	ciphertextSize := len(plaintext) + chacha20poly1305.Overhead
+	encodedCiphertextSize := base64.StdEncoding.EncodedLen(ciphertextSize)
+
+	salt := make([]byte, saltSize)
+	nonce := make([]byte, chacha20poly1305.NonceSizeX)
+	fixed, err := json.Marshal(envelope{
+		Version:    envelopeVersion,
+		KDF:        params,
+		Salt:       base64.StdEncoding.EncodeToString(salt),
+		Nonce:      base64.StdEncoding.EncodeToString(nonce),
+		Ciphertext: "",
+	})
+	Zero(salt)
+	Zero(nonce)
+	if err != nil || len(fixed) > MaxEnvelopeBytes {
+		return false
+	}
+	return encodedCiphertextSize <= MaxEnvelopeBytes-len(fixed)
 }
 
 func associatedData(params KDFParams) []byte {

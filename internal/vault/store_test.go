@@ -92,6 +92,41 @@ func TestStoreSaveUsesInjectedAtomicWriter(t *testing.T) {
 	}
 }
 
+func TestStoreSaveRejectsOversizedDataWithoutReplacingVault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.json")
+	master := []byte("master")
+	want := Data{Servers: map[string]ServerSecret{
+		"existing": {Host: "existing.example.com", Port: 22, User: "deploy", Password: []byte("old-secret")},
+	}}
+	original, err := Seal(master, want, testKDFParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = (Store{Path: path}).Save(master, dataWithPasswordSize(13<<20))
+	if !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("Save() error = %v, want ErrInvalidEnvelope", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, original) {
+		t.Fatal("Save() changed existing vault bytes after oversized input")
+	}
+	got, err := (Store{Path: path}).Load(master)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Load() = %#v, want existing data", got)
+	}
+}
+
 func TestStoreInitializeDoesNotOverwriteExistingVault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vault.json")
 	original := []byte("existing vault")
