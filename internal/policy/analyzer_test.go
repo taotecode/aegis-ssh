@@ -358,3 +358,263 @@ func TestAnalyzerClassifiesSSHConfigFragments(t *testing.T) {
 		}
 	}
 }
+
+func TestAnalyzerClassifiesStaticWordsAcrossAST(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"for word iterator", `for p in ~/.ssh/id_rsa; do cat "$p"; done`, []Category{SSHSecret}},
+		{"array element", `paths=(/etc/hosts /tmp/plain); printf '%s\n' "${paths[@]}"`, []Category{NetworkIdentity}},
+		{"ordinary loop", `for p in /var/log/app.log; do cat "$p"; done`, nil},
+		{"ordinary array", `paths=(/tmp/a /tmp/b); printf '%s\n' "${paths[@]}"`, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerPreservesStaticArgumentPositions(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"dynamic command does not promote env", `$cmd env`, nil},
+		{"known path after dynamic command", `$cmd /etc/hosts`, []Category{NetworkIdentity}},
+		{"printenv mixed arguments", `printenv "$dynamic" AWS_SECRET_ACCESS_KEY`, []Category{CloudCredential, ProcessEnvironment}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerOnlyExpandsSimpleHOMEParameters(t *testing.T) {
+	commands := []string{
+		`cat "${HOME:+/tmp}/.ssh/id_rsa"`,
+		`cat "${HOME:-/tmp}/.ssh/id_rsa"`,
+		`cat "${HOME:0:2}/.ssh/id_rsa"`,
+		`cat "${HOME/foo/bar}/.ssh/id_rsa"`,
+		`cat "${HOME[0]}/.ssh/id_rsa"`,
+	}
+
+	for _, command := range commands {
+		got, err := NewAnalyzer().Analyze(command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", command, err)
+		}
+		if len(got.Categories) != 0 {
+			t.Errorf("Analyze(%q) categories = %#v, want none", command, got.Categories)
+		}
+	}
+}
+
+func TestAnalyzerUsesShellSpecificInvocationOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"bash bundled c static", `bash -lc 'ip route' /etc/hosts`, []Category{NetworkIdentity}},
+		{"bash bundled c dynamic", `bash -lc "$script" /etc/hosts`, nil},
+		{"sh posix options", `sh -eu -c 'ip route'`, []Category{NetworkIdentity}},
+		{"sh option value", `sh -o errexit -c 'ip route'`, []Category{NetworkIdentity}},
+		{"sh rejects bash long", `sh --rcfile /tmp/rc -c 'ip route'`, nil},
+		{"dash short cluster", `dash -ec 'ip route'`, []Category{NetworkIdentity}},
+		{"dash option value", `dash -o errexit -c 'ip route'`, []Category{NetworkIdentity}},
+		{"dash rejects bash long", `dash --noprofile -c 'ip route'`, nil},
+		{"zsh named options", `zsh --no-rcs --no-globalrcs -c 'ip route'`, []Category{NetworkIdentity}},
+		{"zsh option value", `zsh -o norcs -c 'ip route'`, []Category{NetworkIdentity}},
+		{"zsh rejects bash rcfile", `zsh --rcfile /tmp/rc -c 'ip route'`, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerClassifiesEnvOnlyWithoutUtility(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"plain", `env`, []Category{ProcessEnvironment}},
+		{"null separated", `env -0`, []Category{ProcessEnvironment}},
+		{"assignment only", `env FOO=bar`, []Category{ProcessEnvironment}},
+		{"clean assignment only", `env -i FOO=bar`, []Category{ProcessEnvironment}},
+		{"known utility", `env FOO=bar command`, nil},
+		{"known sensitive utility path", `env FOO=bar /etc/hosts`, []Category{NetworkIdentity}},
+		{"dynamic possible utility", `env FOO=bar "$utility"`, nil},
+		{"dynamic after option", `env -i "$utility"`, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerClassifiesApplicationCredentialPaths(t *testing.T) {
+	commands := []string{
+		`cat ~/.git-credentials`,
+		`cat ~/.netrc`,
+		`cat ~/.npmrc`,
+		`cat ~/.docker/config.json`,
+		`cat ~/.config/gh/hosts.yml`,
+	}
+
+	for _, command := range commands {
+		got, err := NewAnalyzer().Analyze(command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", command, err)
+		}
+		want := Analysis{
+			Categories: []Category{CloudCredential},
+			Findings: []Finding{{
+				Category: CloudCredential,
+				Rule:     "application_credential_path",
+				Evidence: "application credential path",
+			}},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Analyze(%q) = %#v, want %#v", command, got, want)
+		}
+	}
+}
+
+func TestAnalyzerAvoidsApplicationCredentialPathFalsePositives(t *testing.T) {
+	for _, command := range []string{
+		`cat ~/.gitconfig`,
+		`cat ./package.json`,
+		`cat /etc/docker/daemon.json`,
+	} {
+		got, err := NewAnalyzer().Analyze(command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", command, err)
+		}
+		if len(got.Categories) != 0 {
+			t.Errorf("Analyze(%q) categories = %#v, want none", command, got.Categories)
+		}
+	}
+}
+
+func TestAnalyzerFindingLabelsAreCompleteAndBounded(t *testing.T) {
+	want := []findingLabel{
+		{"application_credential_path", "application credential path"},
+		{"cloud_credential_path", "cloud credential path"},
+		{"cloud_environment", "cloud credential environment"},
+		{"database_credential_path", "database credential path"},
+		{"environment_command", "environment listing command"},
+		{"kubernetes_sensitive_path", "kubernetes sensitive path"},
+		{"network_command", "network identity command"},
+		{"network_identity_path", "network identity path"},
+		{"private_key_input", "private key input"},
+		{"private_key_path", "private key path"},
+		{"process_environment_path", "process environment path"},
+		{"public_ip_lookup", "public IP lookup command"},
+		{"ssh_sensitive_path", "ssh sensitive path"},
+	}
+	if !reflect.DeepEqual(allFindingLabels, want) {
+		t.Fatalf("allFindingLabels = %#v, want %#v", allFindingLabels, want)
+	}
+	for _, label := range allFindingLabels {
+		if label.rule == "" || label.evidence == "" || len(label.rule) > 128 || len(label.evidence) > 128 {
+			t.Errorf("invalid finding label: %#v", label)
+		}
+	}
+}
+
+func TestAnalyzerNestedShellDepthLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		depth int
+		want  []Category
+	}{
+		{"four levels", 4, []Category{NetworkIdentity}},
+		{"five levels", 5, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(nestedShellCommand(tt.depth, "ip route"))
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerCommandLengthBoundary(t *testing.T) {
+	prefix := "echo "
+	exact := prefix + strings.Repeat("x", maxCommandBytes-len(prefix))
+	if _, err := NewAnalyzer().Analyze(exact); err != nil {
+		t.Fatalf("Analyze(exact limit) error = %v", err)
+	}
+	_, err := NewAnalyzer().Analyze(exact + "x")
+	if !errors.Is(err, ErrInvalidShell) || err.Error() != ErrInvalidShell.Error() {
+		t.Fatalf("Analyze(limit + 1) error = %v, want sanitized ErrInvalidShell", err)
+	}
+}
+
+func FuzzAnalyzerNoPanic(f *testing.F) {
+	prefix := "echo "
+	for _, command := range []string{
+		`systemctl status nginx`,
+		string([]byte{'c', 'a', 't', ' ', 0xff, 0xfe}),
+		nestedShellCommand(4, "ip route"),
+		prefix + strings.Repeat("x", maxCommandBytes-len(prefix)),
+		`cat "unterminated`,
+	} {
+		f.Add(command)
+	}
+
+	f.Fuzz(func(t *testing.T, command string) {
+		_, _ = NewAnalyzer().Analyze(command)
+	})
+}
+
+func nestedShellCommand(depth int, leaf string) string {
+	command := leaf
+	for range depth {
+		command = "sh -c '" + strings.ReplaceAll(command, "'", `'"'"'`) + "'"
+	}
+	return command
+}

@@ -5,66 +5,100 @@ import (
 	"strings"
 )
 
-func classifyCall(words []string) []Finding {
+func classifyCall(args []staticArg) []Finding {
 	var findings []Finding
-	command := filepath.Base(words[0])
-	args := words[1:]
-	if isShell(command) {
-		for i, word := range args {
-			if word == "-c" {
-				args = args[:i]
-				break
-			}
-		}
+	if len(args) == 0 || !args[0].Known {
+		return nil
 	}
-	for _, word := range args {
-		findings = append(findings, classifyPath(word)...)
-	}
-	if command == "openssl" && isOpenSSLPrivateKeyInput(words[1:]) {
-		findings = append(findings, Finding{PrivateKey, "private_key_input", "private key input"})
+	command := filepath.Base(args[0].Value)
+	commandArgs := args[1:]
+	if command == "openssl" && isOpenSSLPrivateKeyInput(commandArgs) {
+		findings = append(findings, labeledFinding(PrivateKey, labelPrivateKeyInput))
 	}
 	switch {
-	case command == "env" && len(words) == 1:
-		findings = append(findings, Finding{ProcessEnvironment, "environment_command", "environment listing command"})
+	case command == "env" && isEnvironmentListing(commandArgs):
+		findings = append(findings, labeledFinding(ProcessEnvironment, labelEnvironmentCommand))
 	case command == "printenv":
-		findings = append(findings, Finding{ProcessEnvironment, "environment_command", "environment listing command"})
-		if containsCloudEnvironment(words[1:]) {
-			findings = append(findings, Finding{CloudCredential, "cloud_environment", "cloud credential environment"})
+		findings = append(findings, labeledFinding(ProcessEnvironment, labelEnvironmentCommand))
+		if containsCloudEnvironment(commandArgs) {
+			findings = append(findings, labeledFinding(CloudCredential, labelCloudEnvironment))
 		}
-	case command == "set" && len(words) == 1:
-		findings = append(findings, Finding{ProcessEnvironment, "environment_command", "environment listing command"})
-	case command == "ip" && containsIPSubcommand(words[1:]):
-		findings = append(findings, Finding{NetworkIdentity, "network_command", "network identity command"})
+	case command == "set" && len(commandArgs) == 0:
+		findings = append(findings, labeledFinding(ProcessEnvironment, labelEnvironmentCommand))
+	case command == "ip" && containsIPSubcommand(commandArgs):
+		findings = append(findings, labeledFinding(NetworkIdentity, labelNetworkCommand))
 	case command == "ifconfig", command == "ss", command == "netstat", command == "route":
-		findings = append(findings, Finding{NetworkIdentity, "network_command", "network identity command"})
-	case command == "hostname" && containsWord(words[1:], "-I"):
-		findings = append(findings, Finding{NetworkIdentity, "network_command", "network identity command"})
-	case isPublicIPLookup(command, words[1:]):
-		findings = append(findings, Finding{NetworkIdentity, "public_ip_lookup", "public IP lookup command"})
+		findings = append(findings, labeledFinding(NetworkIdentity, labelNetworkCommand))
+	case command == "hostname" && containsWord(commandArgs, "-I"):
+		findings = append(findings, labeledFinding(NetworkIdentity, labelNetworkCommand))
+	case isPublicIPLookup(command, commandArgs):
+		findings = append(findings, labeledFinding(NetworkIdentity, labelPublicIPLookup))
 	}
 	return findings
+}
+
+func isEnvironmentListing(args []staticArg) bool {
+	for _, arg := range args {
+		if !arg.Known {
+			return false
+		}
+		switch arg.Value {
+		case "-0", "-i", "--ignore-environment":
+			continue
+		}
+		if isEnvironmentAssignment(arg.Value) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isEnvironmentAssignment(value string) bool {
+	equals := strings.IndexByte(value, '=')
+	if equals <= 0 {
+		return false
+	}
+	for i, char := range value[:equals] {
+		if char == '_' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || i > 0 && char >= '0' && char <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func classifyPath(value string) []Finding {
 	normalized := strings.ToLower(strings.TrimSuffix(value, "/"))
 	switch {
 	case isSSHPath(normalized):
-		return []Finding{{SSHSecret, "ssh_sensitive_path", "ssh sensitive path"}}
+		return []Finding{labeledFinding(SSHSecret, labelSSHSensitivePath)}
+	case isApplicationCredentialPath(normalized):
+		return []Finding{labeledFinding(CloudCredential, labelApplicationCredentialPath)}
 	case isCloudPath(normalized):
-		return []Finding{{CloudCredential, "cloud_credential_path", "cloud credential path"}}
+		return []Finding{labeledFinding(CloudCredential, labelCloudCredentialPath)}
 	case isProcessEnvironmentPath(normalized):
-		return []Finding{{ProcessEnvironment, "process_environment_path", "process environment path"}}
+		return []Finding{labeledFinding(ProcessEnvironment, labelProcessEnvironmentPath)}
 	case isDatabasePath(normalized):
-		return []Finding{{DatabaseCredential, "database_credential_path", "database credential path"}}
+		return []Finding{labeledFinding(DatabaseCredential, labelDatabaseCredentialPath)}
 	case isKubernetesPath(normalized):
-		return []Finding{{KubernetesSecret, "kubernetes_sensitive_path", "kubernetes sensitive path"}}
+		return []Finding{labeledFinding(KubernetesSecret, labelKubernetesSensitivePath)}
 	case isNetworkPath(normalized):
-		return []Finding{{NetworkIdentity, "network_identity_path", "network identity path"}}
+		return []Finding{labeledFinding(NetworkIdentity, labelNetworkIdentityPath)}
 	case isPrivateKeyPath(normalized):
-		return []Finding{{PrivateKey, "private_key_path", "private key path"}}
+		return []Finding{labeledFinding(PrivateKey, labelPrivateKeyPath)}
 	default:
 		return nil
 	}
+}
+
+func isApplicationCredentialPath(path string) bool {
+	switch filepath.Base(path) {
+	case ".git-credentials", ".netrc", ".npmrc":
+		return true
+	}
+	return path == "~/.docker/config.json" || strings.HasSuffix(path, "/.docker/config.json") ||
+		path == "~/.config/gh/hosts.yml" || strings.HasSuffix(path, "/.config/gh/hosts.yml")
 }
 
 func isSSHPath(path string) bool {
@@ -127,9 +161,9 @@ func isPrivateKeyPath(path string) bool {
 		(strings.HasSuffix(base, ".pem") && (strings.Contains(base, "private") || strings.Contains(base, "private-key") || strings.Contains(path, "/private/")))
 }
 
-func containsCloudEnvironment(words []string) bool {
-	for _, word := range words {
-		if isCloudEnvironment(word) {
+func containsCloudEnvironment(args []staticArg) bool {
+	for _, arg := range args {
+		if arg.Known && isCloudEnvironment(arg.Value) {
 			return true
 		}
 	}
@@ -143,10 +177,13 @@ func isCloudEnvironment(name string) bool {
 		strings.HasPrefix(upper, "AZURE_") && (strings.Contains(upper, "SECRET") || strings.Contains(upper, "TOKEN") || strings.Contains(upper, "CREDENTIAL"))
 }
 
-func isOpenSSLPrivateKeyInput(words []string) bool {
+func isOpenSSLPrivateKeyInput(args []staticArg) bool {
 	privateSubcommand := false
-	for _, word := range words {
-		switch word {
+	for _, arg := range args {
+		if !arg.Known {
+			continue
+		}
+		switch arg.Value {
 		case "pkey", "rsa", "ec", "dsa", "pkcs8":
 			privateSubcommand = true
 		}
@@ -154,23 +191,26 @@ func isOpenSSLPrivateKeyInput(words []string) bool {
 	if !privateSubcommand {
 		return false
 	}
-	for i := 0; i+1 < len(words); i++ {
-		if words[i] != "-in" {
+	for i := 0; i+1 < len(args); i++ {
+		if !args[i].Known || args[i].Value != "-in" || !args[i+1].Known {
 			continue
 		}
-		path := strings.ToLower(words[i+1])
+		path := strings.ToLower(args[i+1].Value)
 		base := filepath.Base(path)
 		return isPrivateKeyPath(path) || strings.HasSuffix(base, ".pem") && strings.Contains(path, "/private/")
 	}
 	return false
 }
 
-func containsIPSubcommand(words []string) bool {
-	for _, word := range words {
-		if strings.HasPrefix(word, "-") {
+func containsIPSubcommand(args []staticArg) bool {
+	for _, arg := range args {
+		if !arg.Known {
+			return false
+		}
+		if strings.HasPrefix(arg.Value, "-") {
 			continue
 		}
-		switch word {
+		switch arg.Value {
 		case "addr", "address", "route", "link", "neigh", "neighbor":
 			return true
 		default:
@@ -180,21 +220,24 @@ func containsIPSubcommand(words []string) bool {
 	return false
 }
 
-func containsWord(words []string, target string) bool {
-	for _, word := range words {
-		if word == target {
+func containsWord(args []staticArg, target string) bool {
+	for _, arg := range args {
+		if arg.Known && arg.Value == target {
 			return true
 		}
 	}
 	return false
 }
 
-func isPublicIPLookup(command string, words []string) bool {
+func isPublicIPLookup(command string, args []staticArg) bool {
 	if command != "curl" && command != "wget" && command != "dig" && command != "host" {
 		return false
 	}
-	for _, word := range words {
-		lower := strings.ToLower(word)
+	for _, arg := range args {
+		if !arg.Known {
+			continue
+		}
+		lower := strings.ToLower(arg.Value)
 		if strings.Contains(lower, "api.ipify.org") || strings.Contains(lower, "ifconfig.me") ||
 			strings.Contains(lower, "icanhazip.com") || strings.Contains(lower, "checkip.amazonaws.com") ||
 			strings.Contains(lower, "myip.opendns.com") {

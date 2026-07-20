@@ -2,7 +2,6 @@ package policy
 
 import (
 	"errors"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -39,6 +38,11 @@ type Analysis struct {
 
 type Analyzer struct{}
 
+type staticArg struct {
+	Value string
+	Known bool
+}
+
 var ErrInvalidShell = errors.New("invalid shell command")
 
 func NewAnalyzer() *Analyzer { return &Analyzer{} }
@@ -64,39 +68,40 @@ func (a *Analyzer) analyze(command string, depth int) ([]Finding, error) {
 	}
 
 	var findings []Finding
+	excludedWords := make(map[*syntax.Word]struct{})
 	syntax.Walk(file, func(node syntax.Node) bool {
 		switch node := node.(type) {
 		case *syntax.CallExpr:
-			words := staticWords(node.Args)
-			if len(words) == 0 {
+			args := makeStaticArgs(node.Args)
+			if len(args) == 0 {
 				return true
 			}
-			findings = append(findings, classifyCall(words)...)
-			if depth < maxShellDepth {
-				if script, ok := staticShellScript(node.Args); ok {
-					nested, nestedErr := a.analyze(script, depth+1)
+			findings = append(findings, classifyCall(args)...)
+			if invocation, ok := parseShellInvocation(node.Args); ok {
+				for _, word := range node.Args[invocation.positionalStart:] {
+					excludedWords[word] = struct{}{}
+				}
+				if depth < maxShellDepth && invocation.commandStringIndex >= 0 && invocation.commandStringKnown {
+					nested, nestedErr := a.analyze(invocation.commandString, depth+1)
 					if nestedErr == nil {
 						findings = append(findings, nested...)
 					}
 				}
 			}
-		case *syntax.Assign:
-			if node.Value != nil {
-				if value, ok := staticWord(node.Value); ok {
-					findings = append(findings, classifyPath(value)...)
-				}
+		case *syntax.Word:
+			if _, excluded := excludedWords[node]; excluded {
+				break
 			}
-		case *syntax.Redirect:
-			if value, ok := staticWord(node.Word); ok {
+			if value, ok := staticWord(node); ok {
 				findings = append(findings, classifyPath(value)...)
 			}
 		case *syntax.DeclClause:
 			if node.Variant.Value == "export" && (len(node.Args) == 0 || declHasOption(node, "-p")) {
-				findings = append(findings, Finding{ProcessEnvironment, "environment_command", "environment listing command"})
+				findings = append(findings, labeledFinding(ProcessEnvironment, labelEnvironmentCommand))
 			}
 		case *syntax.ParamExp:
 			if name, ok := simpleParameterName(node); ok && isCloudEnvironment(name) {
-				findings = append(findings, Finding{CloudCredential, "cloud_environment", "cloud credential environment"})
+				findings = append(findings, labeledFinding(CloudCredential, labelCloudEnvironment))
 			}
 		}
 		return true
@@ -104,14 +109,10 @@ func (a *Analyzer) analyze(command string, depth int) ([]Finding, error) {
 	return findings, nil
 }
 
-func staticWords(words []*syntax.Word) []string {
-	result := make([]string, 0, len(words))
-	for _, word := range words {
-		value, ok := staticWord(word)
-		if !ok {
-			continue
-		}
-		result = append(result, value)
+func makeStaticArgs(words []*syntax.Word) []staticArg {
+	result := make([]staticArg, len(words))
+	for i, word := range words {
+		result[i].Value, result[i].Known = staticWord(word)
 	}
 	return result
 }
@@ -142,7 +143,7 @@ func writeStaticPart(value *strings.Builder, part syntax.WordPart) bool {
 		}
 		return true
 	case *syntax.ParamExp:
-		if part.Param != nil && part.Param.Value == "HOME" && !part.Excl && !part.Length {
+		if name, ok := simpleParameterName(part); ok && name == "HOME" {
 			value.WriteByte('~')
 			return true
 		}
@@ -159,72 +160,6 @@ func simpleParameterName(param *syntax.ParamExp) (string, bool) {
 	return param.Param.Value, true
 }
 
-func staticShellScript(args []*syntax.Word) (string, bool) {
-	if len(args) == 0 {
-		return "", false
-	}
-	command, ok := staticWord(args[0])
-	if !ok || !isShell(command) {
-		return "", false
-	}
-	for i := 1; i < len(args); i++ {
-		option, optionOK := staticWord(args[i])
-		if !optionOK {
-			return "", false
-		}
-		switch option {
-		case "--":
-			return "", false
-		case "-c":
-			if i+1 >= len(args) {
-				return "", false
-			}
-			return staticWord(args[i+1])
-		case "-O", "-o", "+O", "+o", "--rcfile", "--init-file":
-			if i+1 >= len(args) {
-				return "", false
-			}
-			i++
-			continue
-		case "--noprofile", "--norc", "--posix", "--restricted", "--verbose", "--debugger", "--noediting", "--login":
-			continue
-		}
-		if strings.HasPrefix(option, "--rcfile=") || strings.HasPrefix(option, "--init-file=") {
-			continue
-		}
-		if len(option) == 1 || option[0] != '-' && option[0] != '+' {
-			return "", false
-		}
-		hasCommandString, valid := shellShortOptionCluster(option[1:])
-		if !valid {
-			return "", false
-		}
-		if option[0] == '+' {
-			continue
-		}
-		if hasCommandString {
-			if i+1 >= len(args) {
-				return "", false
-			}
-			return staticWord(args[i+1])
-		}
-	}
-	return "", false
-}
-
-func shellShortOptionCluster(cluster string) (hasCommandString, valid bool) {
-	for _, option := range cluster {
-		if option == 'c' {
-			hasCommandString = true
-			continue
-		}
-		if !strings.ContainsRune("abefhkmnptuvxBCEHPTDilsr", option) {
-			return false, false
-		}
-	}
-	return hasCommandString, cluster != ""
-}
-
 func declHasOption(decl *syntax.DeclClause, option string) bool {
 	for _, arg := range decl.Args {
 		if arg.Value == nil {
@@ -235,15 +170,6 @@ func declHasOption(decl *syntax.DeclClause, option string) bool {
 		}
 	}
 	return false
-}
-
-func isShell(command string) bool {
-	switch filepath.Base(command) {
-	case "sh", "bash", "dash", "zsh":
-		return true
-	default:
-		return false
-	}
 }
 
 func buildAnalysis(findings []Finding) Analysis {
