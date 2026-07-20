@@ -270,6 +270,37 @@ func TestAnalyzerParsesNestedShellOptionBoundaries(t *testing.T) {
 	}
 }
 
+func TestAnalyzerHandlesNestedShellPlusOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"bash plus x", `bash +x -c 'ip route'`, []Category{NetworkIdentity}},
+		{"sh plus x", `sh +x -c 'ip route'`, []Category{NetworkIdentity}},
+		{"dash plus x", `dash +x -c 'ip route'`, []Category{NetworkIdentity}},
+		{"zsh plus x", `zsh +x -c 'ip route'`, []Category{NetworkIdentity}},
+		{"plus short cluster", `bash +xeu -c 'ip route'`, []Category{NetworkIdentity}},
+		{"plus O with value", `bash +O extglob -c 'ip route'`, []Category{NetworkIdentity}},
+		{"plus o with value", `bash +o verbose -c 'ip route'`, []Category{NetworkIdentity}},
+		{"plus c is not selector", `bash +c 'ip route'`, nil},
+		{"plus c then minus c", `bash +c -c 'ip route'`, []Category{NetworkIdentity}},
+		{"unknown plus option", `bash +not-an-option -c 'ip route'`, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
 func TestAnalyzerClassifiesPrivatePEMDirectories(t *testing.T) {
 	for _, command := range []string{
 		`cat /etc/ssl/private/server.pem`,

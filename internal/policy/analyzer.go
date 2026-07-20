@@ -192,12 +192,15 @@ func staticShellScript(args []*syntax.Word) (string, bool) {
 		if strings.HasPrefix(option, "--rcfile=") || strings.HasPrefix(option, "--init-file=") {
 			continue
 		}
-		if !strings.HasPrefix(option, "-") || len(option) == 1 {
+		if len(option) == 1 || option[0] != '-' && option[0] != '+' {
 			return "", false
 		}
 		hasCommandString, valid := shellShortOptionCluster(option[1:])
 		if !valid {
 			return "", false
+		}
+		if option[0] == '+' {
+			continue
 		}
 		if hasCommandString {
 			if i+1 >= len(args) {
