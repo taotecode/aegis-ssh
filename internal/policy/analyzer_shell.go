@@ -54,7 +54,7 @@ func parseShellOptions(words []*syntax.Word, spec shellOptionSpec) shellInvocati
 			return invocation
 		}
 		if option == "--" {
-			invocation.positionalStart = i + 1
+			invocation.positionalStart = min(i+2, len(words))
 			return invocation
 		}
 		if _, ok := spec.valueOptions[option]; ok {
@@ -71,7 +71,7 @@ func parseShellOptions(words []*syntax.Word, spec shellOptionSpec) shellInvocati
 			continue
 		}
 		if len(option) < 2 || option[0] != '-' && (!spec.allowPlusShort || option[0] != '+') {
-			invocation.positionalStart = i
+			invocation.positionalStart = i + 1
 			return invocation
 		}
 
@@ -141,7 +141,7 @@ func zshOptionSpec() shellOptionSpec {
 	return shellOptionSpec{
 		shortOptions:   "abefhkmnptuvxDilsrdy",
 		valueOptions:   stringSet("-o", "+o"),
-		flagOptions:    stringSet("--no-rcs", "--no-globalrcs", "--rcs", "--globalrcs"),
+		flagOptions:    stringSet("--no-rcs", "--no-globalrcs", "--rcs", "--globalrcs", "--no-rcexpandparam", "--rcexpandparam"),
 		allowPlusShort: true,
 	}
 }

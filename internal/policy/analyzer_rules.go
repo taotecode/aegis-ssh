@@ -38,12 +38,27 @@ func classifyCall(args []staticArg) []Finding {
 }
 
 func isEnvironmentListing(args []staticArg) bool {
-	for _, arg := range args {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		if !arg.Known {
 			return false
 		}
 		switch arg.Value {
 		case "-0", "-i", "--ignore-environment":
+			continue
+		case "--":
+			return i == len(args)-1
+		case "-u", "--unset":
+			if i+1 >= len(args) || !args[i+1].Known || !isEnvironmentName(args[i+1].Value) {
+				return false
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg.Value, "--unset=") {
+			if !isEnvironmentName(strings.TrimPrefix(arg.Value, "--unset=")) {
+				return false
+			}
 			continue
 		}
 		if isEnvironmentAssignment(arg.Value) {
@@ -59,7 +74,14 @@ func isEnvironmentAssignment(value string) bool {
 	if equals <= 0 {
 		return false
 	}
-	for i, char := range value[:equals] {
+	return isEnvironmentName(value[:equals])
+}
+
+func isEnvironmentName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, char := range value {
 		if char == '_' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || i > 0 && char >= '0' && char <= '9' {
 			continue
 		}
@@ -94,11 +116,14 @@ func classifyPath(value string) []Finding {
 
 func isApplicationCredentialPath(path string) bool {
 	switch filepath.Base(path) {
-	case ".git-credentials", ".netrc", ".npmrc":
+	case ".git-credentials", ".netrc", ".npmrc", ".pypirc":
 		return true
 	}
 	return path == "~/.docker/config.json" || strings.HasSuffix(path, "/.docker/config.json") ||
-		path == "~/.config/gh/hosts.yml" || strings.HasSuffix(path, "/.config/gh/hosts.yml")
+		path == "~/.config/gh/hosts.yml" || strings.HasSuffix(path, "/.config/gh/hosts.yml") ||
+		path == "~/.cargo/credentials" || strings.HasSuffix(path, "/.cargo/credentials") ||
+		path == "~/.cargo/credentials.toml" || strings.HasSuffix(path, "/.cargo/credentials.toml") ||
+		path == "~/.config/git/credentials" || strings.HasSuffix(path, "/.config/git/credentials")
 }
 
 func isSSHPath(path string) bool {

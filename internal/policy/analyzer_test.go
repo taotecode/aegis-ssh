@@ -618,3 +618,130 @@ func nestedShellCommand(depth int, leaf string) string {
 	}
 	return command
 }
+
+func TestAnalyzerClassifiesShellFileScriptOperands(t *testing.T) {
+	tests := []struct {
+		command string
+		want    []Category
+	}{
+		{`bash ~/.ssh/config`, []Category{SSHSecret}},
+		{`sh /etc/hosts`, []Category{NetworkIdentity}},
+		{`bash -c 'ip route' /etc/hosts`, []Category{NetworkIdentity}},
+		{`bash -c "$script" /etc/hosts`, nil},
+	}
+
+	for _, tt := range tests {
+		got, err := NewAnalyzer().Analyze(tt.command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", tt.command, err)
+		}
+		if !reflect.DeepEqual(got.Categories, tt.want) {
+			t.Errorf("Analyze(%q) categories = %#v, want %#v", tt.command, got.Categories, tt.want)
+		}
+	}
+}
+
+func TestAnalyzerClassifiesEnvUnsetWithoutUtility(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"short unset", `env -u NAME`, []Category{ProcessEnvironment}},
+		{"long unset", `env --unset NAME`, []Category{ProcessEnvironment}},
+		{"long unset equals", `env --unset=NAME`, []Category{ProcessEnvironment}},
+		{"option terminator", `env --`, []Category{ProcessEnvironment}},
+		{"short unset utility", `env -u NAME command`, nil},
+		{"long unset utility", `env --unset NAME command`, nil},
+		{"terminator utility", `env -- command`, nil},
+		{"short unset missing value", `env -u`, nil},
+		{"short unset dynamic value", `env -u "$name"`, nil},
+		{"long unset dynamic value", `env --unset="$name"`, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerDoesNotTreatValueOptionClusterCAsCommandSelector(t *testing.T) {
+	tests := []struct {
+		command string
+		want    []Category
+	}{
+		{`bash -oc 'ip route'`, nil},
+		{`bash -Oc 'ip route'`, nil},
+		{`bash +oc 'ip route'`, nil},
+		{`dash -oc 'ip route'`, nil},
+		{`dash +oc 'ip route'`, nil},
+		{`bash -o errexit -c 'ip route'`, []Category{NetworkIdentity}},
+		{`dash -o errexit -c 'ip route'`, []Category{NetworkIdentity}},
+	}
+
+	for _, tt := range tests {
+		got, err := NewAnalyzer().Analyze(tt.command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", tt.command, err)
+		}
+		if !reflect.DeepEqual(got.Categories, tt.want) {
+			t.Errorf("Analyze(%q) categories = %#v, want %#v", tt.command, got.Categories, tt.want)
+		}
+	}
+}
+
+func TestAnalyzerAcceptsVerifiedZshNamedOptions(t *testing.T) {
+	tests := []struct {
+		command string
+		want    []Category
+	}{
+		{`zsh --no-rcexpandparam -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh --rcexpandparam -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh --not-a-real-option -c 'ip route'`, nil},
+	}
+
+	for _, tt := range tests {
+		got, err := NewAnalyzer().Analyze(tt.command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", tt.command, err)
+		}
+		if !reflect.DeepEqual(got.Categories, tt.want) {
+			t.Errorf("Analyze(%q) categories = %#v, want %#v", tt.command, got.Categories, tt.want)
+		}
+	}
+}
+
+func TestAnalyzerClassifiesAdditionalApplicationCredentialPaths(t *testing.T) {
+	for _, command := range []string{
+		`cat ~/.pypirc`,
+		`cat ~/.cargo/credentials`,
+		`cat ~/.cargo/credentials.toml`,
+		`cat ~/.config/git/credentials`,
+	} {
+		got, err := NewAnalyzer().Analyze(command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", command, err)
+		}
+		want := []Category{CloudCredential}
+		if !reflect.DeepEqual(got.Categories, want) {
+			t.Errorf("Analyze(%q) categories = %#v, want %#v", command, got.Categories, want)
+		}
+	}
+
+	for _, command := range []string{`cat pyproject.toml`, `cat Cargo.toml`, `cat ~/.gitconfig`} {
+		got, err := NewAnalyzer().Analyze(command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", command, err)
+		}
+		if len(got.Categories) != 0 {
+			t.Errorf("Analyze(%q) categories = %#v, want none", command, got.Categories)
+		}
+	}
+}
