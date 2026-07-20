@@ -239,6 +239,37 @@ func TestAnalyzerRecursesStaticNestedScriptWithDynamicTrailingArgs(t *testing.T)
 	}
 }
 
+func TestAnalyzerParsesNestedShellOptionBoundaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"script file ends option phase", `bash script.sh -c 'ip route'`, nil},
+		{"double dash ends option phase", `bash -- -c 'env'`, nil},
+		{"relative script ends option phase", `bash ./script -c 'cat ~/.ssh/id_rsa'`, nil},
+		{"short flag before command string", `bash -x -c 'ip route'`, []Category{NetworkIdentity}},
+		{"short option cluster", `bash -lc 'ip route'`, []Category{NetworkIdentity}},
+		{"long flags before command string", `bash --noprofile --norc -c 'ip route'`, []Category{NetworkIdentity}},
+		{"short option with value", `bash -O extglob -c 'ip route'`, []Category{NetworkIdentity}},
+		{"long option with value", `bash --rcfile /tmp/rc -c 'ip route'`, []Category{NetworkIdentity}},
+		{"long option with dynamic value", `bash --rcfile "$rcfile" -c 'ip route'`, []Category{NetworkIdentity}},
+		{"dynamic unknown option", `bash "$unknown" -c 'ip route'`, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
 func TestAnalyzerClassifiesPrivatePEMDirectories(t *testing.T) {
 	for _, command := range []string{
 		`cat /etc/ssl/private/server.pem`,

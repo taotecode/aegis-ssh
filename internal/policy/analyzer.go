@@ -167,14 +167,59 @@ func staticShellScript(args []*syntax.Word) (string, bool) {
 	if !ok || !isShell(command) {
 		return "", false
 	}
-	for i := 1; i+1 < len(args); i++ {
+	for i := 1; i < len(args); i++ {
 		option, optionOK := staticWord(args[i])
-		if !optionOK || option != "-c" {
+		if !optionOK {
+			return "", false
+		}
+		switch option {
+		case "--":
+			return "", false
+		case "-c":
+			if i+1 >= len(args) {
+				return "", false
+			}
+			return staticWord(args[i+1])
+		case "-O", "-o", "+O", "+o", "--rcfile", "--init-file":
+			if i+1 >= len(args) {
+				return "", false
+			}
+			i++
+			continue
+		case "--noprofile", "--norc", "--posix", "--restricted", "--verbose", "--debugger", "--noediting", "--login":
 			continue
 		}
-		return staticWord(args[i+1])
+		if strings.HasPrefix(option, "--rcfile=") || strings.HasPrefix(option, "--init-file=") {
+			continue
+		}
+		if !strings.HasPrefix(option, "-") || len(option) == 1 {
+			return "", false
+		}
+		hasCommandString, valid := shellShortOptionCluster(option[1:])
+		if !valid {
+			return "", false
+		}
+		if hasCommandString {
+			if i+1 >= len(args) {
+				return "", false
+			}
+			return staticWord(args[i+1])
+		}
 	}
 	return "", false
+}
+
+func shellShortOptionCluster(cluster string) (hasCommandString, valid bool) {
+	for _, option := range cluster {
+		if option == 'c' {
+			hasCommandString = true
+			continue
+		}
+		if !strings.ContainsRune("abefhkmnptuvxBCEHPTDilsr", option) {
+			return false, false
+		}
+	}
+	return hasCommandString, cluster != ""
 }
 
 func declHasOption(decl *syntax.DeclClause, option string) bool {
