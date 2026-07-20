@@ -8,7 +8,16 @@ import (
 func classifyCall(words []string) []Finding {
 	var findings []Finding
 	command := filepath.Base(words[0])
-	for _, word := range words[1:] {
+	args := words[1:]
+	if isShell(command) {
+		for i, word := range args {
+			if word == "-c" {
+				args = args[:i]
+				break
+			}
+		}
+	}
+	for _, word := range args {
 		findings = append(findings, classifyPath(word)...)
 	}
 	if command == "openssl" && isOpenSSLPrivateKeyInput(words[1:]) {
@@ -68,6 +77,9 @@ func isSSHPath(path string) bool {
 		return true
 	}
 	if strings.HasPrefix(path, "/etc/ssh/") {
+		if strings.HasPrefix(path, "/etc/ssh/ssh_config.d/") || strings.HasPrefix(path, "/etc/ssh/sshd_config.d/") {
+			return strings.HasSuffix(path, ".conf")
+		}
 		return base == "ssh_config" || base == "sshd_config" ||
 			(strings.HasPrefix(base, "ssh_host_") && !strings.HasSuffix(base, ".pub")) ||
 			(base == "id_rsa" || base == "id_dsa" || base == "id_ecdsa" || base == "id_ed25519")
@@ -112,7 +124,7 @@ func isNetworkPath(path string) bool {
 func isPrivateKeyPath(path string) bool {
 	base := filepath.Base(path)
 	return strings.HasSuffix(base, ".key") ||
-		(strings.HasSuffix(base, ".pem") && (strings.Contains(base, "private") || strings.Contains(base, "private-key")))
+		(strings.HasSuffix(base, ".pem") && (strings.Contains(base, "private") || strings.Contains(base, "private-key") || strings.Contains(path, "/private/")))
 }
 
 func containsCloudEnvironment(words []string) bool {

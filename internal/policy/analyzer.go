@@ -67,21 +67,17 @@ func (a *Analyzer) analyze(command string, depth int) ([]Finding, error) {
 	syntax.Walk(file, func(node syntax.Node) bool {
 		switch node := node.(type) {
 		case *syntax.CallExpr:
-			words, complete := staticWords(node.Args)
+			words := staticWords(node.Args)
 			if len(words) == 0 {
 				return true
 			}
 			findings = append(findings, classifyCall(words)...)
-			if complete && depth < maxShellDepth && isShell(words[0]) {
-				for i := 1; i+1 < len(words); i++ {
-					if words[i] != "-c" {
-						continue
-					}
-					nested, nestedErr := a.analyze(words[i+1], depth+1)
+			if depth < maxShellDepth {
+				if script, ok := staticShellScript(node.Args); ok {
+					nested, nestedErr := a.analyze(script, depth+1)
 					if nestedErr == nil {
 						findings = append(findings, nested...)
 					}
-					break
 				}
 			}
 		case *syntax.Assign:
@@ -95,7 +91,7 @@ func (a *Analyzer) analyze(command string, depth int) ([]Finding, error) {
 				findings = append(findings, classifyPath(value)...)
 			}
 		case *syntax.DeclClause:
-			if node.Variant.Value == "export" && declHasOption(node, "-p") {
+			if node.Variant.Value == "export" && (len(node.Args) == 0 || declHasOption(node, "-p")) {
 				findings = append(findings, Finding{ProcessEnvironment, "environment_command", "environment listing command"})
 			}
 		case *syntax.ParamExp:
@@ -108,18 +104,16 @@ func (a *Analyzer) analyze(command string, depth int) ([]Finding, error) {
 	return findings, nil
 }
 
-func staticWords(words []*syntax.Word) ([]string, bool) {
+func staticWords(words []*syntax.Word) []string {
 	result := make([]string, 0, len(words))
-	complete := true
 	for _, word := range words {
 		value, ok := staticWord(word)
 		if !ok {
-			complete = false
 			continue
 		}
 		result = append(result, value)
 	}
-	return result, complete
+	return result
 }
 
 func staticWord(word *syntax.Word) (string, bool) {
@@ -163,6 +157,24 @@ func simpleParameterName(param *syntax.ParamExp) (string, bool) {
 		return "", false
 	}
 	return param.Param.Value, true
+}
+
+func staticShellScript(args []*syntax.Word) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	command, ok := staticWord(args[0])
+	if !ok || !isShell(command) {
+		return "", false
+	}
+	for i := 1; i+1 < len(args); i++ {
+		option, optionOK := staticWord(args[i])
+		if !optionOK || option != "-c" {
+			continue
+		}
+		return staticWord(args[i+1])
+	}
+	return "", false
 }
 
 func declHasOption(decl *syntax.DeclClause, option string) bool {

@@ -213,3 +213,86 @@ func TestAnalyzerIgnoresDynamicNestedShellWithoutPanicking(t *testing.T) {
 		t.Fatalf("Analyze() categories = %#v, want best-effort no match", got.Categories)
 	}
 }
+
+func TestAnalyzerRecursesStaticNestedScriptWithDynamicTrailingArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []Category
+	}{
+		{"dynamic positional argument", `bash -c 'ip route' "$arg"`, []Category{NetworkIdentity}},
+		{"options before command string", `bash --noprofile --norc -c 'ip route' "$0"`, []Category{NetworkIdentity}},
+		{"dynamic command string", `bash -c "$script" 'cat /etc/hosts'`, nil},
+		{"dynamic script positional path", `bash -c "$script" /etc/hosts`, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewAnalyzer().Analyze(tt.command)
+			if err != nil {
+				t.Fatalf("Analyze() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.Categories, tt.want) {
+				t.Fatalf("Analyze() categories = %#v, want %#v", got.Categories, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzerClassifiesPrivatePEMDirectories(t *testing.T) {
+	for _, command := range []string{
+		`cat /etc/ssl/private/server.pem`,
+		`base64 /srv/tls/private/client.pem`,
+		`xxd /run/private/signing.pem`,
+	} {
+		got, err := NewAnalyzer().Analyze(command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", command, err)
+		}
+		if !reflect.DeepEqual(got.Categories, []Category{PrivateKey}) {
+			t.Errorf("Analyze(%q) categories = %#v, want private key", command, got.Categories)
+		}
+	}
+}
+
+func TestAnalyzerClassifiesEnvironmentExportListing(t *testing.T) {
+	tests := []struct {
+		command string
+		want    []Category
+	}{
+		{`export`, []Category{ProcessEnvironment}},
+		{`export -p`, []Category{ProcessEnvironment}},
+		{`export FOO=bar`, nil},
+	}
+
+	for _, tt := range tests {
+		got, err := NewAnalyzer().Analyze(tt.command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", tt.command, err)
+		}
+		if !reflect.DeepEqual(got.Categories, tt.want) {
+			t.Errorf("Analyze(%q) categories = %#v, want %#v", tt.command, got.Categories, tt.want)
+		}
+	}
+}
+
+func TestAnalyzerClassifiesSSHConfigFragments(t *testing.T) {
+	tests := []struct {
+		command string
+		want    []Category
+	}{
+		{`cat /etc/ssh/ssh_config.d/20-proxy.conf`, []Category{SSHSecret}},
+		{`sed -n 1p /etc/ssh/sshd_config.d/50-cloud.conf`, []Category{SSHSecret}},
+		{`cat /etc/app/config.d/20-app.conf`, nil},
+	}
+
+	for _, tt := range tests {
+		got, err := NewAnalyzer().Analyze(tt.command)
+		if err != nil {
+			t.Fatalf("Analyze(%q) error = %v", tt.command, err)
+		}
+		if !reflect.DeepEqual(got.Categories, tt.want) {
+			t.Errorf("Analyze(%q) categories = %#v, want %#v", tt.command, got.Categories, tt.want)
+		}
+	}
+}
