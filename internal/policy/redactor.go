@@ -83,11 +83,12 @@ func (r *Redactor) RedactString(input string) RedactionResult {
 		maxBytes = 0
 	}
 	truncated := len(input) > maxBytes
+	urlCredentialAcrossBoundary := urlCredentialAfterBoundary(input, maxBytes)
 	inspectionLimit := redactionInspectionLimit(maxBytes)
 	if len(input) > inspectionLimit {
 		input = input[:inspectionLimit]
 	}
-	return r.redactInspected(input, truncated)
+	return r.redactInspected(input, truncated, urlCredentialAcrossBoundary)
 }
 
 func (r *Redactor) redactBounded(input string, truncated bool) RedactionResult {
@@ -100,7 +101,7 @@ type redactionBoundary struct {
 	crossingURLCredentialPrefix string
 }
 
-func (r *Redactor) redactInspected(inspection string, truncated bool) RedactionResult {
+func (r *Redactor) redactInspected(inspection string, truncated bool, urlCredentialAcrossBoundary bool) RedactionResult {
 	publicBytes := len(inspection)
 	if publicBytes > r.maxBytes {
 		publicBytes = r.maxBytes
@@ -108,8 +109,10 @@ func (r *Redactor) redactInspected(inspection string, truncated bool) RedactionR
 	boundary := redactionBoundary{rightContext: inspection[publicBytes:]}
 	boundary.crossingIPPrefix = crossingIPAddressPrefix(inspection, publicBytes)
 	boundary.crossingURLCredentialPrefix = crossingURLCredentialPrefix(inspection, publicBytes)
-	if truncated && boundary.crossingURLCredentialPrefix == "" {
-		boundary.crossingURLCredentialPrefix = truncatedURLAuthorityPrefix(inspection, publicBytes)
+	if truncated && urlCredentialAcrossBoundary && boundary.crossingURLCredentialPrefix == "" {
+		if start, ok := urlAuthorityAtBoundary(inspection, publicBytes); ok {
+			boundary.crossingURLCredentialPrefix = inspection[start:publicBytes]
+		}
 	}
 	return r.redactBoundedWithBoundary(inspection[:publicBytes], truncated, boundary)
 }
@@ -453,23 +456,105 @@ func crossingURLCredentialPrefix(inspection string, publicBytes int) string {
 	return ""
 }
 
-func truncatedURLAuthorityPrefix(inspection string, publicBytes int) string {
-	if publicBytes <= 0 || publicBytes >= len(inspection) {
-		return ""
+func urlAuthorityAtBoundary(input string, publicBytes int) (int, bool) {
+	if publicBytes <= 0 || publicBytes > len(input) {
+		return 0, false
 	}
-	for _, index := range urlSchemeRE.FindAllStringIndex(inspection, -1) {
-		authorityStart := index[1]
+	searchFrom := 0
+	for searchFrom < publicBytes {
+		match := urlSchemeRE.FindStringIndex(input[searchFrom:publicBytes])
+		if match == nil {
+			return 0, false
+		}
+		authorityStart := searchFrom + match[1]
+		if authorityStart < publicBytes {
+			terminated := false
+			for i := authorityStart; i < publicBytes; i++ {
+				if isURLAuthorityTerminator(input[i]) {
+					terminated = true
+					break
+				}
+			}
+			if !terminated {
+				return authorityStart, true
+			}
+		}
+		searchFrom += match[1]
+	}
+	return 0, false
+}
+
+func urlAuthorityAtBoundaryBytes(input []byte, publicBytes int) (int, bool) {
+	if publicBytes <= 0 || publicBytes > len(input) {
+		return 0, false
+	}
+	for start := 0; start < publicBytes; start++ {
+		if !isASCIIAlpha(input[start]) || start > 0 && isASCIIWord(input[start-1]) {
+			continue
+		}
+		end := start + 1
+		for end < publicBytes && end-start < 32 && isURLSchemeChar(input[end]) {
+			end++
+		}
+		if end-start < 2 || end+2 >= len(input) || input[end] != ':' || input[end+1] != '/' || input[end+2] != '/' {
+			continue
+		}
+		authorityStart := end + 3
 		if authorityStart >= publicBytes {
 			continue
 		}
-		authority := inspection[authorityStart:]
-		delimiter := strings.IndexAny(authority, "/?#")
-		if delimiter >= 0 {
-			continue
+		terminated := false
+		for i := authorityStart; i < publicBytes; i++ {
+			if isURLAuthorityTerminator(input[i]) {
+				terminated = true
+				break
+			}
 		}
-		return inspection[authorityStart:publicBytes]
+		if !terminated {
+			return authorityStart, true
+		}
 	}
-	return ""
+	return 0, false
+}
+
+func isASCIIAlpha(char byte) bool {
+	return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
+}
+
+func isASCIIWord(char byte) bool {
+	return isASCIIAlpha(char) || char >= '0' && char <= '9' || char == '_'
+}
+
+func isURLSchemeChar(char byte) bool {
+	return isASCIIAlpha(char) || char >= '0' && char <= '9' || char == '+' || char == '.' || char == '-'
+}
+
+func urlCredentialAfterBoundary(input string, publicBytes int) bool {
+	start, ok := urlAuthorityAtBoundary(input, publicBytes)
+	if !ok || publicBytes >= len(input) {
+		return false
+	}
+	colonSeen := false
+	for i := start; i < len(input); i++ {
+		char := input[i]
+		if isURLAuthorityTerminator(char) {
+			return false
+		}
+		switch char {
+		case ':':
+			colonSeen = true
+		case '@':
+			if colonSeen {
+				return i >= publicBytes
+			}
+			return false
+		}
+	}
+	return false
+}
+
+func isURLAuthorityTerminator(char byte) bool {
+	return char == '/' || char == '?' || char == '#' || char == ' ' || char == '\t' || char == '\r' || char == '\n'
 }
 
 func trimIPv6Candidate(candidate string) (int, int) {
@@ -514,6 +599,14 @@ func isIPAddressAdjacent(char byte) bool {
 		char >= '0' && char <= '9' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
 }
 
+type urlAuthorityTailState struct {
+	initialized bool
+	active      bool
+	colonSeen   bool
+	credentials bool
+	resolved    bool
+}
+
 type StreamRedactor struct {
 	mu        sync.Mutex
 	dst       io.Writer
@@ -523,6 +616,7 @@ type StreamRedactor struct {
 	closed    bool
 	closeErr  error
 	result    RedactionResult
+	urlTail   urlAuthorityTailState
 }
 
 func NewStreamRedactor(dst io.Writer, allowed map[RedactionCategory]bool) *StreamRedactor {
@@ -565,17 +659,67 @@ func (s *StreamRedactor) Write(p []byte) (int, error) {
 	if len(s.buffer)+len(p) > s.redactor.maxBytes {
 		s.truncated = true
 	}
+	bufferedBefore := len(s.buffer)
 	remaining := redactionInspectionLimit(s.redactor.maxBytes) - len(s.buffer)
 	if remaining < 0 {
 		remaining = 0
 	}
-	if len(p) > remaining {
-		p = p[:remaining]
+	kept := p
+	var dropped []byte
+	if len(kept) > remaining {
+		kept, dropped = kept[:remaining], kept[remaining:]
 		s.truncated = true
 	}
-	s.growBuffer(len(p))
-	s.buffer = append(s.buffer, p...)
+	s.growBuffer(len(kept))
+	s.buffer = append(s.buffer, kept...)
+	if len(dropped) > 0 {
+		s.observeDroppedURLBytes(dropped, bufferedBefore+len(kept))
+	}
 	return written, nil
+}
+
+func (s *StreamRedactor) observeDroppedURLBytes(dropped []byte, absoluteStart int) {
+	if !s.urlTail.initialized {
+		s.urlTail.initialized = true
+		start, ok := urlAuthorityAtBoundaryBytes(s.buffer, s.redactor.maxBytes)
+		if !ok {
+			return
+		}
+		s.urlTail.active = true
+		for i := start; i < len(s.buffer); i++ {
+			s.observeURLAuthorityByte(s.buffer[i], i)
+			if s.urlTail.resolved {
+				return
+			}
+		}
+	}
+	if !s.urlTail.active || s.urlTail.resolved {
+		return
+	}
+	for i, char := range dropped {
+		s.observeURLAuthorityByte(char, absoluteStart+i)
+		if s.urlTail.resolved {
+			return
+		}
+	}
+}
+
+func (s *StreamRedactor) observeURLAuthorityByte(char byte, absolutePosition int) {
+	if isURLAuthorityTerminator(char) {
+		s.urlTail.resolved = true
+		s.urlTail.active = false
+		return
+	}
+	switch char {
+	case ':':
+		s.urlTail.colonSeen = true
+	case '@':
+		if s.urlTail.colonSeen && absolutePosition >= s.redactor.maxBytes {
+			s.urlTail.credentials = true
+		}
+		s.urlTail.resolved = true
+		s.urlTail.active = false
+	}
 }
 
 func (s *StreamRedactor) growBuffer(additional int) {
@@ -603,7 +747,11 @@ func (s *StreamRedactor) Close() error {
 		return s.closeErr
 	}
 	s.closed = true
-	s.result = s.redactor.redactInspected(string(s.buffer), s.truncated)
+	urlCredentialAcrossBoundary := urlCredentialAfterBoundary(string(s.buffer), s.redactor.maxBytes)
+	if s.urlTail.credentials {
+		urlCredentialAcrossBoundary = true
+	}
+	s.result = s.redactor.redactInspected(string(s.buffer), s.truncated, urlCredentialAcrossBoundary)
 	s.buffer = nil
 	written, err := io.WriteString(s.dst, s.result.Text)
 	if err == nil && written != len(s.result.Text) {

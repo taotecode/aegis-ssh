@@ -358,6 +358,17 @@ func TestRedactorDoesNotOverRedactResolvedURLAuthorityAtLimit(t *testing.T) {
 	}
 }
 
+func TestRedactorPreservesLongOrdinaryHostBeyondInspection(t *testing.T) {
+	const maxBytes = 50
+	host := "https://" + strings.Repeat("h", 40) + "." + strings.Repeat("k", 40)
+	for _, input := range []string{host, host + " trailing-output"} {
+		result := NewRedactor(nil).WithMaxBytes(maxBytes).RedactString(input)
+		if !result.Truncated || result.Text != input[:maxBytes] || result.Counts[URLCredential] != 0 {
+			t.Errorf("RedactString() = %#v", result)
+		}
+	}
+}
+
 func TestStreamRedactorBuffersUntilCloseAcrossEveryChunkBoundary(t *testing.T) {
 	pem := "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-STREAM-PEM\n-----END PRIVATE KEY-----"
 	input := "Bearer synthetic-stream-token\nIP=2001:db8::9\n" + pem
@@ -478,8 +489,10 @@ func TestStreamRedactorProtectsAmbiguousLongURLAuthorityAtLimit(t *testing.T) {
 	input := "https://" + strings.Repeat("u", 300) + ":synthetic-pass@example.test/path"
 	var dst bytes.Buffer
 	stream := NewStreamRedactor(&dst, nil).WithMaxBytes(maxBytes)
-	if _, err := stream.Write([]byte(input)); err != nil {
-		t.Fatal(err)
+	for i := range len(input) {
+		if _, err := stream.Write([]byte{input[i]}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatal(err)
@@ -487,6 +500,27 @@ func TestStreamRedactorProtectsAmbiguousLongURLAuthorityAtLimit(t *testing.T) {
 	result := stream.Result()
 	if !result.Truncated || result.Counts[URLCredential] != 1 || strings.Contains(result.Text, strings.Repeat("u", 30)) || strings.Contains(dst.String(), strings.Repeat("u", 30)) {
 		t.Fatalf("stream result=%#v dst=%q", result, dst.String())
+	}
+}
+
+func TestStreamRedactorPreservesLongOrdinaryHostBeyondInspection(t *testing.T) {
+	const maxBytes = 50
+	host := "https://" + strings.Repeat("h", 40) + "." + strings.Repeat("k", 40)
+	for _, input := range []string{host, host + " trailing-output"} {
+		var dst bytes.Buffer
+		stream := NewStreamRedactor(&dst, nil).WithMaxBytes(maxBytes)
+		for i := range len(input) {
+			if _, err := stream.Write([]byte{input[i]}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatal(err)
+		}
+		result := stream.Result()
+		if !result.Truncated || result.Text != input[:maxBytes] || dst.String() != input[:maxBytes] || result.Counts[URLCredential] != 0 {
+			t.Errorf("stream result=%#v dst=%q", result, dst.String())
+		}
 	}
 }
 
