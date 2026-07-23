@@ -15,11 +15,12 @@ type shellInvocation struct {
 }
 
 type shellOptionSpec struct {
-	shortOptions   string
-	valueOptions   map[string]struct{}
-	flagOptions    map[string]struct{}
-	prefixOptions  []string
-	allowPlusShort bool
+	shortOptions        string
+	clusterValueOptions string
+	valueOptions        map[string]struct{}
+	flagOptions         map[string]struct{}
+	prefixOptions       []string
+	allowPlusShort      bool
 }
 
 func parseShellInvocation(words []*syntax.Word) (shellInvocation, bool) {
@@ -75,10 +76,17 @@ func parseShellOptions(words []*syntax.Word, spec shellOptionSpec) shellInvocati
 			return invocation
 		}
 
-		hasCommandString, valid := parseShortOptionCluster(option[1:], spec.shortOptions)
+		hasCommandString, consumesValue, valid := parseShortOptionCluster(option[1:], spec.shortOptions, spec.clusterValueOptions)
 		if !valid {
 			invocation.positionalStart = i
 			return invocation
+		}
+		if consumesValue {
+			if i+1 >= len(words) {
+				return invocation
+			}
+			i++
+			continue
 		}
 		if option[0] == '+' {
 			continue
@@ -96,17 +104,21 @@ func parseShellOptions(words []*syntax.Word, spec shellOptionSpec) shellInvocati
 	return invocation
 }
 
-func parseShortOptionCluster(cluster, supported string) (hasCommandString, valid bool) {
+func parseShortOptionCluster(cluster, supported, valueOptions string) (hasCommandString, consumesValue, valid bool) {
 	for _, option := range cluster {
+		if strings.ContainsRune(valueOptions, option) {
+			consumesValue = true
+			continue
+		}
 		if option == 'c' {
 			hasCommandString = true
 			continue
 		}
 		if !strings.ContainsRune(supported, option) {
-			return false, false
+			return false, false, false
 		}
 	}
-	return hasCommandString, cluster != ""
+	return hasCommandString, consumesValue, cluster != ""
 }
 
 func hasOptionPrefix(option string, prefixes []string) bool {
@@ -120,29 +132,32 @@ func hasOptionPrefix(option string, prefixes []string) bool {
 
 func bashOptionSpec() shellOptionSpec {
 	return shellOptionSpec{
-		shortOptions:   "abefhkmnptuvxBCEHPTDilsr",
-		valueOptions:   stringSet("-O", "-o", "+O", "+o", "--rcfile", "--init-file"),
-		flagOptions:    stringSet("--noprofile", "--norc", "--posix", "--restricted", "--verbose", "--debugger", "--noediting", "--login"),
-		prefixOptions:  []string{"--rcfile=", "--init-file="},
-		allowPlusShort: true,
+		shortOptions:        "abefhkmnptuvxBCEHPTDilsr",
+		clusterValueOptions: "oO",
+		valueOptions:        stringSet("-O", "-o", "+O", "+o", "--rcfile", "--init-file"),
+		flagOptions:         stringSet("--noprofile", "--norc", "--posix", "--restricted", "--verbose", "--debugger", "--noediting", "--login"),
+		prefixOptions:       []string{"--rcfile=", "--init-file="},
+		allowPlusShort:      true,
 	}
 }
 
 func posixShellOptionSpec() shellOptionSpec {
 	return shellOptionSpec{
-		shortOptions:   "abefkmnptuvxilsr",
-		valueOptions:   stringSet("-o", "+o"),
-		flagOptions:    map[string]struct{}{},
-		allowPlusShort: true,
+		shortOptions:        "abefkmnptuvxilsr",
+		clusterValueOptions: "o",
+		valueOptions:        stringSet("-o", "+o"),
+		flagOptions:         map[string]struct{}{},
+		allowPlusShort:      true,
 	}
 }
 
 func zshOptionSpec() shellOptionSpec {
 	return shellOptionSpec{
-		shortOptions:   "abefhkmnptuvxDilsrdy",
-		valueOptions:   stringSet("-o", "+o"),
-		flagOptions:    stringSet("--no-rcs", "--no-globalrcs", "--rcs", "--globalrcs", "--no-rcexpandparam", "--rcexpandparam"),
-		allowPlusShort: true,
+		shortOptions:        "abefhkmnptuvxDilsrdy",
+		clusterValueOptions: "o",
+		valueOptions:        stringSet("-o", "+o"),
+		flagOptions:         stringSet("--no-rcs", "--no-globalrcs", "--rcs", "--globalrcs", "--no-rcexpandparam", "--rcexpandparam"),
+		allowPlusShort:      true,
 	}
 }
 
