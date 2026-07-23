@@ -243,14 +243,7 @@ func (logger *Logger) writeLocked(line []byte, durable bool) error {
 		if err := file.Close(); err != nil {
 			return fmt.Errorf("close audit file for rotation: %w", err)
 		}
-		if err := logger.rotate(); err != nil {
-			return err
-		}
-		file, created, err = logger.openAuditFile(logger.path)
-		if err != nil {
-			return err
-		}
-		created = true
+		return logger.rotate(line, durable)
 	}
 	if created {
 		if err := logger.syncMetadata(); err != nil {
@@ -487,7 +480,7 @@ func boundedRedactions(counts map[string]int) map[string]int {
 	return result
 }
 
-func (logger *Logger) rotate() error {
+func (logger *Logger) rotate(line []byte, durable bool) error {
 	if err := logger.recoverRotation(); err != nil {
 		return err
 	}
@@ -507,7 +500,7 @@ func (logger *Logger) rotate() error {
 		}
 	}
 	limit := min(logger.backups, highestPresent+1)
-	if err := logger.prepareRotation(present[:limit+1]); err != nil {
+	if err := logger.prepareRotation(present[:limit+1], line, durable); err != nil {
 		return errors.Join(err, logger.recoverRotation())
 	}
 	if err := logger.applyRotation(limit); err != nil {
@@ -516,7 +509,7 @@ func (logger *Logger) rotate() error {
 	return logger.cleanupRotationStaging()
 }
 
-func (logger *Logger) prepareRotation(present []bool) error {
+func (logger *Logger) prepareRotation(present []bool, line []byte, durable bool) error {
 	if err := logger.createEmptyMetadataFile(logger.rotationMarkerPath()); err != nil {
 		return fmt.Errorf("create audit rotation marker: %w", err)
 	}
@@ -531,7 +524,7 @@ func (logger *Logger) prepareRotation(present []bool) error {
 			return fmt.Errorf("stage missing audit rotation source %d: %w", index, err)
 		}
 	}
-	if err := logger.createEmptyMetadataFile(logger.rotationNewPath()); err != nil {
+	if err := logger.createRotationNewFile(line, durable); err != nil {
 		return fmt.Errorf("stage new audit file: %w", err)
 	}
 	if err := logger.linkMetadata(logger.rotationNewPath(), logger.rotationProofPath()); err != nil {
@@ -692,7 +685,7 @@ func (logger *Logger) cleanupRotationStaging() error {
 			}
 		}
 	}
-	for _, path := range []string{logger.rotationNewPath(), logger.rotationProofPath()} {
+	for _, path := range []string{logger.rotationProofPath(), logger.rotationNewPath()} {
 		if err := logger.removeMetadataIfExists(path); err != nil {
 			return fmt.Errorf("remove audit rotation staging %q: %w", filepath.Base(path), err)
 		}
@@ -735,6 +728,28 @@ func (logger *Logger) createEmptyMetadataFile(path string) error {
 	}
 	if err := file.Chmod(0o600); err != nil {
 		return closeWithError(file, err)
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return logger.syncMetadata()
+}
+
+func (logger *Logger) createRotationNewFile(line []byte, durable bool) error {
+	file, err := logger.hooks.openFile(logger.rotationNewPath(), os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return closeWithError(file, err)
+	}
+	if err := writeAllWith(file, line, logger.hooks.write); err != nil {
+		return closeWithError(file, fmt.Errorf("write staged audit event: %w", err))
+	}
+	if durable {
+		if err := logger.syncFile(file); err != nil {
+			return closeWithError(file, fmt.Errorf("sync staged audit event: %w", err))
+		}
 	}
 	if err := file.Close(); err != nil {
 		return err
@@ -828,6 +843,9 @@ func numericBackupIndex(name string) (uint64, bool) {
 		if character < '0' || character > '9' {
 			return 0, false
 		}
+	}
+	if suffix[0] == '0' {
+		return ^uint64(0), true
 	}
 	index, err := strconv.ParseUint(suffix, 10, 64)
 	if errors.Is(err, strconv.ErrRange) {

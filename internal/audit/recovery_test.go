@@ -78,6 +78,35 @@ func TestNewCleansNumericBackupsBeyondLegacyLimit(t *testing.T) {
 	}
 }
 
+func TestNewRemovesLeadingZeroBackupAliases(t *testing.T) {
+	dir := privateTempDir(t)
+	if _, err := New(dir, Options{Backups: 1}); err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	canonical := backupPath(filepath.Join(dir, auditFilename), 1)
+	aliases := []string{
+		filepath.Join(dir, auditFilename+".01"),
+		filepath.Join(dir, auditFilename+".001"),
+	}
+	for _, path := range append([]string{canonical}, aliases...) {
+		if err := os.WriteFile(path, []byte("backup\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := New(dir, Options{Backups: 1}); err != nil {
+		t.Fatalf("New(Backups=1): %v", err)
+	}
+	if _, err := os.Lstat(canonical); err != nil {
+		t.Fatalf("canonical backup removed: %v", err)
+	}
+	for _, path := range aliases {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("leading-zero backup alias %q remains: %v", path, err)
+		}
+	}
+}
+
 func TestWriteRollsBackPartialJSONLine(t *testing.T) {
 	dir := privateTempDir(t)
 	want := errors.New("synthetic partial write")
@@ -452,6 +481,147 @@ func TestRotationOpenFailureLeavesCanonicalRecordsIntact(t *testing.T) {
 			t.Errorf("record %q missing after staging open failure; seen=%v", requestID, canonical)
 		}
 	}
+}
+
+func TestRotationPublishesTriggerEventBeforeCleanup(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		requireSync   bool
+		wantSyncCalls int
+	}{
+		{name: "ordinary"},
+		{name: "durable", requireSync: true, wantSyncCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := privateTempDir(t)
+			options := Options{MaxBytes: 128, Backups: 3}
+			seedAuditRecords(t, dir, options, "transaction-original", 4)
+			path := filepath.Join(dir, auditFilename)
+			newPath := path + ".rotate.new"
+			proofPath := path + ".rotate.newproof"
+			cleanupFailure := errors.New("synthetic committed rotation cleanup failure")
+			cleanupFailed := false
+			stagedSyncCalls := 0
+			logger, err := newWithHooks(dir, options, loggerHooks{
+				remove: func(removePath string) error {
+					if strings.Contains(filepath.Base(removePath), ".rotate.source.") && !cleanupFailed {
+						currentInfo, currentErr := os.Lstat(path)
+						proofInfo, proofErr := os.Lstat(proofPath)
+						if currentErr == nil && proofErr == nil && os.SameFile(currentInfo, proofInfo) {
+							cleanupFailed = true
+							return cleanupFailure
+						}
+					}
+					return os.Remove(removePath)
+				},
+				syncFile: func(file *os.File) error {
+					if file.Name() == newPath {
+						stagedSyncCalls++
+					}
+					return file.Sync()
+				},
+			})
+			if err != nil {
+				t.Fatalf("newWithHooks(): %v", err)
+			}
+			triggerID := "transaction-trigger-" + test.name
+			writeErr := logger.Write(Event{
+				RequestID:   triggerID,
+				Command:     "echo trigger committed rotation cleanup failure",
+				RequireSync: test.requireSync,
+			})
+			if !errors.Is(writeErr, cleanupFailure) {
+				t.Fatalf("Write() error = %v, want cleanup failure", writeErr)
+			}
+			if !cleanupFailed {
+				t.Fatal("committed rotation cleanup failure injection not reached")
+			}
+
+			if _, err := New(dir, options); err != nil {
+				t.Fatalf("New() after committed rotation cleanup failure: %v", err)
+			}
+			canonical := collectCanonicalRequestIDs(t, dir, options.Backups)
+			if !canonical[triggerID] {
+				t.Errorf("trigger event %q missing after recovery; seen=%v", triggerID, canonical)
+			}
+			if stagedSyncCalls != test.wantSyncCalls {
+				t.Errorf("staged new file Sync calls = %d, want %d", stagedSyncCalls, test.wantSyncCalls)
+			}
+			assertNoRotationStaging(t, dir)
+		})
+	}
+}
+
+func TestRollbackCleanupFailureBetweenNewAndProofRemovalRecovers(t *testing.T) {
+	dir := privateTempDir(t)
+	options := Options{MaxBytes: 128, Backups: 3}
+	seedAuditRecords(t, dir, options, "rollback-original", 4)
+	canonicalBefore := collectCanonicalRequestIDs(t, dir, options.Backups)
+	path := filepath.Join(dir, auditFilename)
+	newPath := path + ".rotate.new"
+	markerPath := path + ".rotate.marker"
+	applyFailure := errors.New("synthetic apply failure before rollback")
+	cleanupFailure := errors.New("synthetic proof cleanup failure")
+	renameCalls := 0
+	applyFailed := false
+	cleanupInterrupted := false
+	logger, err := newWithHooks(dir, options, loggerHooks{
+		rename: func(oldPath, newPath string) error {
+			if strings.Contains(filepath.Base(oldPath), ".rotate.work.") && !applyFailed {
+				renameCalls++
+				if renameCalls == 2 {
+					applyFailed = true
+					return applyFailure
+				}
+			}
+			return os.Rename(oldPath, newPath)
+		},
+		remove: func(removePath string) error {
+			if removePath == newPath && !cleanupInterrupted {
+				if err := os.Remove(removePath); err != nil {
+					return err
+				}
+				cleanupInterrupted = true
+				return cleanupFailure
+			}
+			return os.Remove(removePath)
+		},
+	})
+	if err != nil {
+		t.Fatalf("newWithHooks(): %v", err)
+	}
+	writeErr := logger.Write(Event{RequestID: "failed-cleanup-write", Command: "echo trigger rollback cleanup failure"})
+	if !errors.Is(writeErr, applyFailure) || !errors.Is(writeErr, cleanupFailure) {
+		t.Fatalf("Write() error = %v, want apply and cleanup failures", writeErr)
+	}
+	if !applyFailed || !cleanupInterrupted {
+		t.Fatalf("failure injection not reached: apply=%t cleanup=%t", applyFailed, cleanupInterrupted)
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("Lstat(%q): %v", markerPath, err)
+	}
+	if _, err := os.Lstat(newPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Lstat(%q) error = %v, want not exist", newPath, err)
+	}
+
+	recovered, err := New(dir, options)
+	if err != nil {
+		t.Fatalf("New() after interrupted rollback cleanup: %v", err)
+	}
+	canonicalAfter := collectCanonicalRequestIDs(t, dir, options.Backups)
+	for requestID := range canonicalBefore {
+		if !canonicalAfter[requestID] {
+			t.Errorf("record %q missing after recovery; seen=%v", requestID, canonicalAfter)
+		}
+	}
+	if err := recovered.Write(Event{RequestID: "recovered-after-cleanup", Command: "echo recovered"}); err != nil {
+		t.Fatalf("Write() after interrupted rollback cleanup: %v", err)
+	}
+	canonicalAfter = collectCanonicalRequestIDs(t, dir, options.Backups)
+	if !canonicalAfter["recovered-after-cleanup"] {
+		t.Errorf("recovered record missing; seen=%v", canonicalAfter)
+	}
+	assertNoRotationStaging(t, dir)
 }
 
 func seedAuditRecords(t *testing.T, dir string, options Options, prefix string, count int) {
