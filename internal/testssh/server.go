@@ -22,6 +22,7 @@ type Output struct {
 	ExitCode int
 }
 
+// Handler must return after its context is canceled.
 type Handler func(context.Context) Output
 
 type Server struct {
@@ -224,7 +225,11 @@ func (s *Server) runHandler(connCtx context.Context, ch ssh.Channel, requests <-
 	}
 
 	result := make(chan Output, 1)
-	go func() { result <- handler(ctx) }()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		result <- handler(ctx)
+	}()
 	for {
 		select {
 		case output := <-result:

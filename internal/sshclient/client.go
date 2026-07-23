@@ -18,8 +18,15 @@ import (
 
 type Limits struct {
 	Timeout        time.Duration
-	MaxOutputBytes int
+	MaxOutputBytes int64
 }
+
+const (
+	maxTimeout        = 30 * time.Minute
+	maxOutputBytes    = int64(4 << 20)
+	maxCommandBytes   = 128 << 10
+	authenticationErr = "unable to authenticate"
+)
 
 type Result struct {
 	Stdout    string
@@ -45,7 +52,7 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 	address := net.JoinHostPort(secret.Host, strconv.FormatUint(uint64(secret.Port), 10))
 	conn, err := (&net.Dialer{}).DialContext(opCtx, "tcp", address)
 	if err != nil {
-		return Result{}, operationError(opCtx, false)
+		return Result{}, connectionError(opCtx)
 	}
 
 	hostKeyRejected := false
@@ -65,7 +72,7 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 	sshConn, channels, requests, err := handshake(opCtx, conn, address, config)
 	if err != nil {
 		_ = conn.Close()
-		return Result{}, operationError(opCtx, hostKeyRejected)
+		return Result{}, handshakeError(opCtx, err, hostKeyRejected)
 	}
 	client := ssh.NewClient(sshConn, channels, requests)
 	defer client.Close()
@@ -84,7 +91,7 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 
 	session, err := client.NewSession()
 	if err != nil {
-		return Result{}, operationError(opCtx, false)
+		return Result{}, connectionError(opCtx)
 	}
 	defer session.Close()
 
@@ -109,7 +116,7 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 			result.ExitCode = exitError.ExitStatus()
 			return result, nil
 		}
-		return result, operationError(opCtx, false)
+		return result, connectionError(opCtx)
 	case <-opCtx.Done():
 		_ = session.Close()
 		_ = client.Close()
@@ -126,8 +133,9 @@ func valid(ctx context.Context, secret vault.ServerSecret, command string, limit
 		len(secret.Password) != 0 &&
 		strings.TrimSpace(secret.HostFingerprint) != "" &&
 		command != "" &&
-		limits.Timeout > 0 &&
-		limits.MaxOutputBytes > 0
+		len(command) <= maxCommandBytes &&
+		limits.Timeout > 0 && limits.Timeout <= maxTimeout &&
+		limits.MaxOutputBytes > 0 && limits.MaxOutputBytes <= maxOutputBytes
 }
 
 func handshake(ctx context.Context, conn net.Conn, address string, config *ssh.ClientConfig) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
@@ -144,19 +152,29 @@ func handshake(ctx context.Context, conn net.Conn, address string, config *ssh.C
 	return sshConn, channels, requests, err
 }
 
-func operationError(ctx context.Context, hostKeyRejected bool) error {
+func handshakeError(ctx context.Context, err error, hostKeyRejected bool) error {
 	if ctx.Err() != nil {
 		return model.ErrTimeout
 	}
 	if hostKeyRejected {
 		return model.ErrHostKey
 	}
-	return model.ErrAuthentication
+	if strings.Contains(err.Error(), authenticationErr) {
+		return model.ErrAuthentication
+	}
+	return model.ErrConnection
+}
+
+func connectionError(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return model.ErrTimeout
+	}
+	return model.ErrConnection
 }
 
 type outputBudget struct {
 	mu        sync.Mutex
-	remaining int
+	remaining int64
 	truncated bool
 }
 
@@ -169,12 +187,12 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 	w.budget.mu.Lock()
 	defer w.budget.mu.Unlock()
 
-	accepted := min(len(p), w.budget.remaining)
+	accepted := min(int64(len(p)), w.budget.remaining)
 	if accepted > 0 {
-		_, _ = w.buffer.Write(p[:accepted])
+		_, _ = w.buffer.Write(p[:int(accepted)])
 		w.budget.remaining -= accepted
 	}
-	if accepted < len(p) {
+	if accepted < int64(len(p)) {
 		w.budget.truncated = true
 	}
 	return len(p), nil

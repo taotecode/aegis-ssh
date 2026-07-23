@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,8 @@ import (
 	"github.com/chenjw/aegis-ssh/internal/testssh"
 	"github.com/chenjw/aegis-ssh/internal/vault"
 )
+
+var _ int64 = sshclient.Limits{}.MaxOutputBytes
 
 func testLimits() sshclient.Limits {
 	return sshclient.Limits{Timeout: 2 * time.Second, MaxOutputBytes: 64 << 10}
@@ -46,39 +49,6 @@ func TestExecuteRejectsHostKeyMismatch(t *testing.T) {
 
 	_, err := sshclient.New().Execute(context.Background(), secret, "printf ok", testLimits())
 	assertSanitizedError(t, err, model.ErrHostKey, secret)
-}
-
-func TestExecuteTimeoutCancelsRemoteHandler(t *testing.T) {
-	server := testssh.Start(t, "root", "synthetic-password")
-	started := make(chan struct{})
-	canceled := make(chan struct{})
-	server.Handle("block", func(ctx context.Context) testssh.Output {
-		close(started)
-		<-ctx.Done()
-		close(canceled)
-		return testssh.Output{}
-	})
-
-	start := time.Now()
-	_, err := sshclient.New().Execute(context.Background(), server.Secret("root", "synthetic-password"), "block", sshclient.Limits{
-		Timeout: 100 * time.Millisecond, MaxOutputBytes: 1024,
-	})
-	if !errors.Is(err, model.ErrTimeout) {
-		t.Fatalf("Execute() error = %v, want ErrTimeout", err)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("Execute() returned after %v, want prompt timeout", elapsed)
-	}
-	select {
-	case <-started:
-	default:
-		t.Fatal("remote handler did not start")
-	}
-	select {
-	case <-canceled:
-	case <-time.After(time.Second):
-		t.Fatal("remote handler did not observe context cancellation")
-	}
 }
 
 func TestExecuteTimeoutInterruptsSSHHandshake(t *testing.T) {
@@ -120,7 +90,7 @@ func TestExecuteTimeoutInterruptsSSHHandshake(t *testing.T) {
 	}
 }
 
-func TestExecuteHonorsEarlierContextCancellation(t *testing.T) {
+func TestExecuteCancellationAfterHandlerStarts(t *testing.T) {
 	server := testssh.Start(t, "root", "synthetic-password")
 	started := make(chan struct{})
 	canceled := make(chan struct{})
@@ -144,6 +114,55 @@ func TestExecuteHonorsEarlierContextCancellation(t *testing.T) {
 	case <-canceled:
 	case <-time.After(time.Second):
 		t.Fatal("remote handler did not observe cancellation")
+	}
+}
+
+func TestServerCloseCancelsAndWaitsForHandler(t *testing.T) {
+	server := testssh.Start(t, "root", "synthetic-password")
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseHandler()
+	handlerReturned := make(chan struct{})
+	server.Handle("wait-for-cleanup", func(ctx context.Context) testssh.Output {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		close(handlerReturned)
+		return testssh.Output{}
+	})
+
+	executeResult := make(chan error, 1)
+	go func() {
+		_, err := sshclient.New().Execute(context.Background(), server.Secret("root", "synthetic-password"), "wait-for-cleanup", testLimits())
+		executeResult <- err
+	}()
+	waitForSignal(t, started, "handler start")
+
+	closeResult := make(chan struct{})
+	go func() {
+		server.Close()
+		close(closeResult)
+	}()
+	waitForSignal(t, canceled, "handler cancellation")
+	select {
+	case <-closeResult:
+		t.Fatal("Server.Close() returned before handler exited")
+	default:
+	}
+	releaseHandler()
+	waitForSignal(t, handlerReturned, "handler return")
+	waitForSignal(t, closeResult, "server close")
+	select {
+	case err := <-executeResult:
+		if !errors.Is(err, model.ErrConnection) {
+			t.Fatalf("Execute() error = %v, want ErrConnection", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Execute() to return")
 	}
 }
 
@@ -218,16 +237,84 @@ func TestExecuteValidatesInputs(t *testing.T) {
 	}
 }
 
-func TestExecuteDoesNotExposeConnectionDetails(t *testing.T) {
-	secret := vault.ServerSecret{
-		Host:            "127.0.0.1",
-		Port:            1,
-		User:            "synthetic-private-user",
-		Password:        []byte("synthetic-private-password"),
-		HostFingerprint: "SHA256:synthetic-private-fingerprint",
+func TestExecuteAcceptsDefensiveLimitBoundaries(t *testing.T) {
+	secret := refusedConnectionSecret(t)
+	const (
+		maxOutputBytes  int64 = 4 << 20
+		maxCommandBytes       = 128 << 10
+	)
+	tests := []struct {
+		name    string
+		command string
+		limits  sshclient.Limits
+	}{
+		{name: "timeout", command: "true", limits: sshclient.Limits{Timeout: 30 * time.Minute, MaxOutputBytes: 1}},
+		{name: "output", command: "true", limits: sshclient.Limits{Timeout: time.Second, MaxOutputBytes: maxOutputBytes}},
+		{name: "command", command: strings.Repeat("x", maxCommandBytes), limits: testLimits()},
 	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := sshclient.New().Execute(context.Background(), secret, test.command, test.limits)
+			if !errors.Is(err, model.ErrConnection) {
+				t.Fatalf("Execute() error = %v, want accepted validation followed by ErrConnection", err)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsLimitsAboveDefensiveBounds(t *testing.T) {
+	validSecret := vault.ServerSecret{
+		Host: "127.0.0.1", Port: 22, User: "root", Password: []byte("password"), HostFingerprint: "SHA256:fingerprint",
+	}
+	tests := []struct {
+		name    string
+		command string
+		limits  sshclient.Limits
+	}{
+		{name: "timeout", command: "true", limits: sshclient.Limits{Timeout: 30*time.Minute + time.Nanosecond, MaxOutputBytes: 1}},
+		{name: "output", command: "true", limits: sshclient.Limits{Timeout: time.Second, MaxOutputBytes: (4 << 20) + 1}},
+		{name: "command", command: strings.Repeat("x", (128<<10)+1), limits: testLimits()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := sshclient.New().Execute(context.Background(), validSecret, test.command, test.limits)
+			if !errors.Is(err, model.ErrValidation) {
+				t.Fatalf("Execute() error = %v, want ErrValidation", err)
+			}
+		})
+	}
+}
+
+func TestExecuteClassifiesAndSanitizesConnectionRefused(t *testing.T) {
+	secret := refusedConnectionSecret(t)
 	_, err := sshclient.New().Execute(context.Background(), secret, "synthetic-private-command", sshclient.Limits{Timeout: time.Second, MaxOutputBytes: 1024})
-	assertSanitizedError(t, err, model.ErrAuthentication, secret)
+	assertSanitizedError(t, err, model.ErrConnection, secret)
+}
+
+func TestExecuteClassifiesAndSanitizesInvalidSSHProtocol(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("synthetic-garbage-protocol\r\n"))
+		_ = conn.Close()
+	}()
+	secret := secretForAddress(t, listener.Addr().String())
+
+	_, executeErr := sshclient.New().Execute(context.Background(), secret, "synthetic-private-command", testLimits())
+	assertSanitizedError(t, executeErr, model.ErrConnection, secret)
+	if strings.Contains(executeErr.Error(), "synthetic-garbage-protocol") {
+		t.Fatalf("Execute() error exposed raw protocol input: %q", executeErr)
+	}
+	waitForSignal(t, serverDone, "invalid protocol server exit")
 }
 
 func mutateSecret(secret vault.ServerSecret, mutate func(*vault.ServerSecret)) vault.ServerSecret {
@@ -235,6 +322,47 @@ func mutateSecret(secret vault.ServerSecret, mutate func(*vault.ServerSecret)) v
 	copy.Password = append([]byte(nil), secret.Password...)
 	mutate(&copy)
 	return copy
+}
+
+func refusedConnectionSecret(t *testing.T) vault.ServerSecret {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return secretForAddress(t, address)
+}
+
+func secretForAddress(t *testing.T, address string) vault.ServerSecret {
+	t.Helper()
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vault.ServerSecret{
+		Host:            host,
+		Port:            uint16(port),
+		User:            "synthetic-private-user",
+		Password:        []byte("synthetic-private-password"),
+		HostFingerprint: "SHA256:synthetic-private-fingerprint",
+	}
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
 }
 
 func assertSanitizedError(t *testing.T, err error, want error, secret vault.ServerSecret) {

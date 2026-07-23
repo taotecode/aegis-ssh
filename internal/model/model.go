@@ -17,6 +17,7 @@ type ErrorCode string
 
 const (
 	CodeAuthentication    ErrorCode = "authentication_failed"
+	CodeConnection        ErrorCode = "connection_failed"
 	CodeHostKey           ErrorCode = "host_key_verification_failed"
 	CodeTimeout           ErrorCode = "timeout"
 	CodeUnavailableDaemon ErrorCode = "daemon_unavailable"
@@ -48,6 +49,7 @@ func (e *CodedError) MarshalJSON() ([]byte, error) {
 
 var (
 	ErrAuthentication    = &CodedError{code: CodeAuthentication, message: "authentication failed"}
+	ErrConnection        = &CodedError{code: CodeConnection, message: "remote connection failed"}
 	ErrHostKey           = &CodedError{code: CodeHostKey, message: "host key verification failed"}
 	ErrTimeout           = &CodedError{code: CodeTimeout, message: "operation timed out"}
 	ErrUnavailableDaemon = &CodedError{code: CodeUnavailableDaemon, message: "broker daemon unavailable"}

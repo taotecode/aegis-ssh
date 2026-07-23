@@ -37,6 +37,7 @@ func TestCodedErrorsHaveStableSanitizedJSONAndRemainComparable(t *testing.T) {
 		message string
 	}{
 		{model.ErrAuthentication, model.CodeAuthentication, "authentication failed"},
+		{model.ErrConnection, model.CodeConnection, "remote connection failed"},
 		{model.ErrHostKey, model.CodeHostKey, "host key verification failed"},
 		{model.ErrTimeout, model.CodeTimeout, "operation timed out"},
 		{model.ErrUnavailableDaemon, model.CodeUnavailableDaemon, "broker daemon unavailable"},
