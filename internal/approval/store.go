@@ -13,10 +13,16 @@ import (
 	"github.com/chenjw/aegis-ssh/internal/policy"
 )
 
-const defaultTTL = 5 * time.Minute
+const (
+	defaultTTL       = 5 * time.Minute
+	maxStoreEntries  = 256
+	maxCommandBytes  = 128 << 10
+	approvalCodeSize = 4
+)
 
 var (
 	ErrInvalidInput = errors.New("invalid approval input")
+	ErrCapacity     = errors.New("approval store capacity reached")
 	ErrRandom       = errors.New("approval random source failure")
 	ErrNotFound     = errors.New("approval not found")
 	ErrCode         = errors.New("invalid approval code")
@@ -57,26 +63,28 @@ func NewStore(now func() time.Time, random io.Reader) *Store {
 
 // Create records a single-use approval with the default five-minute TTL.
 func (s *Store) Create(serverAlias string, command []byte, categories []policy.Category) (Approval, error) {
-	if s == nil || s.now == nil || s.random == nil || serverAlias == "" || len(command) == 0 {
+	if s == nil || s.now == nil || s.random == nil || serverAlias == "" || len(command) == 0 || len(command) > maxCommandBytes {
 		return Approval{}, ErrInvalidInput
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cleanupAt := s.now()
 	s.cleanupLocked(cleanupAt, "")
+	if len(s.items) >= maxStoreEntries {
+		return Approval{}, ErrCapacity
+	}
 
 	idBytes := make([]byte, 16)
 	if _, err := io.ReadFull(s.random, idBytes); err != nil {
 		return Approval{}, fmt.Errorf("%w: %v", ErrRandom, err)
 	}
-	codeBytes := make([]byte, 4)
-	if _, err := io.ReadFull(s.random, codeBytes); err != nil {
-		return Approval{}, fmt.Errorf("%w: %v", ErrRandom, err)
-	}
 	id := hex.EncodeToString(idBytes)
-	code := makeCode(codeBytes)
 	if _, exists := s.items[id]; exists {
 		return Approval{}, fmt.Errorf("%w: duplicate approval id", ErrRandom)
+	}
+	code, err := generateCode(s.random)
+	if err != nil {
+		return Approval{}, fmt.Errorf("%w: %v", ErrRandom, err)
 	}
 	createdAt := s.now()
 	approval := Approval{
@@ -114,17 +122,24 @@ func (s *Store) Consume(id, code string) (Approval, error) {
 	if item.used {
 		return Approval{}, ErrUsed
 	}
-	var supplied [4]byte
+	var supplied [approvalCodeSize]byte
 	copy(supplied[:], code)
 	codeMatch := subtle.ConstantTimeCompare([]byte(item.Code), supplied[:])
 	lengthMatch := subtle.ConstantTimeEq(int32(len(code)), int32(len(item.Code)))
 	if codeMatch != 1 || lengthMatch != 1 {
 		return Approval{}, ErrCode
 	}
-	item.used = true
-	item.Approval.Used = true
-	s.items[id] = item
-	return cloneApproval(item.Approval), nil
+	consumed := cloneApproval(item.Approval)
+	consumed.Used = true
+	s.items[id] = storedApproval{
+		Approval: Approval{
+			ID:        item.ID,
+			ExpiresAt: item.ExpiresAt,
+			Used:      true,
+		},
+		used: true,
+	}
+	return consumed, nil
 }
 
 func (s *Store) cleanupLocked(now time.Time, except string) {
@@ -137,12 +152,20 @@ func (s *Store) cleanupLocked(now time.Time, except string) {
 
 const codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
-func makeCode(raw []byte) string {
-	code := make([]byte, len(raw))
-	for i, value := range raw {
-		code[i] = codeAlphabet[int(value)%len(codeAlphabet)]
+func generateCode(random io.Reader) (string, error) {
+	const unbiasedLimit = 256 - 256%len(codeAlphabet)
+	code := make([]byte, 0, approvalCodeSize)
+	var raw [1]byte
+	for len(code) < approvalCodeSize {
+		if _, err := io.ReadFull(random, raw[:]); err != nil {
+			return "", err
+		}
+		if int(raw[0]) >= unbiasedLimit {
+			continue
+		}
+		code = append(code, codeAlphabet[int(raw[0])%len(codeAlphabet)])
 	}
-	return string(code)
+	return string(code), nil
 }
 
 func normalizeCategories(categories []policy.Category) []policy.Category {

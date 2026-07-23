@@ -2,6 +2,7 @@ package approval
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strings"
@@ -14,8 +15,24 @@ import (
 
 const testApprovalCodeCharacters = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
+const (
+	testApprovalCapacity = 256
+	testMaxCommandBytes  = 128 << 10
+)
+
 func deterministicReader() io.Reader {
 	return bytes.NewReader(bytes.Repeat([]byte{0x42}, 256))
+}
+
+func uniqueApprovalReader(count int) io.Reader {
+	data := make([]byte, 0, count*20)
+	for i := 0; i < count; i++ {
+		id := make([]byte, 16)
+		binary.BigEndian.PutUint64(id[8:], uint64(i+1))
+		data = append(data, id...)
+		data = append(data, 2, 3, 4, 5)
+	}
+	return bytes.NewReader(data)
 }
 
 func fixedClock(t time.Time) func() time.Time { return func() time.Time { return t } }
@@ -199,6 +216,97 @@ func TestCreateCleansExpiredApprovalsBeforeEarlyReturn(t *testing.T) {
 			t.Fatalf("consume replacement = %#v", consumed)
 		}
 	})
+}
+
+func TestApprovalStoreCapacityIncludesUsedTombstonesAndExpires(t *testing.T) {
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	store := NewStore(func() time.Time { return now }, uniqueApprovalReader(testApprovalCapacity+1))
+	var first Approval
+	for i := 0; i < testApprovalCapacity; i++ {
+		created, err := store.Create("prod", []byte("echo ok"), nil)
+		if err != nil {
+			t.Fatalf("create approval %d: %v", i, err)
+		}
+		if i == 0 {
+			first = created
+		}
+	}
+	if _, err := store.Consume(first.ID, first.Code); err != nil {
+		t.Fatalf("consume first approval: %v", err)
+	}
+	if _, err := store.Create("overflow", []byte("echo overflow"), nil); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("create beyond capacity = %v; want ErrCapacity", err)
+	}
+	if len(store.items) != testApprovalCapacity {
+		t.Fatalf("store size after rejected create = %d; want %d", len(store.items), testApprovalCapacity)
+	}
+	if _, err := store.Consume(first.ID, first.Code); !errors.Is(err, ErrUsed) {
+		t.Fatalf("used approval after rejected create = %v; want ErrUsed", err)
+	}
+
+	now = first.ExpiresAt
+	created, err := store.Create("after-expiry", []byte("echo ready"), nil)
+	if err != nil {
+		t.Fatalf("create after expiry cleanup: %v", err)
+	}
+	if len(store.items) != 1 || created.ServerAlias != "after-expiry" {
+		t.Fatalf("store after expiry cleanup = %d items, approval %#v", len(store.items), created)
+	}
+}
+
+func TestApprovalCommandSizeLimit(t *testing.T) {
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	store := newTestStore(t, &now)
+	if _, err := store.Create("prod", bytes.Repeat([]byte{'x'}, testMaxCommandBytes+1), nil); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("oversized command = %v; want ErrInvalidInput", err)
+	}
+	store = newTestStore(t, &now)
+	if _, err := store.Create("prod", bytes.Repeat([]byte{'x'}, testMaxCommandBytes), nil); err != nil {
+		t.Fatalf("command at size limit = %v", err)
+	}
+}
+
+func TestConsumeCompactsStoredApproval(t *testing.T) {
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	store := newTestStore(t, &now)
+	created, err := store.Create("prod", []byte("sudo cat /root/.ssh/id_rsa"), []policy.Category{policy.PrivateKey, policy.SSHSecret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed, err := store.Consume(created.ID, created.Code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed.ServerAlias != "prod" || string(consumed.Command) != "sudo cat /root/.ssh/id_rsa" || len(consumed.Categories) != 2 || consumed.Code != created.Code {
+		t.Fatalf("consume returned incomplete approval: %#v", consumed)
+	}
+	stored := store.items[created.ID]
+	if !stored.used || stored.ID != created.ID || !stored.ExpiresAt.Equal(created.ExpiresAt) {
+		t.Fatalf("invalid used tombstone: %#v", stored)
+	}
+	if stored.Code != "" || stored.ServerAlias != "" || stored.Command != nil || stored.Categories != nil || !stored.CreatedAt.IsZero() {
+		t.Fatalf("used tombstone retained approval payload: %#v", stored)
+	}
+}
+
+func TestApprovalCodeUsesRejectionSampling(t *testing.T) {
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	id := bytes.Repeat([]byte{0x42}, 16)
+	random := bytes.NewReader(append(append([]byte(nil), id...), 248, 255, 0, 1, 2, 3))
+	store := NewStore(fixedClock(now), random)
+	created, err := store.Create("prod", []byte("echo ok"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Code != "ABCD" {
+		t.Fatalf("code after rejected high bytes = %q; want ABCD", created.Code)
+	}
+
+	random = bytes.NewReader(append(append([]byte(nil), id...), 248, 249, 250, 255))
+	store = NewStore(fixedClock(now), random)
+	if _, err := store.Create("prod", []byte("echo ok"), nil); !errors.Is(err, ErrRandom) {
+		t.Fatalf("exhausted rejection source = %v; want ErrRandom", err)
+	}
 }
 
 func TestApprovalConcurrentConsumeOnlyOnce(t *testing.T) {
