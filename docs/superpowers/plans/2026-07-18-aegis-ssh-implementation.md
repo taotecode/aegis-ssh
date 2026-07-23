@@ -427,7 +427,7 @@ git commit -m "feat: redact sensitive remote output"
 - Create: `internal/approval/store.go`
 - Create: `internal/approval/store_test.go`
 
-- [ ] **Step 1: Write failing state-machine tests with a fake clock**
+- [x] **Step 1: Write failing state-machine tests with a fake clock**
 
 ```go
 func TestApprovalIsBoundAndSingleUse(t *testing.T) {
@@ -469,13 +469,13 @@ Define `deterministicReader()` in the test file as
 `bytes.NewReader(bytes.Repeat([]byte{0x42}, 256))`; every test creates a fresh
 reader so it cannot exhaust shared state.
 
-- [ ] **Step 2: Run tests and confirm the red state**
+- [x] **Step 2: Run tests and confirm the red state**
 
 Run: `go test ./internal/approval -v`
 
 Expected: FAIL because approval storage is missing.
 
-- [ ] **Step 3: Implement mutex-protected create and consume**
+- [x] **Step 3: Implement mutex-protected create and consume**
 
 Use `crypto/rand` for 128-bit IDs and an unambiguous uppercase code alphabet.
 Store exact command bytes, alias, sorted categories, creation time, expiry, and
@@ -483,7 +483,7 @@ state. Compare codes in constant time. Mark used under the same mutex before
 returning the stored command. Periodically remove expired records during create
 and consume; no background goroutine is needed.
 
-- [ ] **Step 4: Verify race safety and commit**
+- [x] **Step 4: Verify race safety and commit**
 
 Run: `go test -race ./internal/approval -v`
 
