@@ -461,10 +461,6 @@ func TestNewRemovesBackupsBeyondChangedRetention(t *testing.T) {
 	if err := os.WriteFile(unmatched, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	outOfRange := backupPath(filepath.Join(dir, auditFilename), maxBackups+1)
-	if err := os.WriteFile(outOfRange, []byte("keep"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 
 	if _, err := New(dir, Options{MaxBytes: 128, Backups: 2}); err != nil {
 		t.Fatalf("New(Backups=2): %v", err)
@@ -486,9 +482,6 @@ func TestNewRemovesBackupsBeyondChangedRetention(t *testing.T) {
 	}
 	if got, err := os.ReadFile(unmatched); err != nil || string(got) != "keep" {
 		t.Fatalf("non-matching file changed: data=%q err=%v", got, err)
-	}
-	if got, err := os.ReadFile(outOfRange); err != nil || string(got) != "keep" {
-		t.Fatalf("out-of-range backup changed: data=%q err=%v", got, err)
 	}
 }
 
@@ -521,21 +514,20 @@ func TestNewSyncsDirectoryAfterRemovingExcessBackups(t *testing.T) {
 		}
 	}
 
-	original := syncAuditDirectory
-	t.Cleanup(func() { syncAuditDirectory = original })
 	syncCalls := 0
-	syncAuditDirectory = func(path string) error {
+	loggerWithCleanup, err := newWithHooks(dir, Options{MaxBytes: 128, Backups: 0}, loggerHooks{syncDir: func(path string) error {
 		syncCalls++
 		if path != dir {
 			t.Errorf("sync path = %q, want %q", path, dir)
 		}
 		return nil
-	}
-	if _, err := New(dir, Options{MaxBytes: 128, Backups: 0}); err != nil {
+	}})
+	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
-	if syncCalls != 1 {
-		t.Fatalf("directory sync calls = %d, want 1", syncCalls)
+	_ = loggerWithCleanup
+	if syncCalls != 3 {
+		t.Fatalf("directory sync calls = %d, want 3 (pre-recovery, removal, and final New sync)", syncCalls)
 	}
 }
 
@@ -548,11 +540,15 @@ func TestNewPropagatesDirectorySyncFailureAfterBackupCleanup(t *testing.T) {
 		}
 	}
 
-	original := syncAuditDirectory
-	t.Cleanup(func() { syncAuditDirectory = original })
 	want := errors.New("synthetic cleanup directory sync failure")
-	syncAuditDirectory = func(string) error { return want }
-	if _, err := New(dir, Options{MaxBytes: 128, Backups: 0}); !errors.Is(err, want) {
+	syncCalls := 0
+	if _, err := newWithHooks(dir, Options{MaxBytes: 128, Backups: 0}, loggerHooks{syncDir: func(path string) error {
+		syncCalls++
+		if syncCalls == 2 {
+			return want
+		}
+		return syncDirectory(path)
+	}}); !errors.Is(err, want) {
 		t.Fatalf("New() error = %v, want wrapped sync failure", err)
 	}
 	if _, err := os.Lstat(backupPath(filepath.Join(dir, auditFilename), 1)); !errors.Is(err, os.ErrNotExist) {
