@@ -12,6 +12,8 @@ import (
 	"github.com/chenjw/aegis-ssh/internal/policy"
 )
 
+const testApprovalCodeCharacters = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
 func deterministicReader() io.Reader {
 	return bytes.NewReader(bytes.Repeat([]byte{0x42}, 256))
 }
@@ -39,9 +41,12 @@ func TestApprovalIsBoundAndSingleUse(t *testing.T) {
 		t.Fatalf("unexpected approval lifetime: %v to %v", created.CreatedAt, created.ExpiresAt)
 	}
 	for _, r := range created.Code {
-		if !strings.ContainsRune(codeAlphabet, r) {
+		if !strings.ContainsRune(testApprovalCodeCharacters, r) {
 			t.Fatalf("code contains ambiguous character %q", r)
 		}
+	}
+	if strings.ContainsAny(created.Code, "ILO01") {
+		t.Fatalf("code contains explicitly forbidden ambiguous character: %q", created.Code)
 	}
 	command[0] = 'X'
 	categories[0] = policy.PrivateKey
@@ -150,6 +155,50 @@ func TestDuplicateRandomIDDoesNotOverwrite(t *testing.T) {
 	if consumed.ServerAlias != "first" || string(consumed.Command) != "echo first" {
 		t.Fatalf("duplicate random id overwrote approval: %#v", consumed)
 	}
+}
+
+func TestCreateCleansExpiredApprovalsBeforeEarlyReturn(t *testing.T) {
+	t.Run("random failure", func(t *testing.T) {
+		now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+		store := newTestStore(t, &now)
+		created, err := store.Create("first", []byte("echo first"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now = created.ExpiresAt
+		store.random = bytes.NewReader(nil)
+		if _, err := store.Create("second", []byte("echo second"), nil); !errors.Is(err, ErrRandom) {
+			t.Fatalf("create with failed random source = %v; want ErrRandom", err)
+		}
+		if _, err := store.Consume(created.ID, created.Code); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expired approval after failed create = %v; want ErrNotFound", err)
+		}
+	})
+
+	t.Run("expired id collision", func(t *testing.T) {
+		now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+		store := newTestStore(t, &now)
+		created, err := store.Create("first", []byte("echo first"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now = created.ExpiresAt
+		store.random = deterministicReader()
+		replacement, err := store.Create("second", []byte("echo second"), nil)
+		if err != nil {
+			t.Fatalf("reuse id after expiry = %v", err)
+		}
+		if replacement.ID != created.ID {
+			t.Fatalf("replacement id = %q; want collision id %q", replacement.ID, created.ID)
+		}
+		consumed, err := store.Consume(replacement.ID, replacement.Code)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if consumed.ServerAlias != "second" || string(consumed.Command) != "echo second" {
+			t.Fatalf("consume replacement = %#v", consumed)
+		}
+	})
 }
 
 func TestApprovalConcurrentConsumeOnlyOnce(t *testing.T) {

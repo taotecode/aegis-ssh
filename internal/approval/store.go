@@ -62,6 +62,8 @@ func (s *Store) Create(serverAlias string, command []byte, categories []policy.C
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cleanupAt := s.now()
+	s.cleanupLocked(cleanupAt, "")
 
 	idBytes := make([]byte, 16)
 	if _, err := io.ReadFull(s.random, idBytes); err != nil {
@@ -77,7 +79,6 @@ func (s *Store) Create(serverAlias string, command []byte, categories []policy.C
 		return Approval{}, fmt.Errorf("%w: duplicate approval id", ErrRandom)
 	}
 	createdAt := s.now()
-	s.cleanupLocked(createdAt, "")
 	approval := Approval{
 		ID:          id,
 		Code:        code,
