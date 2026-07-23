@@ -360,7 +360,7 @@ git commit -m "feat: classify sensitive remote shell operations"
 - Create: `internal/policy/redactor.go`
 - Create: `internal/policy/redactor_test.go`
 
-- [ ] **Step 1: Write failing redaction tests**
+- [x] **Step 1: Write failing redaction tests**
 
 ```go
 func TestRedactorRemovesSupportedSecrets(t *testing.T) {
@@ -392,13 +392,13 @@ Define `testPEM` in the test file as a complete synthetic
 `NewStreamRedactor` test writer records every emitted byte so the assertion
 checks the public output boundary, not an internal buffer.
 
-- [ ] **Step 2: Run tests and confirm the red state**
+- [x] **Step 2: Run tests and confirm the red state**
 
 Run: `go test ./internal/policy -run Redactor -v`
 
 Expected: FAIL because redactor types are missing.
 
-- [ ] **Step 3: Implement bounded filtering and category counts**
+- [x] **Step 3: Implement bounded filtering and category counts**
 
 Define `RedactionCategory`, `RedactionResult`, `Redactor`, and
 `StreamRedactor`. Validate IP candidates with `net/netip` rather than replacing
@@ -407,7 +407,7 @@ version-like numbers. Replace secrets with stable markers such as
 supported token and PEM delimiter, and enforce the broker output byte limit
 before returning data.
 
-- [ ] **Step 4: Run package tests, fuzz seeds, and commit**
+- [x] **Step 4: Run package tests, fuzz seeds, and commit**
 
 Add fuzz seeds containing invalid UTF-8, very long lines, adjacent IPv6 text,
 split PEM blocks, and empty writes.
