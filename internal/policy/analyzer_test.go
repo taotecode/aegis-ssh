@@ -283,8 +283,9 @@ func TestAnalyzerHandlesNestedShellPlusOptions(t *testing.T) {
 		{"plus short cluster", `bash +xeu -c 'ip route'`, []Category{NetworkIdentity}},
 		{"plus O with value", `bash +O extglob -c 'ip route'`, []Category{NetworkIdentity}},
 		{"plus o with value", `bash +o verbose -c 'ip route'`, []Category{NetworkIdentity}},
-		{"plus c is not selector", `bash +c 'ip route'`, nil},
-		{"plus c then minus c", `bash +c -c 'ip route'`, []Category{NetworkIdentity}},
+		{"bash plus c selector", `bash +c 'ip route'`, []Category{NetworkIdentity}},
+		{"dash plus c selector", `dash +c 'ip route'`, []Category{NetworkIdentity}},
+		{"zsh plus c selector", `zsh +c 'ip route'`, []Category{NetworkIdentity}},
 		{"unknown plus option", `bash +not-an-option -c 'ip route'`, nil},
 	}
 
@@ -672,7 +673,7 @@ func TestAnalyzerClassifiesEnvUnsetWithoutUtility(t *testing.T) {
 	}
 }
 
-func TestAnalyzerDoesNotTreatValueOptionClusterCAsCommandSelector(t *testing.T) {
+func TestAnalyzerHandlesCommandSelectorsInValueOptionClusters(t *testing.T) {
 	tests := []struct {
 		command string
 		want    []Category
@@ -682,11 +683,20 @@ func TestAnalyzerDoesNotTreatValueOptionClusterCAsCommandSelector(t *testing.T) 
 		{`bash +oc 'ip route'`, nil},
 		{`dash -oc 'ip route'`, nil},
 		{`dash +oc 'ip route'`, nil},
-		{`bash -oc errexit -c 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
-		{`bash -Oc extglob -c 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
-		{`dash -oc errexit -c 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
-		{`bash +oc errexit -c 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
-		{`bash +Oc extglob -c 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
+		{`zsh -oc ignored 'ip route'`, nil},
+		{`zsh +oc ignored 'ip route'`, nil},
+		{`bash -oc errexit 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
+		{`bash -Oc extglob 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
+		{`dash -oc errexit 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
+		{`bash +oc errexit 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
+		{`bash +Oc extglob 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
+		{`dash +oc errexit 'cat ~/.ssh/id_rsa'`, []Category{SSHSecret}},
+		{`bash -oc errexit 'ip route'`, []Category{NetworkIdentity}},
+		{`bash -Oc extglob 'ip route'`, []Category{NetworkIdentity}},
+		{`dash -oc errexit 'ip route'`, []Category{NetworkIdentity}},
+		{`bash +oc errexit 'ip route'`, []Category{NetworkIdentity}},
+		{`bash +Oc extglob 'ip route'`, []Category{NetworkIdentity}},
+		{`dash +oc errexit 'ip route'`, []Category{NetworkIdentity}},
 		{`bash -xo`, nil},
 		{`bash -xO`, nil},
 		{`dash -xo`, nil},

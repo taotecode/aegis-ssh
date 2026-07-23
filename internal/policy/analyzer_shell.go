@@ -94,10 +94,6 @@ func parseShellOptions(words []*syntax.Word, spec shellOptionSpec) shellInvocati
 				return invocation
 			}
 			i++
-			continue
-		}
-		if option[0] == '+' {
-			continue
 		}
 		if hasCommandString {
 			if i+1 >= len(words) {
