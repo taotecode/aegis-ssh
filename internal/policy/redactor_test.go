@@ -69,6 +69,47 @@ func TestRedactorPrefixCollisionScaling(t *testing.T) {
 	}
 }
 
+func TestRedactorCollisionPrefixIsFixedAndMemoryBounded(t *testing.T) {
+	const (
+		collisionRun = 32 << 10
+		secretCount  = 128
+		maxPrefixLen = 64
+	)
+	input := redactionBasePrefix + strings.Repeat("\x00", collisionRun)
+	for range secretCount {
+		input += " password=x"
+	}
+
+	prefix := collisionSafeRedactionPrefix(input)
+	if len(prefix) > maxPrefixLen {
+		t.Fatalf("collision-safe prefix length = %d, want <= %d", len(prefix), maxPrefixLen)
+	}
+
+	redactor := NewRedactor(nil)
+	result := redactor.RedactString(input)
+	if strings.Contains(result.Text, "password=x") {
+		t.Fatalf("RedactString() leaked assignment secret: %q", result.Text)
+	}
+	if got := result.Counts[CredentialAssignment]; got != secretCount {
+		t.Fatalf("CredentialAssignment count = %d, want %d", got, secretCount)
+	}
+
+	benchmark := testing.Benchmark(func(b *testing.B) {
+		for range b.N {
+			result := redactor.RedactString(input)
+			if result.Counts[CredentialAssignment] != secretCount || strings.Contains(result.Text, "password=x") {
+				b.Fatal("benchmark redaction lost assignment protection")
+			}
+		}
+	})
+	// The race detector adds substantial bookkeeping allocations; keep the
+	// bound linear while leaving enough headroom for instrumented runs.
+	maxAllocBytes := int64(len(input) * 128)
+	if benchmark.AllocedBytesPerOp() > maxAllocBytes {
+		t.Fatalf("RedactString() allocated %d bytes/op for %d input bytes; want <= %d", benchmark.AllocedBytesPerOp(), len(input), maxAllocBytes)
+	}
+}
+
 func TestRedactorRedactsSensitiveOutputAndCountsReplacements(t *testing.T) {
 	awsKey := "AKIA" + strings.Repeat("S", 16)
 	githubToken := "ghp_" + strings.Repeat("g", 36)

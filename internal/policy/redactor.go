@@ -1,6 +1,9 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/netip"
@@ -224,27 +227,20 @@ func newRedactionState(text string) *redactionState {
 }
 
 func collisionSafeRedactionPrefix(text string) string {
-	maxNULRun := -1
-	searchFrom := 0
-	for searchFrom < len(text) {
-		relative := strings.Index(text[searchFrom:], redactionBasePrefix)
-		if relative < 0 {
-			break
+	seed := sha256.Sum256([]byte(text))
+	var candidateInput [sha256.Size + 8]byte
+	copy(candidateInput[:sha256.Size], seed[:])
+
+	for attempt := uint64(0); ; attempt++ {
+		binary.BigEndian.PutUint64(candidateInput[sha256.Size:], attempt)
+		digest := sha256.Sum256(candidateInput[:])
+		var encoded [32]byte
+		hex.Encode(encoded[:], digest[:16])
+		candidate := redactionBasePrefix + string(encoded[:]) + "\x00"
+		if !strings.Contains(text, candidate) {
+			return candidate
 		}
-		afterPrefix := searchFrom + relative + len(redactionBasePrefix)
-		runEnd := afterPrefix
-		for runEnd < len(text) && text[runEnd] == 0 {
-			runEnd++
-		}
-		if runEnd-afterPrefix > maxNULRun {
-			maxNULRun = runEnd - afterPrefix
-		}
-		searchFrom = runEnd
 	}
-	if maxNULRun < 0 {
-		return redactionBasePrefix
-	}
-	return redactionBasePrefix + strings.Repeat("\x00", maxNULRun+1)
 }
 
 type protectedFormatter func(*regexp.Regexp, string, string) string
