@@ -87,7 +87,7 @@ func TestRedactorRedactsSensitiveOutputAndCountsReplacements(t *testing.T) {
 }
 
 func TestRedactorHandlesPEMVariantsAndPreventsPartialLowerPriorityMatches(t *testing.T) {
-	for _, pemType := range []string{"PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY"} {
+	for _, pemType := range []string{"PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY"} {
 		t.Run(pemType, func(t *testing.T) {
 			input := "before\n-----BEGIN " + pemType + "-----\nSYNTHETIC-192.0.2.33-PAYLOAD\n-----END " + pemType + "-----\nafter"
 			result := NewRedactor(nil).RedactString(input)
@@ -123,6 +123,18 @@ func TestRedactorAvoidsIPAddressAndAccessKeyFalsePositives(t *testing.T) {
 	}
 	if len(result.Counts) != 0 {
 		t.Fatalf("RedactString() counts = %#v, want none", result.Counts)
+	}
+}
+
+func TestRedactorRedactsIPAddressBeforeSentencePeriod(t *testing.T) {
+	for _, input := range []string{"peer=192.0.2.10.", "peer=2001:db8::1."} {
+		result := NewRedactor(nil).RedactString(input)
+		if result.Text != "peer=[REDACTED:IP_ADDRESS]." {
+			t.Errorf("RedactString(%q) = %q", input, result.Text)
+		}
+		if result.Counts[IPAddress] != 1 {
+			t.Errorf("RedactString(%q) counts = %#v", input, result.Counts)
+		}
 	}
 }
 
@@ -170,6 +182,17 @@ func TestRedactorRedactsQuotedAndPrefixedCredentialAssignments(t *testing.T) {
 	}
 }
 
+func TestRedactorRedactsEntireEscapedQuotedCredentialValue(t *testing.T) {
+	input := `{"password":"synthetic-prefix\"LEAKED-SUFFIX"}`
+	result := NewRedactor(nil).RedactString(input)
+	if result.Text != `{"password":[REDACTED:CREDENTIAL_ASSIGNMENT]}` {
+		t.Fatalf("RedactString() = %q", result.Text)
+	}
+	if result.Counts[CredentialAssignment] != 1 {
+		t.Fatalf("RedactString() counts = %#v", result.Counts)
+	}
+}
+
 func TestRedactorLimitBoundsInputAndExpandedOutput(t *testing.T) {
 	const maxBytes = 29
 	input := "prefix password=synthetic-value suffix " + strings.Repeat("界", 64)
@@ -185,6 +208,29 @@ func TestRedactorLimitBoundsInputAndExpandedOutput(t *testing.T) {
 	}
 	if strings.Contains(result.Text, "synthetic-value") {
 		t.Fatalf("RedactString() leaked truncated input: %q", result.Text)
+	}
+}
+
+func TestRedactorDoesNotExposeIPAddressPrefixAtStringLimit(t *testing.T) {
+	const exposedPrefix = "peer=192.0.2."
+	input := "peer=192.0.2.123 suffix"
+	result := NewRedactor(nil).WithMaxBytes(len(exposedPrefix)).RedactString(input)
+	if !result.Truncated || len(result.Text) > len(exposedPrefix) {
+		t.Fatalf("RedactString() = %#v", result)
+	}
+	if strings.Contains(result.Text, "192.0.2.") {
+		t.Fatalf("RedactString() exposed IP prefix at limit: %q", result.Text)
+	}
+	if result.Counts[IPAddress] != 1 {
+		t.Fatalf("RedactString() counts = %#v", result.Counts)
+	}
+}
+
+func TestRedactorLookaheadDoesNotRedactTruncatedVersion(t *testing.T) {
+	const publicPrefix = "version=1.2."
+	result := NewRedactor(nil).WithMaxBytes(len(publicPrefix)).RedactString("version=1.2.3 suffix")
+	if result.Text != publicPrefix || result.Counts[IPAddress] != 0 || !result.Truncated {
+		t.Fatalf("RedactString() = %#v", result)
 	}
 }
 
@@ -244,6 +290,9 @@ func TestStreamRedactorBoundsMemoryAndOutputAndReportsTruncation(t *testing.T) {
 	if dst.Len() != 0 {
 		t.Fatalf("Write() released output before Close: %q", dst.String())
 	}
+	if len(stream.buffer) > maxBytes+redactionLookaheadBytes || cap(stream.buffer) > maxBytes+redactionLookaheadBytes {
+		t.Fatalf("stream buffer exceeds bounded lookahead: len=%d cap=%d", len(stream.buffer), cap(stream.buffer))
+	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -253,6 +302,30 @@ func TestStreamRedactorBoundsMemoryAndOutputAndReportsTruncation(t *testing.T) {
 	}
 	if !utf8.ValidString(result.Text) || strings.Contains(result.Text, "synthetic-stream-value") {
 		t.Fatalf("bounded output is unsafe: %q", result.Text)
+	}
+}
+
+func TestStreamRedactorDoesNotExposeIPAddressPrefixAtLimit(t *testing.T) {
+	const exposedPrefix = "peer=192.0.2."
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil).WithMaxBytes(len(exposedPrefix))
+	for _, chunk := range []string{exposedPrefix, "123 suffix"} {
+		if n, err := stream.Write([]byte(chunk)); err != nil || n != len(chunk) {
+			t.Fatalf("Write() = (%d, %v), want (%d, nil)", n, err, len(chunk))
+		}
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := stream.Result()
+	if !result.Truncated || len(result.Text) > len(exposedPrefix) {
+		t.Fatalf("Result() = %#v", result)
+	}
+	if strings.Contains(result.Text, "192.0.2.") || strings.Contains(dst.String(), "192.0.2.") {
+		t.Fatalf("stream exposed IP prefix at limit: result=%q dst=%q", result.Text, dst.String())
+	}
+	if result.Counts[IPAddress] != 1 {
+		t.Fatalf("Result() counts = %#v", result.Counts)
 	}
 }
 
@@ -292,14 +365,18 @@ func TestStreamRedactorCloseAndWriterErrorSemantics(t *testing.T) {
 }
 
 func FuzzRedactor(f *testing.F) {
-	pem := "-----BEGIN EC PRIVATE KEY-----\nFUZZ-PEM-PAYLOAD\n-----END EC PRIVATE KEY-----"
+	const (
+		adjacentIPv6Seed = "2001:db8::1,2001:db8::2"
+		assignmentSeed   = "password=FUZZ-SYNTHETIC"
+		pemSeed          = "-----BEGIN EC PRIVATE KEY-----\nFUZZ-PEM-PAYLOAD\n-----END EC PRIVATE KEY-----"
+	)
 	f.Add([]byte("ordinary output"), 3)
 	f.Add([]byte{}, 0)
 	f.Add([]byte{0xff, 0xfe, 'x'}, 1)
 	f.Add([]byte(strings.Repeat("long", 1024)), 31)
-	f.Add([]byte("2001:db8::1,2001:db8::2"), 7)
-	f.Add([]byte(pem), 5)
-	f.Add([]byte("password=FUZZ-SYNTHETIC"), 2)
+	f.Add([]byte(adjacentIPv6Seed), 7)
+	f.Add([]byte(pemSeed), 5)
+	f.Add([]byte(assignmentSeed), 2)
 
 	f.Fuzz(func(t *testing.T, input []byte, chunkSize int) {
 		const maxBytes = 512
@@ -308,19 +385,32 @@ func FuzzRedactor(f *testing.F) {
 		if len(want.Text) > maxBytes || !utf8.ValidString(want.Text) {
 			t.Fatalf("RedactString() returned invalid bounded output: %#v", want)
 		}
-		inputText := string(input)
-		if strings.Contains(inputText, "-----BEGIN EC PRIVATE KEY-----") &&
-			strings.Contains(inputText, "FUZZ-PEM-PAYLOAD") &&
-			strings.Contains(inputText, "-----END EC PRIVATE KEY-----") &&
-			strings.Contains(want.Text, "FUZZ-PEM-PAYLOAD") {
-			t.Fatal("RedactString() leaked seeded PEM payload")
+		if len(input) > maxBytes && !want.Truncated {
+			t.Fatalf("RedactString() did not report truncation for %d bytes", len(input))
 		}
-		if strings.Contains(inputText, "password=FUZZ-SYNTHETIC") && strings.Contains(want.Text, "FUZZ-SYNTHETIC") {
-			t.Fatal("RedactString() leaked seeded credential assignment")
+		inputText := string(input)
+		switch inputText {
+		case adjacentIPv6Seed:
+			if strings.Contains(want.Text, "2001:db8::1") || strings.Contains(want.Text, "2001:db8::2") || want.Counts[IPAddress] != 2 {
+				t.Fatalf("RedactString() did not safely redact adjacent IPv6 seed: %#v", want)
+			}
+		case pemSeed:
+			if strings.Contains(want.Text, "FUZZ-PEM-PAYLOAD") || want.Counts[PrivateKeyBlock] != 1 {
+				t.Fatalf("RedactString() leaked seeded PEM payload: %#v", want)
+			}
+		case assignmentSeed:
+			if strings.Contains(want.Text, "FUZZ-SYNTHETIC") || want.Counts[CredentialAssignment] != 1 {
+				t.Fatalf("RedactString() leaked seeded credential assignment: %#v", want)
+			}
 		}
 
 		var dst bytes.Buffer
 		stream := NewStreamRedactor(&dst, nil).WithMaxBytes(maxBytes)
+		if len(input) == 0 {
+			if n, err := stream.Write(nil); err != nil || n != 0 {
+				t.Fatalf("empty Write() = (%d, %v), want (0, nil)", n, err)
+			}
+		}
 		chunkSize = int(uint(chunkSize)%31) + 1
 		for offset := 0; offset < len(input); {
 			end := offset + chunkSize

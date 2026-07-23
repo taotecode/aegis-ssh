@@ -11,7 +11,12 @@ import (
 	"unicode/utf8"
 )
 
-const defaultRedactionMaxBytes = 4 << 20
+const (
+	defaultRedactionMaxBytes  = 4 << 20
+	redactionLookaheadBytes   = 256
+	privateKeyPEMLabelPattern = `(?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|OPENSSH PRIVATE KEY|ENCRYPTED PRIVATE KEY)`
+	ipv6ZonePattern           = `(?:%[0-9A-Za-z_.-]{1,64})?`
+)
 
 type RedactionCategory string
 
@@ -36,16 +41,16 @@ type Redactor struct {
 }
 
 var (
-	privateKeyBlockRE  = regexp.MustCompile(`(?ms)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----`)
-	incompletePEMRE    = regexp.MustCompile(`(?ms)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*\z`)
+	privateKeyBlockRE  = regexp.MustCompile(`(?ms)-----BEGIN ` + privateKeyPEMLabelPattern + `-----.*?-----END ` + privateKeyPEMLabelPattern + `-----`)
+	incompletePEMRE    = regexp.MustCompile(`(?ms)-----BEGIN ` + privateKeyPEMLabelPattern + `-----.*\z`)
 	urlCredentialRE    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]{1,31}://)([^/@\s:]+):([^/@\s]+)@`)
 	incompleteURLRE    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]{1,31}://)([^/@\s:]+):([^/@\s]*)\z`)
 	bearerTokenRE      = regexp.MustCompile(`(?i)(\bbearer[ \t]+)([a-z0-9._~+/=-]+)`)
 	accessKeyRE        = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}|glpat-[A-Za-z0-9_-]{20,})\b`)
 	incompleteAccessRE = regexp.MustCompile(`(?:\b(?:AKIA|ASIA)[A-Z0-9]{0,15}|\bgh[pousr]_[A-Za-z0-9]{0,35}|\bgithub_pat_[A-Za-z0-9_]{0,81}|\bglpat-[A-Za-z0-9_-]{0,19})\z`)
-	assignmentRE       = regexp.MustCompile(`(?i)(["']?\b(?:[a-z][a-z0-9_.-]*[_.-])?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key)\b["']?[ \t]*(?:=|:)[ \t]*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)`)
-	bracketedIPv6RE    = regexp.MustCompile(`\[[0-9A-Fa-f:.]+(?:%[0-9A-Za-z_.-]+)?\]`)
-	bareIPv6RE         = regexp.MustCompile(`[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+(?:%[0-9A-Za-z_.-]+)?`)
+	assignmentRE       = regexp.MustCompile(`(?i)(["']?\b(?:[a-z][a-z0-9_.-]*[_.-])?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key)\b["']?[ \t]*(?:=|:)[ \t]*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;]+)`)
+	bracketedIPv6RE    = regexp.MustCompile(`\[[0-9A-Fa-f:.]+` + ipv6ZonePattern + `\]`)
+	bareIPv6RE         = regexp.MustCompile(`[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+` + ipv6ZonePattern)
 	ipv4RE             = regexp.MustCompile(`(?:[0-9]{1,3}\.){3}[0-9]{1,3}`)
 )
 
@@ -77,13 +82,33 @@ func (r *Redactor) RedactString(input string) RedactionResult {
 		maxBytes = 0
 	}
 	truncated := len(input) > maxBytes
-	if truncated {
-		input = input[:maxBytes]
+	inspectionLimit := redactionInspectionLimit(maxBytes)
+	if len(input) > inspectionLimit {
+		input = input[:inspectionLimit]
 	}
-	return r.redactBounded(input, truncated)
+	return r.redactInspected(input, truncated)
 }
 
 func (r *Redactor) redactBounded(input string, truncated bool) RedactionResult {
+	return r.redactBoundedWithBoundary(input, truncated, redactionBoundary{})
+}
+
+type redactionBoundary struct {
+	rightContext     string
+	crossingIPPrefix string
+}
+
+func (r *Redactor) redactInspected(inspection string, truncated bool) RedactionResult {
+	publicBytes := len(inspection)
+	if publicBytes > r.maxBytes {
+		publicBytes = r.maxBytes
+	}
+	boundary := redactionBoundary{rightContext: inspection[publicBytes:]}
+	boundary.crossingIPPrefix = crossingIPAddressPrefix(inspection, publicBytes)
+	return r.redactBoundedWithBoundary(inspection[:publicBytes], truncated, boundary)
+}
+
+func (r *Redactor) redactBoundedWithBoundary(input string, truncated bool, boundary redactionBoundary) RedactionResult {
 	input = strings.ToValidUTF8(input, "\uFFFD")
 	state := newRedactionState(input)
 
@@ -112,7 +137,8 @@ func (r *Redactor) redactBounded(input string, truncated bool) RedactionResult {
 		state.protect(assignmentRE, CredentialAssignment, preserveFirstCapture)
 	}
 	if !r.allowed[IPAddress] {
-		state.protectIPAddresses()
+		state.protectTrailingIPAddress(boundary.crossingIPPrefix)
+		state.protectIPAddresses(boundary.rightContext)
 	}
 
 	text := state.render()
@@ -125,6 +151,14 @@ func (r *Redactor) redactBounded(input string, truncated bool) RedactionResult {
 		truncated = true
 	}
 	return RedactionResult{Text: text, Counts: cloneRedactionCounts(state.counts), Truncated: truncated}
+}
+
+func redactionInspectionLimit(maxBytes int) int {
+	maxInt := int(^uint(0) >> 1)
+	if maxBytes > maxInt-redactionLookaheadBytes {
+		return maxBytes
+	}
+	return maxBytes + redactionLookaheadBytes
 }
 
 func redactionMarker(category RedactionCategory) string {
@@ -239,26 +273,22 @@ func replaceIncompleteURLUserInfo(pattern *regexp.Regexp, match, placeholder str
 	return parts[1] + placeholder
 }
 
-func (s *redactionState) protectIPAddresses() {
-	s.replaceValidated(bracketedIPv6RE, func(candidate string) (int, int, bool) {
-		address, err := netip.ParseAddr(candidate[1 : len(candidate)-1])
-		return 0, len(candidate), err == nil && address.Is6()
-	})
-	s.replaceValidated(bareIPv6RE, func(candidate string) (int, int, bool) {
-		start, end := trimIPv6Candidate(candidate)
-		if start >= end {
-			return 0, 0, false
-		}
-		address, err := netip.ParseAddr(candidate[start:end])
-		return start, end, err == nil && address.Is6()
-	})
-	s.replaceValidated(ipv4RE, func(candidate string) (int, int, bool) {
-		address, err := netip.ParseAddr(candidate)
-		return 0, len(candidate), err == nil && address.Is4()
-	})
+type ipCandidateValidator func(string) (int, int, bool)
+
+func (s *redactionState) protectTrailingIPAddress(prefix string) {
+	if prefix == "" || !strings.HasSuffix(s.text, prefix) {
+		return
+	}
+	s.text = strings.TrimSuffix(s.text, prefix) + s.newPlaceholder(IPAddress)
 }
 
-func (s *redactionState) replaceValidated(pattern *regexp.Regexp, validate func(string) (int, int, bool)) {
+func (s *redactionState) protectIPAddresses(rightContext string) {
+	s.replaceValidated(bracketedIPv6RE, validateBracketedIPv6, rightContext)
+	s.replaceValidated(bareIPv6RE, validateBareIPv6, rightContext)
+	s.replaceValidated(ipv4RE, validateIPv4, rightContext)
+}
+
+func (s *redactionState) replaceValidated(pattern *regexp.Regexp, validate ipCandidateValidator, rightContext string) {
 	text := s.text
 	indices := pattern.FindAllStringIndex(text, -1)
 	if len(indices) == 0 {
@@ -271,7 +301,7 @@ func (s *redactionState) replaceValidated(pattern *regexp.Regexp, validate func(
 		start, end, ok := validate(candidate)
 		absoluteStart := index[0] + start
 		absoluteEnd := index[0] + end
-		if !ok || strings.Contains(candidate, s.prefix) || !validIPAddressBoundary(text, absoluteStart, absoluteEnd) {
+		if !ok || strings.Contains(candidate, s.prefix) || !validIPAddressBoundary(text, absoluteStart, absoluteEnd, rightContext) {
 			continue
 		}
 		output.WriteString(text[last:absoluteStart])
@@ -283,6 +313,51 @@ func (s *redactionState) replaceValidated(pattern *regexp.Regexp, validate func(
 	}
 	output.WriteString(text[last:])
 	s.text = output.String()
+}
+
+func validateBracketedIPv6(candidate string) (int, int, bool) {
+	address, err := netip.ParseAddr(candidate[1 : len(candidate)-1])
+	return 0, len(candidate), err == nil && address.Is6()
+}
+
+func validateBareIPv6(candidate string) (int, int, bool) {
+	start, end := trimIPv6Candidate(candidate)
+	if start >= end {
+		return 0, 0, false
+	}
+	address, err := netip.ParseAddr(candidate[start:end])
+	return start, end, err == nil && address.Is6()
+}
+
+func validateIPv4(candidate string) (int, int, bool) {
+	address, err := netip.ParseAddr(candidate)
+	return 0, len(candidate), err == nil && address.Is4()
+}
+
+func crossingIPAddressPrefix(inspection string, publicBytes int) string {
+	if publicBytes <= 0 || publicBytes >= len(inspection) {
+		return ""
+	}
+	rules := []struct {
+		pattern  *regexp.Regexp
+		validate ipCandidateValidator
+	}{
+		{bracketedIPv6RE, validateBracketedIPv6},
+		{bareIPv6RE, validateBareIPv6},
+		{ipv4RE, validateIPv4},
+	}
+	for _, rule := range rules {
+		for _, index := range rule.pattern.FindAllStringIndex(inspection, -1) {
+			start, end, ok := rule.validate(inspection[index[0]:index[1]])
+			absoluteStart := index[0] + start
+			absoluteEnd := index[0] + end
+			if ok && absoluteStart < publicBytes && absoluteEnd > publicBytes &&
+				validIPAddressBoundary(inspection, absoluteStart, absoluteEnd, "") {
+				return inspection[absoluteStart:publicBytes]
+			}
+		}
+	}
+	return ""
 }
 
 func trimIPv6Candidate(candidate string) (int, int) {
@@ -302,14 +377,24 @@ func trimIPv6Candidate(candidate string) (int, int) {
 	return start, end
 }
 
-func validIPAddressBoundary(text string, start, end int) bool {
+func validIPAddressBoundary(text string, start, end int, rightContext string) bool {
 	if start > 0 && isIPAddressAdjacent(text[start-1]) {
 		return false
 	}
-	if end < len(text) && isIPAddressAdjacent(text[end]) {
-		return false
+	if end < len(text) {
+		return validIPAddressRightBoundary(text[end:])
 	}
-	return true
+	return validIPAddressRightBoundary(rightContext)
+}
+
+func validIPAddressRightBoundary(context string) bool {
+	if context == "" {
+		return true
+	}
+	if context[0] == '.' {
+		return len(context) == 1 || !isIPAddressAdjacent(context[1])
+	}
+	return !isIPAddressAdjacent(context[0])
 }
 
 func isIPAddressAdjacent(char byte) bool {
@@ -342,12 +427,16 @@ func (s *StreamRedactor) WithMaxBytes(maxBytes int) *StreamRedactor {
 		maxBytes = 0
 	}
 	s.redactor = s.redactor.WithMaxBytes(maxBytes)
-	if len(s.buffer) > maxBytes {
-		s.buffer = append([]byte(nil), s.buffer[:maxBytes]...)
+	inspectionLimit := redactionInspectionLimit(maxBytes)
+	if len(s.buffer) > inspectionLimit {
+		s.buffer = append([]byte(nil), s.buffer[:inspectionLimit]...)
 		s.truncated = true
 	}
-	if cap(s.buffer) > maxBytes {
-		shrunk := make([]byte, len(s.buffer), maxBytes)
+	if len(s.buffer) > maxBytes {
+		s.truncated = true
+	}
+	if cap(s.buffer) > inspectionLimit {
+		shrunk := make([]byte, len(s.buffer), inspectionLimit)
 		copy(shrunk, s.buffer)
 		s.buffer = shrunk
 	}
@@ -361,7 +450,10 @@ func (s *StreamRedactor) Write(p []byte) (int, error) {
 		return 0, ErrStreamRedactorClosed
 	}
 	written := len(p)
-	remaining := s.redactor.maxBytes - len(s.buffer)
+	if len(s.buffer)+len(p) > s.redactor.maxBytes {
+		s.truncated = true
+	}
+	remaining := redactionInspectionLimit(s.redactor.maxBytes) - len(s.buffer)
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -379,12 +471,13 @@ func (s *StreamRedactor) growBuffer(additional int) {
 	if required <= cap(s.buffer) {
 		return
 	}
-	capacity := cap(s.buffer) * 2
-	if capacity < required {
-		capacity = required
+	limit := redactionInspectionLimit(s.redactor.maxBytes)
+	capacity := required
+	if cap(s.buffer) > 0 && cap(s.buffer) <= limit/2 && cap(s.buffer)*2 > capacity {
+		capacity = cap(s.buffer) * 2
 	}
-	if capacity > s.redactor.maxBytes {
-		capacity = s.redactor.maxBytes
+	if capacity > limit {
+		capacity = limit
 	}
 	next := make([]byte, len(s.buffer), capacity)
 	copy(next, s.buffer)
@@ -398,7 +491,7 @@ func (s *StreamRedactor) Close() error {
 		return s.closeErr
 	}
 	s.closed = true
-	s.result = s.redactor.redactBounded(string(s.buffer), s.truncated)
+	s.result = s.redactor.redactInspected(string(s.buffer), s.truncated)
 	s.buffer = nil
 	written, err := io.WriteString(s.dst, s.result.Text)
 	if err == nil && written != len(s.result.Text) {
