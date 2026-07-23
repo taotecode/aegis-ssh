@@ -14,6 +14,7 @@ import (
 const (
 	defaultRedactionMaxBytes  = 4 << 20
 	redactionLookaheadBytes   = 256
+	redactionBasePrefix       = "\x00AEGIS_REDACTION\x00"
 	privateKeyPEMLabelPattern = `(?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|OPENSSH PRIVATE KEY|ENCRYPTED PRIVATE KEY)`
 )
 
@@ -219,11 +220,31 @@ type redactionState struct {
 }
 
 func newRedactionState(text string) *redactionState {
-	prefix := "\x00AEGIS_REDACTION\x00"
-	for strings.Contains(text, prefix) {
-		prefix += "\x00"
+	return &redactionState{text: text, prefix: collisionSafeRedactionPrefix(text), counts: make(map[RedactionCategory]int)}
+}
+
+func collisionSafeRedactionPrefix(text string) string {
+	maxNULRun := -1
+	searchFrom := 0
+	for searchFrom < len(text) {
+		relative := strings.Index(text[searchFrom:], redactionBasePrefix)
+		if relative < 0 {
+			break
+		}
+		afterPrefix := searchFrom + relative + len(redactionBasePrefix)
+		runEnd := afterPrefix
+		for runEnd < len(text) && text[runEnd] == 0 {
+			runEnd++
+		}
+		if runEnd-afterPrefix > maxNULRun {
+			maxNULRun = runEnd - afterPrefix
+		}
+		searchFrom = runEnd
 	}
-	return &redactionState{text: text, prefix: prefix, counts: make(map[RedactionCategory]int)}
+	if maxNULRun < 0 {
+		return redactionBasePrefix
+	}
+	return redactionBasePrefix + strings.Repeat("\x00", maxNULRun+1)
 }
 
 type protectedFormatter func(*regexp.Regexp, string, string) string
@@ -617,6 +638,7 @@ type StreamRedactor struct {
 	closeErr  error
 	result    RedactionResult
 	urlTail   urlAuthorityTailState
+	maxFrozen bool
 }
 
 func NewStreamRedactor(dst io.Writer, allowed map[RedactionCategory]bool) *StreamRedactor {
@@ -626,9 +648,13 @@ func NewStreamRedactor(dst io.Writer, allowed map[RedactionCategory]bool) *Strea
 	return &StreamRedactor{dst: dst, redactor: NewRedactor(allowed)}
 }
 
+// WithMaxBytes applies only before the first Write or Close; later calls are no-ops.
 func (s *StreamRedactor) WithMaxBytes(maxBytes int) *StreamRedactor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.maxFrozen || s.closed {
+		return s
+	}
 	if maxBytes < 0 {
 		maxBytes = 0
 	}
@@ -655,6 +681,7 @@ func (s *StreamRedactor) Write(p []byte) (int, error) {
 	if s.closed {
 		return 0, ErrStreamRedactorClosed
 	}
+	s.maxFrozen = true
 	written := len(p)
 	if len(s.buffer)+len(p) > s.redactor.maxBytes {
 		s.truncated = true
@@ -747,6 +774,7 @@ func (s *StreamRedactor) Close() error {
 		return s.closeErr
 	}
 	s.closed = true
+	s.maxFrozen = true
 	urlCredentialAcrossBoundary := urlCredentialAfterBoundary(string(s.buffer), s.redactor.maxBytes)
 	if s.urlTail.credentials {
 		urlCredentialAcrossBoundary = true

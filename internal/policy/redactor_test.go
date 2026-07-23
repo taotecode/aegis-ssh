@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 )
@@ -47,6 +48,24 @@ func TestRedactorStateRenderUsesLinearMemory(t *testing.T) {
 	maxBytesPerOp := int64(len(state.text) * 32)
 	if result.AllocedBytesPerOp() > maxBytesPerOp {
 		t.Fatalf("render() allocated %d bytes/op for %d input bytes; want <= %d", result.AllocedBytesPerOp(), len(state.text), maxBytesPerOp)
+	}
+}
+
+func TestRedactorPrefixCollisionScaling(t *testing.T) {
+	allocations := func(size int) float64 {
+		input := "\x00AEGIS_REDACTION\x00" + strings.Repeat("\x00", size)
+		redactor := NewRedactor(nil)
+		if result := redactor.RedactString(input); result.Text != input || len(result.Counts) != 0 {
+			t.Fatalf("RedactString(collision input) = %#v", result)
+		}
+		return testing.AllocsPerRun(1, func() {
+			redactor.RedactString(input)
+		})
+	}
+	small := allocations(8 << 10)
+	large := allocations(32 << 10)
+	if large > small*3+16 {
+		t.Fatalf("prefix collision allocations scale with collision length: small=%.0f large=%.0f", small, large)
 	}
 }
 
@@ -500,6 +519,57 @@ func TestStreamRedactorProtectsAmbiguousLongURLAuthorityAtLimit(t *testing.T) {
 	result := stream.Result()
 	if !result.Truncated || result.Counts[URLCredential] != 1 || strings.Contains(result.Text, strings.Repeat("u", 30)) || strings.Contains(dst.String(), strings.Repeat("u", 30)) {
 		t.Fatalf("stream result=%#v dst=%q", result, dst.String())
+	}
+}
+
+func TestStreamRedactorFreezesMaxAfterFirstWrite(t *testing.T) {
+	input := "https://" + strings.Repeat("u", 500) + ":synthetic-pass@example.test/path"
+	want := NewRedactor(nil).RedactString(input)
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil)
+	if _, err := stream.Write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	stream.WithMaxBytes(50).WithMaxBytes(defaultRedactionMaxBytes)
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stream.WithMaxBytes(1)
+	result := stream.Result()
+	if result.Text != want.Text || result.Truncated != want.Truncated || !equalRedactionCounts(result.Counts, want.Counts) {
+		t.Fatalf("frozen result=%#v want=%#v", result, want)
+	}
+}
+
+func TestStreamRedactorFreezesMaxAfterEmptyWriteAndConcurrently(t *testing.T) {
+	input := "https://" + strings.Repeat("u", 500) + ":synthetic-pass@example.test/path"
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil).WithMaxBytes(10).WithMaxBytes(50)
+	if stream.redactor.maxBytes != 50 {
+		t.Fatalf("pre-Write WithMaxBytes did not apply: %d", stream.redactor.maxBytes)
+	}
+	if _, err := stream.Write(nil); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		stream.WithMaxBytes(defaultRedactionMaxBytes)
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := stream.Write([]byte(input)); err != nil {
+			t.Error(err)
+		}
+	}()
+	wg.Wait()
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := stream.Result()
+	if !result.Truncated || len(result.Text) > 50 || strings.Contains(result.Text, strings.Repeat("u", 20)) {
+		t.Fatalf("concurrent frozen result=%#v", result)
 	}
 }
 
