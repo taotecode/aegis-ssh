@@ -42,6 +42,7 @@ type Redactor struct {
 var (
 	privateKeyBlockRE  = regexp.MustCompile(`(?ms)-----BEGIN ` + privateKeyPEMLabelPattern + `-----.*?-----END ` + privateKeyPEMLabelPattern + `-----`)
 	incompletePEMRE    = regexp.MustCompile(`(?ms)-----BEGIN ` + privateKeyPEMLabelPattern + `-----.*\z`)
+	urlSchemeRE        = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://`)
 	urlCredentialRE    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]{1,31}://)([^/@\s:]+):([^/@\s]+)@`)
 	incompleteURLRE    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]{1,31}://)([^/@\s:]+):([^/@\s]*)\z`)
 	bearerTokenRE      = regexp.MustCompile(`(?i)(\bbearer[ \t]+)([a-z0-9._~+/=-]+)`)
@@ -107,6 +108,9 @@ func (r *Redactor) redactInspected(inspection string, truncated bool) RedactionR
 	boundary := redactionBoundary{rightContext: inspection[publicBytes:]}
 	boundary.crossingIPPrefix = crossingIPAddressPrefix(inspection, publicBytes)
 	boundary.crossingURLCredentialPrefix = crossingURLCredentialPrefix(inspection, publicBytes)
+	if truncated && boundary.crossingURLCredentialPrefix == "" {
+		boundary.crossingURLCredentialPrefix = truncatedURLAuthorityPrefix(inspection, publicBytes)
+	}
 	return r.redactBoundedWithBoundary(inspection[:publicBytes], truncated, boundary)
 }
 
@@ -445,6 +449,25 @@ func crossingURLCredentialPrefix(inspection string, publicBytes int) string {
 		if credentialStart < publicBytes {
 			return inspection[credentialStart:publicBytes]
 		}
+	}
+	return ""
+}
+
+func truncatedURLAuthorityPrefix(inspection string, publicBytes int) string {
+	if publicBytes <= 0 || publicBytes >= len(inspection) {
+		return ""
+	}
+	for _, index := range urlSchemeRE.FindAllStringIndex(inspection, -1) {
+		authorityStart := index[1]
+		if authorityStart >= publicBytes {
+			continue
+		}
+		authority := inspection[authorityStart:]
+		delimiter := strings.IndexAny(authority, "/?#")
+		if delimiter >= 0 {
+			continue
+		}
+		return inspection[authorityStart:publicBytes]
 	}
 	return ""
 }

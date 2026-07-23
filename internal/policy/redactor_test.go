@@ -331,6 +331,33 @@ func TestRedactorDoesNotExposeURLCredentialAtStringLimit(t *testing.T) {
 	}
 }
 
+func TestRedactorProtectsAmbiguousLongURLAuthorityAtLimit(t *testing.T) {
+	const maxBytes = 50
+	input := "https://" + strings.Repeat("u", 300) + ":synthetic-pass@example.test/path"
+	result := NewRedactor(nil).WithMaxBytes(maxBytes).RedactString(input)
+	if !result.Truncated || result.Counts[URLCredential] != 1 {
+		t.Fatalf("RedactString() = %#v", result)
+	}
+	if strings.Contains(result.Text, strings.Repeat("u", 30)) {
+		t.Fatalf("RedactString() leaked ambiguous URL authority prefix: %q", result.Text)
+	}
+}
+
+func TestRedactorDoesNotOverRedactResolvedURLAuthorityAtLimit(t *testing.T) {
+	ordinaryHost := "https://" + strings.Repeat("h", 80) + "/path"
+	ordinary := NewRedactor(nil).WithMaxBytes(50).RedactString(ordinaryHost)
+	if ordinary.Counts[URLCredential] != 0 || ordinary.Text != ordinaryHost[:50] {
+		t.Fatalf("ordinary truncated host = %#v", ordinary)
+	}
+
+	pathInput := "https://example.test/path/" + strings.Repeat("p", 80)
+	pathLimit := len("https://example.test/path")
+	pathResult := NewRedactor(nil).WithMaxBytes(pathLimit).RedactString(pathInput)
+	if pathResult.Counts[URLCredential] != 0 || pathResult.Text != pathInput[:pathLimit] {
+		t.Fatalf("URL truncated at path = %#v", pathResult)
+	}
+}
+
 func TestStreamRedactorBuffersUntilCloseAcrossEveryChunkBoundary(t *testing.T) {
 	pem := "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-STREAM-PEM\n-----END PRIVATE KEY-----"
 	input := "Bearer synthetic-stream-token\nIP=2001:db8::9\n" + pem
@@ -442,6 +469,23 @@ func TestStreamRedactorDoesNotExposeURLCredentialAtLimit(t *testing.T) {
 	}
 	result := stream.Result()
 	if !result.Truncated || strings.Contains(result.Text, "demo-user") || strings.Contains(dst.String(), "demo-user") || result.Counts[URLCredential] != 1 {
+		t.Fatalf("stream result=%#v dst=%q", result, dst.String())
+	}
+}
+
+func TestStreamRedactorProtectsAmbiguousLongURLAuthorityAtLimit(t *testing.T) {
+	const maxBytes = 50
+	input := "https://" + strings.Repeat("u", 300) + ":synthetic-pass@example.test/path"
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil).WithMaxBytes(maxBytes)
+	if _, err := stream.Write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := stream.Result()
+	if !result.Truncated || result.Counts[URLCredential] != 1 || strings.Contains(result.Text, strings.Repeat("u", 30)) || strings.Contains(dst.String(), strings.Repeat("u", 30)) {
 		t.Fatalf("stream result=%#v dst=%q", result, dst.String())
 	}
 }
