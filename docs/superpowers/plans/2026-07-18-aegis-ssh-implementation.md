@@ -280,7 +280,7 @@ git commit -m "feat: add encrypted credential vault"
 - Create: `internal/policy/analyzer.go`
 - Create: `internal/policy/analyzer_test.go`
 
-- [ ] **Step 1: Write table-driven failing policy tests**
+- [x] **Step 1: Write table-driven failing policy tests**
 
 ```go
 func TestAnalyzerClassifiesCommands(t *testing.T) {
@@ -307,13 +307,13 @@ func TestAnalyzerRejectsUnparseableShell(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests and confirm the red state**
+- [x] **Step 2: Run tests and confirm the red state**
 
 Run: `go test ./internal/policy -run Analyzer -v`
 
 Expected: FAIL because the analyzer API does not exist.
 
-- [ ] **Step 3: Implement AST traversal and normalized rules**
+- [x] **Step 3: Implement AST traversal and normalized rules**
 
 ```go
 type Category string
@@ -337,7 +337,7 @@ without filesystem access. Evidence must be a bounded, sanitized rule label,
 never the content of a local or remote file. Deduplicate and sort categories for
 stable results.
 
-- [ ] **Step 4: Add bypass-regression cases and keep them red-green**
+- [x] **Step 4: Add bypass-regression cases and keep them red-green**
 
 Add separate tests for quoted paths, `${HOME}`, pipelines, redirections,
 `find -exec`, `awk`, `sed`, `xxd`, `strings`, `openssl`, and multiline commands.
@@ -347,7 +347,7 @@ Run: `go test ./internal/policy -run Analyzer -v`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the analyzer**
+- [x] **Step 5: Commit the analyzer**
 
 ```bash
 git add internal/policy/analyzer.go internal/policy/analyzer_test.go go.mod go.sum
