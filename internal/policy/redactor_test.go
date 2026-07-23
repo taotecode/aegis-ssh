@@ -1,0 +1,366 @@
+package policy
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
+
+func TestRedactorCategoryValuesAndMarkersAreStable(t *testing.T) {
+	want := map[RedactionCategory]string{
+		IPAddress:            "ip_address",
+		PrivateKeyBlock:      "private_key_block",
+		BearerToken:          "bearer_token",
+		AccessKey:            "access_key",
+		URLCredential:        "url_credential",
+		CredentialAssignment: "credential_assignment",
+	}
+	for category, wireValue := range want {
+		if string(category) != wireValue {
+			t.Errorf("category %q wire value = %q, want %q", category, category, wireValue)
+		}
+		marker := redactionMarker(category)
+		if marker != "[REDACTED:"+strings.ToUpper(wireValue)+"]" {
+			t.Errorf("redactionMarker(%q) = %q", category, marker)
+		}
+	}
+}
+
+func TestRedactorRedactsSensitiveOutputAndCountsReplacements(t *testing.T) {
+	awsKey := "AKIA" + strings.Repeat("S", 16)
+	githubToken := "ghp_" + strings.Repeat("g", 36)
+	pem := "-----BEGIN OPENSSH PRIVATE KEY-----\nSYNTHETIC-PEM-PAYLOAD\n-----END OPENSSH PRIVATE KEY-----"
+	input := strings.Join([]string{
+		"ipv4=192.0.2.10 ipv6=2001:db8::1 endpoint=[2001:db8::2]:443 zone=fe80::1%eth0",
+		pem,
+		"Authorization: bEaReR synthetic.header.signature",
+		"aws=" + awsKey + " github=" + githubToken,
+		"fetch https://demo-user:synthetic-pass@example.test/path?q=1",
+		`password="synthetic quoted value" api_key: synthetic-api-value`,
+	}, "\n")
+
+	result := NewRedactor(nil).RedactString(input)
+
+	for _, secret := range []string{
+		"192.0.2.10", "2001:db8::1", "2001:db8::2", "fe80::1%eth0",
+		"SYNTHETIC-PEM-PAYLOAD", "synthetic.header.signature", awsKey, githubToken,
+		"demo-user", "synthetic-pass", "synthetic quoted value", "synthetic-api-value",
+	} {
+		if strings.Contains(result.Text, secret) {
+			t.Errorf("RedactString() leaked synthetic secret %q in %q", secret, result.Text)
+		}
+	}
+	for _, marker := range []string{
+		"[REDACTED:IP_ADDRESS]",
+		"[REDACTED:PRIVATE_KEY_BLOCK]",
+		"[REDACTED:BEARER_TOKEN]",
+		"[REDACTED:ACCESS_KEY]",
+		"[REDACTED:URL_CREDENTIAL]",
+		"[REDACTED:CREDENTIAL_ASSIGNMENT]",
+	} {
+		if !strings.Contains(result.Text, marker) {
+			t.Errorf("RedactString() output missing marker %q: %q", marker, result.Text)
+		}
+	}
+	if !strings.Contains(result.Text, "https://[REDACTED:URL_CREDENTIAL]@example.test/path?q=1") {
+		t.Errorf("URL scheme and host were not preserved: %q", result.Text)
+	}
+	wantCounts := map[RedactionCategory]int{
+		IPAddress:            4,
+		PrivateKeyBlock:      1,
+		BearerToken:          1,
+		AccessKey:            2,
+		URLCredential:        1,
+		CredentialAssignment: 2,
+	}
+	for category, want := range wantCounts {
+		if got := result.Counts[category]; got != want {
+			t.Errorf("Counts[%q] = %d, want %d; output=%q", category, got, want, result.Text)
+		}
+	}
+	if result.Truncated {
+		t.Fatal("RedactString() unexpectedly reported truncation")
+	}
+}
+
+func TestRedactorHandlesPEMVariantsAndPreventsPartialLowerPriorityMatches(t *testing.T) {
+	for _, pemType := range []string{"PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY"} {
+		t.Run(pemType, func(t *testing.T) {
+			input := "before\n-----BEGIN " + pemType + "-----\nSYNTHETIC-192.0.2.33-PAYLOAD\n-----END " + pemType + "-----\nafter"
+			result := NewRedactor(nil).RedactString(input)
+			if result.Text != "before\n[REDACTED:PRIVATE_KEY_BLOCK]\nafter" {
+				t.Fatalf("RedactString() = %q", result.Text)
+			}
+			if result.Counts[PrivateKeyBlock] != 1 || result.Counts[IPAddress] != 0 {
+				t.Fatalf("RedactString() counts = %#v, want only one private key block", result.Counts)
+			}
+		})
+	}
+
+	compactPEM := "-----BEGIN EC PRIVATE KEY-----SYNTHETIC-COMPACT-PEM-----END EC PRIVATE KEY-----"
+	compactResult := NewRedactor(nil).RedactString(compactPEM)
+	if compactResult.Text != "[REDACTED:PRIVATE_KEY_BLOCK]" || compactResult.Counts[PrivateKeyBlock] != 1 {
+		t.Fatalf("RedactString(compact PEM) = %#v", compactResult)
+	}
+
+	result := NewRedactor(nil).RedactString("password=192.0.2.44")
+	if result.Text != "password=[REDACTED:CREDENTIAL_ASSIGNMENT]" {
+		t.Fatalf("RedactString() = %q", result.Text)
+	}
+	if result.Counts[CredentialAssignment] != 1 || result.Counts[IPAddress] != 0 {
+		t.Fatalf("RedactString() counts = %#v, want only credential assignment", result.Counts)
+	}
+}
+
+func TestRedactorAvoidsIPAddressAndAccessKeyFalsePositives(t *testing.T) {
+	input := "version 1.2.3 invalid 999.1.1.1 hash deadbeef0123456789abcdef0123456789 abc2001:db8::1def"
+	result := NewRedactor(nil).RedactString(input)
+	if result.Text != input {
+		t.Fatalf("RedactString() = %q, want unchanged %q", result.Text, input)
+	}
+	if len(result.Counts) != 0 {
+		t.Fatalf("RedactString() counts = %#v, want none", result.Counts)
+	}
+}
+
+func TestRedactorAllowedCategoryDoesNotDisableOtherCategoriesAndCopiesMap(t *testing.T) {
+	allowed := map[RedactionCategory]bool{URLCredential: true}
+	redactor := NewRedactor(allowed)
+	allowed[IPAddress] = true
+
+	input := "https://demo-user:synthetic-pass@192.0.2.55/path"
+	result := redactor.RedactString(input)
+	if result.Text != "https://demo-user:synthetic-pass@[REDACTED:IP_ADDRESS]/path" {
+		t.Fatalf("RedactString() = %q", result.Text)
+	}
+	if result.Counts[URLCredential] != 0 || result.Counts[IPAddress] != 1 {
+		t.Fatalf("RedactString() counts = %#v", result.Counts)
+	}
+}
+
+func TestRedactorNormalizesInvalidUTF8AndHandlesEmptyInput(t *testing.T) {
+	invalid := string([]byte{'o', 'k', 0xff, ' ', 'p', 'w', 'd', '=', 'x', 0xfe})
+	result := NewRedactor(nil).RedactString(invalid)
+	if !utf8.ValidString(result.Text) {
+		t.Fatalf("RedactString() returned invalid UTF-8: %x", []byte(result.Text))
+	}
+	if strings.Contains(result.Text, "pwd=x") || result.Counts[CredentialAssignment] != 1 {
+		t.Fatalf("RedactString() did not redact assignment around invalid UTF-8: %#v", result)
+	}
+
+	empty := NewRedactor(nil).RedactString("")
+	if empty.Text != "" || len(empty.Counts) != 0 || empty.Truncated {
+		t.Fatalf("RedactString(empty) = %#v", empty)
+	}
+}
+
+func TestRedactorRedactsQuotedAndPrefixedCredentialAssignments(t *testing.T) {
+	input := `{"db_password":"synthetic-json-value","AWS_SECRET_ACCESS_KEY": synthetic-cloud-value}`
+	result := NewRedactor(nil).RedactString(input)
+	for _, secret := range []string{"synthetic-json-value", "synthetic-cloud-value"} {
+		if strings.Contains(result.Text, secret) {
+			t.Fatalf("RedactString() leaked %q in %q", secret, result.Text)
+		}
+	}
+	if result.Counts[CredentialAssignment] != 2 {
+		t.Fatalf("RedactString() counts = %#v, output = %q", result.Counts, result.Text)
+	}
+}
+
+func TestRedactorLimitBoundsInputAndExpandedOutput(t *testing.T) {
+	const maxBytes = 29
+	input := "prefix password=synthetic-value suffix " + strings.Repeat("界", 64)
+	result := NewRedactor(nil).WithMaxBytes(maxBytes).RedactString(input)
+	if !result.Truncated {
+		t.Fatal("RedactString() Truncated = false, want true")
+	}
+	if len(result.Text) > maxBytes {
+		t.Fatalf("RedactString() returned %d bytes, max %d: %q", len(result.Text), maxBytes, result.Text)
+	}
+	if !utf8.ValidString(result.Text) {
+		t.Fatalf("RedactString() truncated invalid UTF-8: %x", []byte(result.Text))
+	}
+	if strings.Contains(result.Text, "synthetic-value") {
+		t.Fatalf("RedactString() leaked truncated input: %q", result.Text)
+	}
+}
+
+func TestStreamRedactorBuffersUntilCloseAcrossEveryChunkBoundary(t *testing.T) {
+	pem := "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-STREAM-PEM\n-----END PRIVATE KEY-----"
+	input := "Bearer synthetic-stream-token\nIP=2001:db8::9\n" + pem
+	want := NewRedactor(nil).RedactString(input)
+
+	for split := 0; split <= len(input); split++ {
+		var dst bytes.Buffer
+		stream := NewStreamRedactor(&dst, nil)
+		for _, chunk := range []string{input[:split], input[split:]} {
+			if _, err := stream.Write([]byte(chunk)); err != nil {
+				t.Fatalf("split %d Write() error = %v", split, err)
+			}
+			if dst.Len() != 0 {
+				t.Fatalf("split %d released %q before Close", split, dst.String())
+			}
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("split %d Close() error = %v", split, err)
+		}
+		if dst.String() != want.Text {
+			t.Fatalf("split %d output = %q, want %q", split, dst.String(), want.Text)
+		}
+		if got := stream.Result(); got.Text != want.Text || !equalRedactionCounts(got.Counts, want.Counts) || got.Truncated != want.Truncated {
+			t.Fatalf("split %d Result() = %#v, want %#v", split, got, want)
+		}
+	}
+
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil)
+	for i := range len(input) {
+		if _, err := stream.Write([]byte{input[i]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("byte-wise writes released %q before Close", dst.String())
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if dst.String() != want.Text {
+		t.Fatalf("byte-wise output = %q, want %q", dst.String(), want.Text)
+	}
+}
+
+func TestStreamRedactorBoundsMemoryAndOutputAndReportsTruncation(t *testing.T) {
+	const maxBytes = 64
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil).WithMaxBytes(maxBytes)
+	input := []byte("password=synthetic-stream-value " + strings.Repeat("x", 4096))
+	if n, err := stream.Write(input); err != nil || n != len(input) {
+		t.Fatalf("Write() = (%d, %v), want (%d, nil)", n, err, len(input))
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("Write() released output before Close: %q", dst.String())
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	result := stream.Result()
+	if !result.Truncated || len(result.Text) > maxBytes || dst.String() != result.Text {
+		t.Fatalf("Result() = %#v, dst=%q", result, dst.String())
+	}
+	if !utf8.ValidString(result.Text) || strings.Contains(result.Text, "synthetic-stream-value") {
+		t.Fatalf("bounded output is unsafe: %q", result.Text)
+	}
+}
+
+func TestStreamRedactorCloseAndWriterErrorSemantics(t *testing.T) {
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil)
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close(empty) error = %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("second Close(empty) error = %v", err)
+	}
+	if _, err := stream.Write([]byte("later")); !errors.Is(err, ErrStreamRedactorClosed) {
+		t.Fatalf("Write(after Close) error = %v, want ErrStreamRedactorClosed", err)
+	}
+	if _, err := stream.Write(nil); !errors.Is(err, ErrStreamRedactorClosed) {
+		t.Fatalf("empty Write(after Close) error = %v, want ErrStreamRedactorClosed", err)
+	}
+
+	wantErr := errors.New("synthetic destination failure")
+	failing := &errorWriter{err: wantErr}
+	failedStream := NewStreamRedactor(failing, nil)
+	secret := "synthetic-writer-secret"
+	if _, err := failedStream.Write([]byte("password=" + secret)); err != nil {
+		t.Fatal(err)
+	}
+	if err := failedStream.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("Close() error = %v, want %v", err, wantErr)
+	}
+	if err := failedStream.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("second Close() error = %v, want stable %v", err, wantErr)
+	}
+	result := failedStream.Result()
+	if strings.Contains(result.Text, secret) || result.Counts[CredentialAssignment] != 1 {
+		t.Fatalf("Result() after writer failure leaked secret: %#v", result)
+	}
+}
+
+func FuzzRedactor(f *testing.F) {
+	pem := "-----BEGIN EC PRIVATE KEY-----\nFUZZ-PEM-PAYLOAD\n-----END EC PRIVATE KEY-----"
+	f.Add([]byte("ordinary output"), 3)
+	f.Add([]byte{}, 0)
+	f.Add([]byte{0xff, 0xfe, 'x'}, 1)
+	f.Add([]byte(strings.Repeat("long", 1024)), 31)
+	f.Add([]byte("2001:db8::1,2001:db8::2"), 7)
+	f.Add([]byte(pem), 5)
+	f.Add([]byte("password=FUZZ-SYNTHETIC"), 2)
+
+	f.Fuzz(func(t *testing.T, input []byte, chunkSize int) {
+		const maxBytes = 512
+		redactor := NewRedactor(nil).WithMaxBytes(maxBytes)
+		want := redactor.RedactString(string(input))
+		if len(want.Text) > maxBytes || !utf8.ValidString(want.Text) {
+			t.Fatalf("RedactString() returned invalid bounded output: %#v", want)
+		}
+		inputText := string(input)
+		if strings.Contains(inputText, "-----BEGIN EC PRIVATE KEY-----") &&
+			strings.Contains(inputText, "FUZZ-PEM-PAYLOAD") &&
+			strings.Contains(inputText, "-----END EC PRIVATE KEY-----") &&
+			strings.Contains(want.Text, "FUZZ-PEM-PAYLOAD") {
+			t.Fatal("RedactString() leaked seeded PEM payload")
+		}
+		if strings.Contains(inputText, "password=FUZZ-SYNTHETIC") && strings.Contains(want.Text, "FUZZ-SYNTHETIC") {
+			t.Fatal("RedactString() leaked seeded credential assignment")
+		}
+
+		var dst bytes.Buffer
+		stream := NewStreamRedactor(&dst, nil).WithMaxBytes(maxBytes)
+		chunkSize = int(uint(chunkSize)%31) + 1
+		for offset := 0; offset < len(input); {
+			end := offset + chunkSize
+			if end > len(input) {
+				end = len(input)
+			}
+			if n, err := stream.Write(input[offset:end]); err != nil || n != end-offset {
+				t.Fatalf("Write() = (%d, %v)", n, err)
+			}
+			if dst.Len() != 0 {
+				t.Fatalf("stream released output before Close: %q", dst.String())
+			}
+			offset = end
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatal(err)
+		}
+		got := stream.Result()
+		if got.Text != want.Text || got.Truncated != want.Truncated || !equalRedactionCounts(got.Counts, want.Counts) {
+			t.Fatalf("stream Result() = %#v, want %#v", got, want)
+		}
+	})
+}
+
+type errorWriter struct {
+	err error
+}
+
+func (w *errorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func equalRedactionCounts(left, right map[RedactionCategory]int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for category, count := range left {
+		if right[category] != count {
+			return false
+		}
+	}
+	return true
+}
+
+var _ io.WriteCloser = (*StreamRedactor)(nil)
