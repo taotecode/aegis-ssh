@@ -585,7 +585,7 @@ git commit -m "feat: execute password-authenticated SSH commands"
 - Create: `internal/audit/logger.go`
 - Create: `internal/audit/logger_test.go`
 
-- [ ] **Step 1: Write failing no-leak and rotation tests**
+- [x] **Step 1: Write failing no-leak and rotation tests**
 
 ```go
 func TestLoggerNeverWritesForbiddenFields(t *testing.T) {
@@ -614,20 +614,20 @@ func TestLoggerRotatesAtBound(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests and confirm the red state**
+- [x] **Step 2: Run tests and confirm the red state**
 
 Run: `go test ./internal/audit -v`
 
 Expected: FAIL because logger types are missing.
 
-- [ ] **Step 3: Implement append-only JSONL with sanitized command preview**
+- [x] **Step 3: Implement append-only JSONL with sanitized command preview**
 
 The logger owns a redactor, hashes exact command bytes with SHA-256, stores at
 most 160 filtered preview bytes, opens logs with `0600`, syncs each sensitive
 approval event, and rotates using atomic renames. `Event` must not have fields
 for host, port, username, password, fingerprint, or raw output.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run: `go test -race ./internal/audit -v && go test ./...`
 
