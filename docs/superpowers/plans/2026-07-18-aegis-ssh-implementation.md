@@ -501,7 +501,7 @@ git commit -m "feat: add one-time command approvals"
 - Create: `internal/sshclient/client_test.go`
 - Create: `internal/testssh/server.go`
 
-- [ ] **Step 1: Create an in-process password-only SSH test server**
+- [x] **Step 1: Create an in-process password-only SSH test server**
 
 The reusable fixture must listen on `127.0.0.1:0`, generate an ephemeral host key, accept
 exactly one configured username/password pair, reject public keys, execute
@@ -509,7 +509,7 @@ commands through a deterministic test handler, and expose its SHA256 host-key
 fingerprint. It is imported only by tests, so it is not linked into release
 binaries.
 
-- [ ] **Step 2: Write failing client integration tests**
+- [x] **Step 2: Write failing client integration tests**
 
 ```go
 func TestExecuteUsesPasswordAndPinnedHostKey(t *testing.T) {
@@ -553,13 +553,13 @@ func TestExecuteTruncatesOutput(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Run tests and confirm the red state**
+- [x] **Step 3: Run tests and confirm the red state**
 
 Run: `go test ./internal/sshclient -v`
 
 Expected: FAIL because `Client.Execute` is missing.
 
-- [ ] **Step 4: Implement in-process SSH execution**
+- [x] **Step 4: Implement in-process SSH execution**
 
 Use `ssh.Password(string(secret.Password))`, a custom
 `ssh.HostKeyCallback` comparing `ssh.FingerprintSHA256`, `net.Dialer` with
@@ -568,7 +568,7 @@ stderr writers. Never include `net.JoinHostPort`, username, password, or raw SSH
 errors containing the address in returned errors. Map failures to stable model
 error codes.
 
-- [ ] **Step 5: Verify integration behavior and commit**
+- [x] **Step 5: Verify integration behavior and commit**
 
 Run: `go test -race ./internal/sshclient -v`
 
