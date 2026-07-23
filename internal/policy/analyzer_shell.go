@@ -15,12 +15,13 @@ type shellInvocation struct {
 }
 
 type shellOptionSpec struct {
-	shortOptions        string
-	clusterValueOptions string
-	valueOptions        map[string]struct{}
-	flagOptions         map[string]struct{}
-	prefixOptions       []string
-	allowPlusShort      bool
+	shortOptions         string
+	clusterValueOptions  string
+	valueOptions         map[string]struct{}
+	attachedNamedOptions map[string]struct{}
+	flagOptions          map[string]struct{}
+	prefixOptions        []string
+	allowPlusShort       bool
 }
 
 func parseShellInvocation(words []*syntax.Word) (shellInvocation, bool) {
@@ -63,6 +64,13 @@ func parseShellOptions(words []*syntax.Word, spec shellOptionSpec) shellInvocati
 				return invocation
 			}
 			i++
+			continue
+		}
+		if matched, valid := parseAttachedNamedOption(option, spec.attachedNamedOptions); matched {
+			if !valid {
+				invocation.positionalStart = i
+				return invocation
+			}
 			continue
 		}
 		if _, ok := spec.flagOptions[option]; ok {
@@ -121,6 +129,14 @@ func parseShortOptionCluster(cluster, supported, valueOptions string) (hasComman
 	return hasCommandString, consumesValue, cluster != ""
 }
 
+func parseAttachedNamedOption(option string, supported map[string]struct{}) (matched, valid bool) {
+	if len(supported) == 0 || len(option) <= 2 || option[:2] != "-o" && option[:2] != "+o" {
+		return false, false
+	}
+	_, valid = supported[option[2:]]
+	return true, valid
+}
+
 func hasOptionPrefix(option string, prefixes []string) bool {
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(option, prefix) {
@@ -153,11 +169,12 @@ func posixShellOptionSpec() shellOptionSpec {
 
 func zshOptionSpec() shellOptionSpec {
 	return shellOptionSpec{
-		shortOptions:        "abefhkmnptuvxDilsrdy",
-		clusterValueOptions: "o",
-		valueOptions:        stringSet("-o", "+o"),
-		flagOptions:         stringSet("--no-rcs", "--no-globalrcs", "--rcs", "--globalrcs", "--no-rcexpandparam", "--rcexpandparam"),
-		allowPlusShort:      true,
+		shortOptions:         "abefhkmnptuvxDilsrdy",
+		clusterValueOptions:  "o",
+		valueOptions:         stringSet("-o", "+o"),
+		attachedNamedOptions: stringSet("norcs", "rcs", "noglobalrcs", "globalrcs", "norcexpandparam", "rcexpandparam"),
+		flagOptions:          stringSet("--no-rcs", "--no-globalrcs", "--rcs", "--globalrcs", "--no-rcexpandparam", "--rcexpandparam"),
+		allowPlusShort:       true,
 	}
 }
 

@@ -712,6 +712,16 @@ func TestAnalyzerAcceptsVerifiedZshNamedOptions(t *testing.T) {
 	}{
 		{`zsh --no-rcexpandparam -c 'ip route'`, []Category{NetworkIdentity}},
 		{`zsh --rcexpandparam -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh -onorcs -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh +onorcs -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh -orcs -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh +oglobalrcs -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh -onoglobalrcs -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh +onorcexpandparam -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh -orcexpandparam -c 'ip route'`, []Category{NetworkIdentity}},
+		{`zsh -onorcs 'ip route'`, nil},
+		{`zsh -onot-a-real-option -c 'ip route'`, nil},
+		{`zsh -onot ignored -c 'ip route'`, nil},
 		{`zsh --not-a-real-option -c 'ip route'`, nil},
 	}
 
