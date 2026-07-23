@@ -29,6 +29,27 @@ func TestRedactorCategoryValuesAndMarkersAreStable(t *testing.T) {
 	}
 }
 
+func TestRedactorStateRenderUsesLinearMemory(t *testing.T) {
+	state := newRedactionState("")
+	var text strings.Builder
+	for range 512 {
+		text.WriteString(state.newPlaceholder(CredentialAssignment))
+	}
+	state.text = text.String()
+
+	result := testing.Benchmark(func(b *testing.B) {
+		for range b.N {
+			if rendered := state.render(); rendered == "" {
+				b.Fatal("render() returned empty output")
+			}
+		}
+	})
+	maxBytesPerOp := int64(len(state.text) * 32)
+	if result.AllocedBytesPerOp() > maxBytesPerOp {
+		t.Fatalf("render() allocated %d bytes/op for %d input bytes; want <= %d", result.AllocedBytesPerOp(), len(state.text), maxBytesPerOp)
+	}
+}
+
 func TestRedactorRedactsSensitiveOutputAndCountsReplacements(t *testing.T) {
 	awsKey := "AKIA" + strings.Repeat("S", 16)
 	githubToken := "ghp_" + strings.Repeat("g", 36)
@@ -87,7 +108,7 @@ func TestRedactorRedactsSensitiveOutputAndCountsReplacements(t *testing.T) {
 }
 
 func TestRedactorHandlesPEMVariantsAndPreventsPartialLowerPriorityMatches(t *testing.T) {
-	for _, pemType := range []string{"PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY"} {
+	for _, pemType := range []string{"PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "DSA PRIVATE KEY", "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY"} {
 		t.Run(pemType, func(t *testing.T) {
 			input := "before\n-----BEGIN " + pemType + "-----\nSYNTHETIC-192.0.2.33-PAYLOAD\n-----END " + pemType + "-----\nafter"
 			result := NewRedactor(nil).RedactString(input)
@@ -115,14 +136,30 @@ func TestRedactorHandlesPEMVariantsAndPreventsPartialLowerPriorityMatches(t *tes
 	}
 }
 
+func TestRedactorProtectsPrivateKeyBlockAtNaturalEOF(t *testing.T) {
+	input := "before\n-----BEGIN PRIVATE KEY-----\nSYNTHETIC-EOF-PEM-PAYLOAD"
+	result := NewRedactor(nil).RedactString(input)
+	if result.Text != "before\n[REDACTED:PRIVATE_KEY_BLOCK]" || result.Counts[PrivateKeyBlock] != 1 {
+		t.Fatalf("RedactString() = %#v", result)
+	}
+}
+
 func TestRedactorAvoidsIPAddressAndAccessKeyFalsePositives(t *testing.T) {
-	input := "version 1.2.3 invalid 999.1.1.1 hash deadbeef0123456789abcdef0123456789 abc2001:db8::1def"
+	input := "version 1.2.3 invalid 999.1.1.1 hash deadbeef0123456789abcdef0123456789 abc2001:db8::1def glpat-short"
 	result := NewRedactor(nil).RedactString(input)
 	if result.Text != input {
 		t.Fatalf("RedactString() = %q, want unchanged %q", result.Text, input)
 	}
 	if len(result.Counts) != 0 {
 		t.Fatalf("RedactString() counts = %#v, want none", result.Counts)
+	}
+}
+
+func TestRedactorRedactsGitLabPATEndingInHyphen(t *testing.T) {
+	token := "glpat-" + strings.Repeat("g", 20) + "-"
+	result := NewRedactor(nil).RedactString(token)
+	if result.Text != "[REDACTED:ACCESS_KEY]" || result.Counts[AccessKey] != 1 {
+		t.Fatalf("RedactString() = %#v", result)
 	}
 }
 
@@ -134,6 +171,16 @@ func TestRedactorRedactsIPAddressBeforeSentencePeriod(t *testing.T) {
 		}
 		if result.Counts[IPAddress] != 1 {
 			t.Errorf("RedactString(%q) counts = %#v", input, result.Counts)
+		}
+	}
+}
+
+func TestRedactorAcceptsLongNetipIPv6Zones(t *testing.T) {
+	zone := strings.Repeat("z", 65)
+	for _, input := range []string{"fe80::1%" + zone, "[fe80::1%" + zone + "]:443"} {
+		result := NewRedactor(nil).RedactString(input)
+		if !strings.Contains(result.Text, "[REDACTED:IP_ADDRESS]") || result.Counts[IPAddress] != 1 {
+			t.Errorf("RedactString(%q) = %#v", input, result)
 		}
 	}
 }
@@ -193,6 +240,48 @@ func TestRedactorRedactsEntireEscapedQuotedCredentialValue(t *testing.T) {
 	}
 }
 
+func TestRedactorRedactsUnquotedCredentialValueThroughPunctuation(t *testing.T) {
+	input := "password=synthetic,leaked;still-secret"
+	result := NewRedactor(nil).RedactString(input)
+	if result.Text != "password=[REDACTED:CREDENTIAL_ASSIGNMENT]" || result.Counts[CredentialAssignment] != 1 {
+		t.Fatalf("RedactString() = %#v", result)
+	}
+}
+
+func TestRedactorOuterCredentialStructuresConsumeNestedSecrets(t *testing.T) {
+	accessKey := "AKIA" + strings.Repeat("N", 16)
+	tests := []struct {
+		name         string
+		input        string
+		want         string
+		wantCategory RedactionCategory
+	}{
+		{
+			name:         "assignment",
+			input:        "password=prefix-" + accessKey + "-suffix",
+			want:         "password=[REDACTED:CREDENTIAL_ASSIGNMENT]",
+			wantCategory: CredentialAssignment,
+		},
+		{
+			name:         "url userinfo",
+			input:        "https://demo:prefix-" + accessKey + "-suffix@example.test/path",
+			want:         "https://[REDACTED:URL_CREDENTIAL]@example.test/path",
+			wantCategory: URLCredential,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := NewRedactor(nil).RedactString(tt.input)
+			if result.Text != tt.want {
+				t.Fatalf("RedactString() = %q, want %q", result.Text, tt.want)
+			}
+			if result.Counts[tt.wantCategory] != 1 || result.Counts[AccessKey] != 0 {
+				t.Fatalf("RedactString() counts = %#v", result.Counts)
+			}
+		})
+	}
+}
+
 func TestRedactorLimitBoundsInputAndExpandedOutput(t *testing.T) {
 	const maxBytes = 29
 	input := "prefix password=synthetic-value suffix " + strings.Repeat("界", 64)
@@ -230,6 +319,14 @@ func TestRedactorLookaheadDoesNotRedactTruncatedVersion(t *testing.T) {
 	const publicPrefix = "version=1.2."
 	result := NewRedactor(nil).WithMaxBytes(len(publicPrefix)).RedactString("version=1.2.3 suffix")
 	if result.Text != publicPrefix || result.Counts[IPAddress] != 0 || !result.Truncated {
+		t.Fatalf("RedactString() = %#v", result)
+	}
+}
+
+func TestRedactorDoesNotExposeURLCredentialAtStringLimit(t *testing.T) {
+	const publicPrefix = "https://demo-user"
+	result := NewRedactor(nil).WithMaxBytes(len(publicPrefix)).RedactString(publicPrefix + ":synthetic-pass@example.test/path")
+	if !result.Truncated || strings.Contains(result.Text, "demo-user") || result.Counts[URLCredential] != 1 {
 		t.Fatalf("RedactString() = %#v", result)
 	}
 }
@@ -326,6 +423,26 @@ func TestStreamRedactorDoesNotExposeIPAddressPrefixAtLimit(t *testing.T) {
 	}
 	if result.Counts[IPAddress] != 1 {
 		t.Fatalf("Result() counts = %#v", result.Counts)
+	}
+}
+
+func TestStreamRedactorDoesNotExposeURLCredentialAtLimit(t *testing.T) {
+	const publicPrefix = "https://demo-user"
+	var dst bytes.Buffer
+	stream := NewStreamRedactor(&dst, nil).WithMaxBytes(len(publicPrefix))
+	input := publicPrefix + ":synthetic-pass@example.test/path"
+	if _, err := stream.Write([]byte(input[:len(publicPrefix)])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write([]byte(input[len(publicPrefix):])); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := stream.Result()
+	if !result.Truncated || strings.Contains(result.Text, "demo-user") || strings.Contains(dst.String(), "demo-user") || result.Counts[URLCredential] != 1 {
+		t.Fatalf("stream result=%#v dst=%q", result, dst.String())
 	}
 }
 

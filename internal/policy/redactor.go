@@ -14,8 +14,7 @@ import (
 const (
 	defaultRedactionMaxBytes  = 4 << 20
 	redactionLookaheadBytes   = 256
-	privateKeyPEMLabelPattern = `(?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|OPENSSH PRIVATE KEY|ENCRYPTED PRIVATE KEY)`
-	ipv6ZonePattern           = `(?:%[0-9A-Za-z_.-]{1,64})?`
+	privateKeyPEMLabelPattern = `(?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|OPENSSH PRIVATE KEY|ENCRYPTED PRIVATE KEY)`
 )
 
 type RedactionCategory string
@@ -46,11 +45,12 @@ var (
 	urlCredentialRE    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]{1,31}://)([^/@\s:]+):([^/@\s]+)@`)
 	incompleteURLRE    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]{1,31}://)([^/@\s:]+):([^/@\s]*)\z`)
 	bearerTokenRE      = regexp.MustCompile(`(?i)(\bbearer[ \t]+)([a-z0-9._~+/=-]+)`)
-	accessKeyRE        = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}|glpat-[A-Za-z0-9_-]{20,})\b`)
+	accessKeyRE        = regexp.MustCompile(`\b(?:(?:AKIA|ASIA)[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82})\b`)
+	gitLabAccessKeyRE  = regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}`)
 	incompleteAccessRE = regexp.MustCompile(`(?:\b(?:AKIA|ASIA)[A-Z0-9]{0,15}|\bgh[pousr]_[A-Za-z0-9]{0,35}|\bgithub_pat_[A-Za-z0-9_]{0,81}|\bglpat-[A-Za-z0-9_-]{0,19})\z`)
-	assignmentRE       = regexp.MustCompile(`(?i)(["']?\b(?:[a-z][a-z0-9_.-]*[_.-])?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key)\b["']?[ \t]*(?:=|:)[ \t]*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;]+)`)
-	bracketedIPv6RE    = regexp.MustCompile(`\[[0-9A-Fa-f:.]+` + ipv6ZonePattern + `\]`)
-	bareIPv6RE         = regexp.MustCompile(`[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+` + ipv6ZonePattern)
+	assignmentRE       = regexp.MustCompile(`(?i)(["']?\b(?:[a-z][a-z0-9_.-]*[_.-])?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key)\b["']?[ \t]*(?:=|:)[ \t]*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s]+)`)
+	bracketedIPv6RE    = regexp.MustCompile(`\[[^\]\s]+\]`)
+	bareIPv6RE         = regexp.MustCompile(`[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+(?:%[^\s\[\]]+)?`)
 	ipv4RE             = regexp.MustCompile(`(?:[0-9]{1,3}\.){3}[0-9]{1,3}`)
 )
 
@@ -94,8 +94,9 @@ func (r *Redactor) redactBounded(input string, truncated bool) RedactionResult {
 }
 
 type redactionBoundary struct {
-	rightContext     string
-	crossingIPPrefix string
+	rightContext                string
+	crossingIPPrefix            string
+	crossingURLCredentialPrefix string
 }
 
 func (r *Redactor) redactInspected(inspection string, truncated bool) RedactionResult {
@@ -105,6 +106,7 @@ func (r *Redactor) redactInspected(inspection string, truncated bool) RedactionR
 	}
 	boundary := redactionBoundary{rightContext: inspection[publicBytes:]}
 	boundary.crossingIPPrefix = crossingIPAddressPrefix(inspection, publicBytes)
+	boundary.crossingURLCredentialPrefix = crossingURLCredentialPrefix(inspection, publicBytes)
 	return r.redactBoundedWithBoundary(inspection[:publicBytes], truncated, boundary)
 }
 
@@ -114,21 +116,21 @@ func (r *Redactor) redactBoundedWithBoundary(input string, truncated bool, bound
 
 	if !r.allowed[PrivateKeyBlock] {
 		state.protect(privateKeyBlockRE, PrivateKeyBlock, replaceWholeMatch)
-		if truncated {
-			state.protect(incompletePEMRE, PrivateKeyBlock, replaceWholeMatch)
-		}
+		state.protect(incompletePEMRE, PrivateKeyBlock, replaceWholeMatch)
 	}
 	if !r.allowed[URLCredential] {
 		state.protect(urlCredentialRE, URLCredential, replaceURLUserInfo)
 		if truncated {
 			state.protect(incompleteURLRE, URLCredential, replaceIncompleteURLUserInfo)
 		}
+		state.protectTrailingCredentialPrefix(boundary.crossingURLCredentialPrefix, URLCredential)
 	}
 	if !r.allowed[BearerToken] {
 		state.protect(bearerTokenRE, BearerToken, preserveFirstCapture)
 	}
 	if !r.allowed[AccessKey] {
 		state.protect(accessKeyRE, AccessKey, replaceWholeMatch)
+		state.protect(gitLabAccessKeyRE, AccessKey, replaceWholeMatch)
 		if truncated {
 			state.protect(incompleteAccessRE, AccessKey, replaceWholeMatch)
 		}
@@ -198,6 +200,8 @@ func truncateValidUTF8(value string, maxBytes int) string {
 type protectedReplacement struct {
 	placeholder string
 	marker      string
+	category    RedactionCategory
+	active      bool
 }
 
 type redactionState struct {
@@ -220,11 +224,42 @@ type protectedFormatter func(*regexp.Regexp, string, string) string
 func (s *redactionState) protect(pattern *regexp.Regexp, category RedactionCategory, format protectedFormatter) {
 	s.text = pattern.ReplaceAllStringFunc(s.text, func(match string) string {
 		if strings.Contains(match, s.prefix) {
-			return match
+			s.consumePlaceholders(match)
 		}
 		placeholder := s.newPlaceholder(category)
 		return format(pattern, match, placeholder)
 	})
+}
+
+func (s *redactionState) consumePlaceholders(text string) {
+	position := 0
+	for position < len(text) {
+		relative := strings.Index(text[position:], s.prefix)
+		if relative < 0 {
+			return
+		}
+		start := position + relative
+		end := start + len(s.prefix)
+		for end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			end++
+		}
+		if end < len(text) && text[end] == 0 {
+			index, err := strconv.Atoi(text[start+len(s.prefix) : end])
+			if err == nil && index >= 0 && index < len(s.replacements) && s.replacements[index].placeholder == text[start:end+1] {
+				if s.replacements[index].active {
+					s.replacements[index].active = false
+					if s.counts[s.replacements[index].category] <= 1 {
+						delete(s.counts, s.replacements[index].category)
+					} else {
+						s.counts[s.replacements[index].category]--
+					}
+				}
+				position = end + 1
+				continue
+			}
+		}
+		position = start + len(s.prefix)
+	}
 }
 
 func (s *redactionState) newPlaceholder(category RedactionCategory) string {
@@ -232,17 +267,43 @@ func (s *redactionState) newPlaceholder(category RedactionCategory) string {
 	s.replacements = append(s.replacements, protectedReplacement{
 		placeholder: placeholder,
 		marker:      redactionMarker(category),
+		category:    category,
+		active:      true,
 	})
 	s.counts[category]++
 	return placeholder
 }
 
 func (s *redactionState) render() string {
-	text := s.text
-	for _, replacement := range s.replacements {
-		text = strings.ReplaceAll(text, replacement.placeholder, replacement.marker)
+	var rendered strings.Builder
+	rendered.Grow(len(s.text))
+	position := 0
+	for position < len(s.text) {
+		relative := strings.Index(s.text[position:], s.prefix)
+		if relative < 0 {
+			rendered.WriteString(s.text[position:])
+			break
+		}
+		start := position + relative
+		rendered.WriteString(s.text[position:start])
+		end := start + len(s.prefix)
+		for end < len(s.text) && s.text[end] >= '0' && s.text[end] <= '9' {
+			end++
+		}
+		if end < len(s.text) && s.text[end] == 0 {
+			index, err := strconv.Atoi(s.text[start+len(s.prefix) : end])
+			if err == nil && index >= 0 && index < len(s.replacements) && s.replacements[index].placeholder == s.text[start:end+1] {
+				if s.replacements[index].active {
+					rendered.WriteString(s.replacements[index].marker)
+				}
+				position = end + 1
+				continue
+			}
+		}
+		rendered.WriteString(s.prefix)
+		position = start + len(s.prefix)
 	}
-	return text
+	return rendered.String()
 }
 
 func replaceWholeMatch(_ *regexp.Regexp, _ string, placeholder string) string {
@@ -280,6 +341,13 @@ func (s *redactionState) protectTrailingIPAddress(prefix string) {
 		return
 	}
 	s.text = strings.TrimSuffix(s.text, prefix) + s.newPlaceholder(IPAddress)
+}
+
+func (s *redactionState) protectTrailingCredentialPrefix(prefix string, category RedactionCategory) {
+	if prefix == "" || !strings.HasSuffix(s.text, prefix) {
+		return
+	}
+	s.text = strings.TrimSuffix(s.text, prefix) + s.newPlaceholder(category)
 }
 
 func (s *redactionState) protectIPAddresses(rightContext string) {
@@ -355,6 +423,27 @@ func crossingIPAddressPrefix(inspection string, publicBytes int) string {
 				validIPAddressBoundary(inspection, absoluteStart, absoluteEnd, "") {
 				return inspection[absoluteStart:publicBytes]
 			}
+		}
+	}
+	return ""
+}
+
+func crossingURLCredentialPrefix(inspection string, publicBytes int) string {
+	if publicBytes <= 0 || publicBytes >= len(inspection) {
+		return ""
+	}
+	for _, index := range urlCredentialRE.FindAllStringIndex(inspection, -1) {
+		if index[0] >= publicBytes || index[1] <= publicBytes {
+			continue
+		}
+		match := inspection[index[0]:index[1]]
+		parts := urlCredentialRE.FindStringSubmatchIndex(match)
+		if len(parts) < 4 || parts[2] < 0 {
+			continue
+		}
+		credentialStart := index[0] + parts[2]
+		if credentialStart < publicBytes {
+			return inspection[credentialStart:publicBytes]
 		}
 	}
 	return ""
