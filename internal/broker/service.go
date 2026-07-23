@@ -50,20 +50,20 @@ type Auditor interface {
 }
 
 type ServiceOptions struct {
-	Secrets          SecretLookup
-	Analyzer         CommandAnalyzer
-	Approvals        ApprovalStore
-	Executor         SSHExecutor
-	Redactor         OutputRedactor
-	Auditor          Auditor
-	Now              func() time.Time
-	AuditFailClosed  bool
-	DefaultTimeout   time.Duration
-	DefaultMaxOutput int64
-	Servers          []model.ServerSummary
-	VaultLocked      bool
-	Version          string
-	PolicyVersion    string
+	Secrets            SecretLookup
+	Analyzer           CommandAnalyzer
+	Approvals          ApprovalStore
+	Executor           SSHExecutor
+	Redactor           OutputRedactor
+	Auditor            Auditor
+	Now                func() time.Time
+	AllowAuditFailOpen bool
+	DefaultTimeout     time.Duration
+	DefaultMaxOutput   int64
+	Servers            []model.ServerSummary
+	VaultLocked        bool
+	Version            string
+	PolicyVersion      string
 }
 
 type Service struct {
@@ -99,7 +99,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		redactor:         options.Redactor,
 		auditor:          options.Auditor,
 		now:              options.Now,
-		auditFailClosed:  options.AuditFailClosed,
+		auditFailClosed:  !options.AllowAuditFailOpen,
 		defaultTimeout:   options.DefaultTimeout,
 		defaultMaxOutput: options.DefaultMaxOutput,
 		servers:          cloneServers(options.Servers),

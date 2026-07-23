@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -57,38 +59,12 @@ func (service *fakeProtocolService) ExecuteApproved(_ context.Context, request m
 
 func startProtocolServer(t *testing.T, service BrokerService) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
-	directory, err := os.MkdirTemp("", "aegis-broker-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	directory := newPrivateProtocolDir(t)
 	path := filepath.Join(directory, "broker.sock")
 	server := NewServer(path, service)
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- server.Serve(ctx)
-		close(done)
-	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		info, err := os.Lstat(path)
-		if err == nil && info.Mode()&os.ModeSocket != 0 {
-			break
-		}
-		select {
-		case err := <-done:
-			cancel()
-			parentInfo, _ := os.Lstat(filepath.Dir(path))
-			t.Fatalf("server stopped during startup: %v (parent=%v mode=%v owner=%v)", err, parentInfo != nil, parentInfo.Mode(), sameOwner(parentInfo))
-		default:
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatal("timed out waiting for Unix socket")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	done := serveInBackground(server, ctx)
+	waitForProtocolSocket(t, path, done)
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -101,6 +77,48 @@ func startProtocolServer(t *testing.T, service BrokerService) (string, context.C
 		}
 	})
 	return path, cancel, done
+}
+
+func newPrivateProtocolDir(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "aegis-broker-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	return directory
+}
+
+func serveInBackground(server *Server, ctx context.Context) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx)
+		close(done)
+	}()
+	return done
+}
+
+func waitForProtocolSocket(t *testing.T, path string, done <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		info, err := os.Lstat(path)
+		if err == nil && info.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("server stopped during startup: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for Unix socket")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestProtocolDispatchesAllMethods(t *testing.T) {
@@ -226,6 +244,41 @@ func TestProtocolClientCancellationReturnsContextError(t *testing.T) {
 	}
 }
 
+func TestProtocolClientCancellationInterruptsBlockedWrite(t *testing.T) {
+	directory := newPrivateProtocolDir(t)
+	path := filepath.Join(directory, "blocked.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, _ := listener.Accept()
+		accepted <- connection
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := NewClient(path).Execute(ctx, model.ExecuteRequest{
+			ServerAlias: "prod", Command: strings.Repeat("x", MaxFrameBytes-1024),
+		})
+		callDone <- err
+	}()
+	connection := <-accepted
+	defer connection.Close()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-callDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Execute() remained blocked in Write after cancellation")
+	}
+}
+
 func TestProtocolUnavailableClientErrorIsSanitized(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.sock")
 	_, err := NewClient(path).Status(context.Background())
@@ -293,6 +346,161 @@ func TestProtocolShutdownWaitsForActiveHandler(t *testing.T) {
 	case <-callDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("client call did not return")
+	}
+}
+
+func TestProtocolConcurrentServerStartupHasSingleReachableWinner(t *testing.T) {
+	path := filepath.Join(newPrivateProtocolDir(t), "broker.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := serveInBackground(NewServer(path, &fakeProtocolService{}), ctx)
+	second := serveInBackground(NewServer(path, &fakeProtocolService{}), ctx)
+
+	var winner <-chan error
+	select {
+	case err := <-first:
+		if !errors.Is(err, ErrSocketInUse) {
+			t.Fatalf("first Serve() error = %v", err)
+		}
+		winner = second
+	case err := <-second:
+		if !errors.Is(err, ErrSocketInUse) {
+			t.Fatalf("second Serve() error = %v", err)
+		}
+		winner = first
+	case <-time.After(2 * time.Second):
+		t.Fatal("neither concurrent Serve returned")
+	}
+	waitForProtocolSocket(t, path, make(chan error))
+	status, err := NewClient(path).Status(context.Background())
+	if err != nil || !status.DaemonReachable {
+		t.Fatalf("winner is not reachable: status=%+v err=%v", status, err)
+	}
+	cancel()
+	select {
+	case err := <-winner:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("winning Serve did not stop")
+	}
+}
+
+func TestProtocolRejectsUnsafeStartupLock(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{"symlink", func(t *testing.T, path string) {
+			target := path + ".target"
+			if err := os.WriteFile(target, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"broad mode", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(newPrivateProtocolDir(t), "broker.sock")
+			test.setup(t, path+".lock")
+			err := NewServer(path, &fakeProtocolService{}).Serve(context.Background())
+			if !errors.Is(err, ErrUnsafeSocket) || strings.Contains(err.Error(), path) {
+				t.Fatalf("Serve() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestProtocolServerOperationErrorsAreSanitized(t *testing.T) {
+	t.Run("bind", func(t *testing.T) {
+		path := filepath.Join(newPrivateProtocolDir(t), "broker.sock")
+		server := NewServer(path, &fakeProtocolService{})
+		server.listen = func(_, _ string) (net.Listener, error) { return nil, fmt.Errorf("bind %s", path) }
+		assertSanitizedSocketError(t, path, server.Serve(context.Background()))
+	})
+	t.Run("remove stale", func(t *testing.T) {
+		path := filepath.Join(newPrivateProtocolDir(t), "broker.sock")
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		listener.SetUnlinkOnClose(false)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		server := NewServer(path, &fakeProtocolService{})
+		server.remove = func(string) error { return fmt.Errorf("remove %s", path) }
+		assertSanitizedSocketError(t, path, server.Serve(context.Background()))
+	})
+	t.Run("accept", func(t *testing.T) {
+		path := filepath.Join(newPrivateProtocolDir(t), "broker.sock")
+		server := NewServer(path, &fakeProtocolService{})
+		server.accept = func(net.Listener) (net.Conn, error) { return nil, fmt.Errorf("accept %s", path) }
+		assertSanitizedSocketError(t, path, server.Serve(context.Background()))
+	})
+	t.Run("overlong path", func(t *testing.T) {
+		path := filepath.Join(newPrivateProtocolDir(t), strings.Repeat("x", 180))
+		assertSanitizedSocketError(t, path, NewServer(path, &fakeProtocolService{}).Serve(context.Background()))
+	})
+}
+
+func assertSanitizedSocketError(t *testing.T, path string, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrSocketOperation) || strings.Contains(err.Error(), path) {
+		t.Fatalf("Serve() error = %v", err)
+	}
+}
+
+func TestProtocolConcurrentServeLeavesPermanentPrivateUmask(t *testing.T) {
+	original := syscall.Umask(0o022)
+	defer syscall.Umask(original)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	paths := []string{
+		filepath.Join(newPrivateProtocolDir(t), "one.sock"),
+		filepath.Join(newPrivateProtocolDir(t), "two.sock"),
+	}
+	done := []<-chan error{
+		serveInBackground(NewServer(paths[0], &fakeProtocolService{}), ctx),
+		serveInBackground(NewServer(paths[1], &fakeProtocolService{}), ctx),
+	}
+	for index, path := range paths {
+		waitForProtocolSocket(t, path, done[index])
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("socket %d mode = %v err=%v", index, info.Mode().Perm(), err)
+		}
+	}
+	observed := syscall.Umask(0o077)
+	syscall.Umask(observed)
+	if observed != 0o077 {
+		t.Fatalf("process umask = %04o, want permanent 0077", observed)
+	}
+	cancel()
+	for _, result := range done {
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

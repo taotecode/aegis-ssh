@@ -26,6 +26,10 @@ type BrokerService interface {
 type Server struct {
 	path    string
 	service BrokerService
+	listen  func(string, string) (net.Listener, error)
+	accept  func(net.Listener) (net.Conn, error)
+	remove  func(string) error
+	dial    func(string, string, time.Duration) (net.Conn, error)
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -35,24 +39,48 @@ type Server struct {
 }
 
 func NewServer(path string, service BrokerService) *Server {
-	return &Server{path: path, service: service, conns: make(map[net.Conn]struct{})}
+	return &Server{
+		path: path, service: service, conns: make(map[net.Conn]struct{}),
+		listen: net.Listen,
+		accept: func(listener net.Listener) (net.Conn, error) { return listener.Accept() },
+		remove: os.Remove,
+		dial:   net.DialTimeout,
+	}
 }
+
+var umaskMu sync.Mutex
 
 func (server *Server) Serve(ctx context.Context) error {
 	if server == nil || ctx == nil || server.path == "" || server.service == nil {
 		return ErrInvalidProtocol
 	}
-	if err := prepareSocketPath(server.path); err != nil {
+	if err := validatePrivateSocketParent(server.path); err != nil {
 		return err
 	}
-	listener, err := listenPrivateUnix(server.path)
+	setPermanentPrivateUmask()
+	startupLock, err := acquireStartupLock(server.path + ".lock")
+	if err != nil {
+		return err
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			releaseStartupLock(startupLock)
+		}
+	}()
+	if err := server.prepareSocketPath(); err != nil {
+		return err
+	}
+	listener, socketInfo, err := server.listenPrivateUnix()
 	if err != nil {
 		return err
 	}
 	server.mu.Lock()
 	server.listener = listener
-	server.fileInfo, _ = os.Lstat(server.path)
+	server.fileInfo = socketInfo
 	server.mu.Unlock()
+	releaseStartupLock(startupLock)
+	lockHeld = false
 	defer server.shutdown()
 
 	serveCtx, cancel := context.WithCancel(ctx)
@@ -63,7 +91,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	}()
 
 	for {
-		connection, err := listener.Accept()
+		connection, err := server.accept(listener)
 		if err != nil {
 			if serveCtx.Err() != nil {
 				return nil
@@ -72,7 +100,7 @@ func (server *Server) Serve(ctx context.Context) error {
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
-			return err
+			return ErrSocketOperation
 		}
 		server.mu.Lock()
 		server.conns[connection] = struct{}{}
@@ -216,17 +244,22 @@ func (server *Server) shutdown() {
 	server.mu.Unlock()
 	if info != nil {
 		if current, err := os.Lstat(server.path); err == nil && os.SameFile(info, current) {
-			_ = os.Remove(server.path)
+			_ = server.remove(server.path)
 		}
 	}
 }
 
-func prepareSocketPath(path string) error {
+func validatePrivateSocketParent(path string) error {
 	parent := filepath.Dir(path)
 	parentInfo, err := os.Lstat(parent)
-	if err != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 || parentInfo.Mode().Perm()&0o022 != 0 || !sameOwner(parentInfo) {
+	if err != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 || parentInfo.Mode().Perm() != 0o700 || !sameOwner(parentInfo) {
 		return ErrUnsafeSocket
 	}
+	return nil
+}
+
+func (server *Server) prepareSocketPath() error {
+	path := server.path
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -234,43 +267,97 @@ func prepareSocketPath(path string) error {
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 || !sameOwner(info) || info.Mode().Perm() != 0o600 {
 		return ErrUnsafeSocket
 	}
-	connection, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
+	connection, dialErr := server.dial("unix", path, 100*time.Millisecond)
 	if dialErr == nil {
 		_ = connection.Close()
 		return ErrSocketInUse
 	}
 	if !isConnectionRefused(dialErr) {
-		return dialErr
+		return ErrSocketOperation
 	}
-	return os.Remove(path)
+	current, err := os.Lstat(path)
+	if err != nil || !os.SameFile(info, current) {
+		return ErrSocketInUse
+	}
+	if err := server.remove(path); err != nil {
+		return ErrSocketOperation
+	}
+	return nil
 }
 
-func listenPrivateUnix(path string) (net.Listener, error) {
-	previous := syscall.Umask(0o077)
-	listener, err := net.Listen("unix", path)
-	syscall.Umask(previous)
+func (server *Server) listenPrivateUnix() (net.Listener, os.FileInfo, error) {
+	listener, err := server.listen("unix", server.path)
 	if err != nil {
-		return nil, err
+		return nil, nil, ErrSocketOperation
 	}
 	unixListener, ok := listener.(*net.UnixListener)
 	if !ok {
 		_ = listener.Close()
-		_ = os.Remove(path)
-		return nil, ErrUnsafeSocket
+		_ = server.remove(server.path)
+		return nil, nil, ErrSocketOperation
 	}
 	unixListener.SetUnlinkOnClose(false)
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := os.Chmod(server.path, 0o600); err != nil {
 		_ = listener.Close()
-		_ = os.Remove(path)
-		return nil, ErrUnsafeSocket
+		_ = server.remove(server.path)
+		return nil, nil, ErrSocketOperation
 	}
-	info, err := os.Lstat(path)
+	info, err := os.Lstat(server.path)
 	if err != nil || info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 || !sameOwner(info) {
 		_ = listener.Close()
-		_ = os.Remove(path)
+		_ = server.remove(server.path)
+		return nil, nil, ErrUnsafeSocket
+	}
+	return listener, info, nil
+}
+
+func setPermanentPrivateUmask() {
+	umaskMu.Lock()
+	syscall.Umask(0o077)
+	umaskMu.Unlock()
+}
+
+func acquireStartupLock(path string) (*os.File, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if !safeLockInfo(info) {
+			return nil, ErrUnsafeSocket
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, ErrSocketOperation
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		if info, inspectErr := os.Lstat(path); inspectErr == nil && !safeLockInfo(info) {
+			return nil, ErrUnsafeSocket
+		}
+		return nil, ErrSocketOperation
+	}
+	info, statErr := file.Stat()
+	pathInfo, pathErr := os.Lstat(path)
+	if statErr != nil || pathErr != nil || !safeLockInfo(info) || !safeLockInfo(pathInfo) || !os.SameFile(info, pathInfo) {
+		_ = file.Close()
 		return nil, ErrUnsafeSocket
 	}
-	return listener, nil
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, ErrSocketInUse
+		}
+		return nil, ErrSocketOperation
+	}
+	return file, nil
+}
+
+func releaseStartupLock(file *os.File) {
+	if file == nil {
+		return
+	}
+	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	_ = file.Close()
+}
+
+func safeLockInfo(info os.FileInfo) bool {
+	return info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0o600 && sameOwner(info)
 }
 
 func sameOwner(info os.FileInfo) bool {

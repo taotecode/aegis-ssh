@@ -20,6 +20,7 @@ const (
 var (
 	ErrSocketInUse     = errors.New("broker socket already in use")
 	ErrUnsafeSocket    = errors.New("unsafe broker socket path")
+	ErrSocketOperation = errors.New("broker socket operation failed")
 	ErrFrameTooLarge   = errors.New("broker request frame too large")
 	ErrInvalidProtocol = errors.New("invalid broker protocol request")
 )

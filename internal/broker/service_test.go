@@ -58,10 +58,10 @@ func newTestService(executor *fakeExecutor) *Service {
 }
 
 func newTestServiceWithAudit(executor *fakeExecutor, auditor *fakeAudit) *Service {
-	return newTestServiceWithAuditMode(executor, auditor, true)
+	return newTestServiceWithAuditMode(executor, auditor, false)
 }
 
-func newTestServiceWithAuditMode(executor *fakeExecutor, auditor *fakeAudit, auditFailClosed bool) *Service {
+func newTestServiceWithAuditMode(executor *fakeExecutor, auditor *fakeAudit, allowAuditFailOpen bool) *Service {
 	now := func() time.Time { return time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC) }
 	service, err := NewService(ServiceOptions{
 		Secrets: memorySecrets{servers: map[string]vault.ServerSecret{
@@ -73,15 +73,15 @@ func newTestServiceWithAuditMode(executor *fakeExecutor, auditor *fakeAudit, aud
 				HostFingerprint: "SHA256:fixture",
 			},
 		}},
-		Analyzer:         policy.NewAnalyzer(),
-		Approvals:        approval.NewStore(now, rand.Reader),
-		Executor:         executor,
-		Redactor:         realOutputRedactor{},
-		Auditor:          auditor,
-		Now:              now,
-		AuditFailClosed:  auditFailClosed,
-		DefaultTimeout:   30 * time.Second,
-		DefaultMaxOutput: 1 << 20,
+		Analyzer:           policy.NewAnalyzer(),
+		Approvals:          approval.NewStore(now, rand.Reader),
+		Executor:           executor,
+		Redactor:           realOutputRedactor{},
+		Auditor:            auditor,
+		Now:                now,
+		AllowAuditFailOpen: allowAuditFailOpen,
+		DefaultTimeout:     30 * time.Second,
+		DefaultMaxOutput:   1 << 20,
 	})
 	if err != nil {
 		panic(err)
@@ -153,12 +153,26 @@ func TestServiceAuditFailurePreventsRemoteExecution(t *testing.T) {
 
 func TestServiceExplicitAuditFailOpenAllowsOrdinaryExecution(t *testing.T) {
 	executor := &fakeExecutor{result: sshclient.Result{Stdout: "ok"}}
-	service := newTestServiceWithAuditMode(executor, &fakeAudit{err: errors.New("disk full")}, false)
+	service := newTestServiceWithAuditMode(executor, &fakeAudit{err: errors.New("disk full")}, true)
 
 	got := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
 
 	if got.Status != model.StatusCompleted || got.Stdout != "ok" || executor.calls != 1 {
 		t.Fatalf("result=%+v calls=%d", got, executor.calls)
+	}
+}
+
+func TestServiceOmittedAuditPolicyDefaultsToFailClosed(t *testing.T) {
+	executor := &fakeExecutor{}
+	service := newTestServiceWithAuditMode(executor, &fakeAudit{err: errors.New("disk full")}, false)
+
+	status, err := service.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
+	if !status.AuditFailClosed || got.Status != model.StatusFailed || got.Error == nil || got.Error.Code() != model.CodeAudit || executor.calls != 0 {
+		t.Fatalf("status=%+v result=%+v calls=%d", status, got, executor.calls)
 	}
 }
 

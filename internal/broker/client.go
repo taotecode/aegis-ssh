@@ -76,6 +76,8 @@ func (client *Client) call(ctx context.Context, method string, params any, resul
 		return ErrUnavailable
 	}
 	defer connection.Close()
+	stopContextWatch := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stopContextWatch()
 	requestBytes = append(requestBytes, '\n')
 	if _, err := connection.Write(requestBytes); err != nil {
 		if ctx.Err() != nil {
