@@ -552,6 +552,63 @@ func TestRotationPublishesTriggerEventBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestFinalPublishSyncFailureDoesNotRollbackCommittedRotation(t *testing.T) {
+	dir := privateTempDir(t)
+	options := Options{MaxBytes: 128, Backups: 3}
+	seedAuditRecords(t, dir, options, "publish-sync-original", 4)
+	path := filepath.Join(dir, auditFilename)
+	newPath := path + ".rotate.new"
+	proofPath := path + ".rotate.newproof"
+	publishSyncFailure := errors.New("synthetic final publish directory sync failure")
+	rollbackFailure := errors.New("synthetic rollback link failure")
+	publishSyncFailed := false
+	rollbackAttempted := false
+	logger, err := newWithHooks(dir, options, loggerHooks{
+		link: func(oldPath, newPath string) error {
+			if publishSyncFailed && oldPath == path+".rotate.source.1" && newPath == path+".rotate.work.1" {
+				rollbackAttempted = true
+				return rollbackFailure
+			}
+			return os.Link(oldPath, newPath)
+		},
+		syncDir: func(syncPath string) error {
+			if !publishSyncFailed {
+				currentInfo, currentErr := os.Lstat(path)
+				proofInfo, proofErr := os.Lstat(proofPath)
+				_, newErr := os.Lstat(newPath)
+				if currentErr == nil && proofErr == nil && errors.Is(newErr, os.ErrNotExist) && os.SameFile(currentInfo, proofInfo) {
+					publishSyncFailed = true
+					return publishSyncFailure
+				}
+			}
+			return syncDirectory(syncPath)
+		},
+	})
+	if err != nil {
+		t.Fatalf("newWithHooks(): %v", err)
+	}
+	triggerID := "final-publish-sync-trigger"
+	writeErr := logger.Write(Event{RequestID: triggerID, Command: "echo trigger final publish sync failure", RequireSync: true})
+	if !errors.Is(writeErr, publishSyncFailure) {
+		t.Fatalf("Write() error = %v, want final publish sync failure", writeErr)
+	}
+	if !publishSyncFailed {
+		t.Fatal("final publish sync failure injection not reached")
+	}
+	if rollbackAttempted {
+		t.Error("rollback ran after final publish rename succeeded")
+	}
+
+	if _, err := New(dir, options); err != nil {
+		t.Fatalf("New() after final publish sync failure: %v", err)
+	}
+	canonical := collectCanonicalRequestIDs(t, dir, options.Backups)
+	if !canonical[triggerID] {
+		t.Errorf("committed trigger event %q missing after recovery; seen=%v", triggerID, canonical)
+	}
+	assertNoRotationStaging(t, dir)
+}
+
 func TestRollbackCleanupFailureBetweenNewAndProofRemovalRecovers(t *testing.T) {
 	dir := privateTempDir(t)
 	options := Options{MaxBytes: 128, Backups: 3}

@@ -503,7 +503,11 @@ func (logger *Logger) rotate(line []byte, durable bool) error {
 	if err := logger.prepareRotation(present[:limit+1], line, durable); err != nil {
 		return errors.Join(err, logger.recoverRotation())
 	}
-	if err := logger.applyRotation(limit); err != nil {
+	published, err := logger.applyRotation(limit)
+	if err != nil {
+		if published {
+			return err
+		}
 		return errors.Join(err, logger.rollbackRotation(limit))
 	}
 	return logger.cleanupRotationStaging()
@@ -533,29 +537,32 @@ func (logger *Logger) prepareRotation(present []bool, line []byte, durable bool)
 	return nil
 }
 
-func (logger *Logger) applyRotation(limit int) error {
+func (logger *Logger) applyRotation(limit int) (bool, error) {
 	for target := limit; target >= 1; target-- {
 		source := logger.rotationSourcePath(target - 1)
 		if exists, err := inspectPrivateFileIfExists(source); err != nil {
-			return fmt.Errorf("inspect staged rotation source %d: %w", target-1, err)
+			return false, fmt.Errorf("inspect staged rotation source %d: %w", target-1, err)
 		} else if exists {
 			work := logger.rotationWorkPath(target)
 			if err := logger.linkMetadata(source, work); err != nil {
-				return fmt.Errorf("prepare rotation target %d: %w", target, err)
+				return false, fmt.Errorf("prepare rotation target %d: %w", target, err)
 			}
 			if err := logger.renameMetadata(work, logger.canonicalPath(target)); err != nil {
-				return fmt.Errorf("publish rotation target %d: %w", target, err)
+				return false, fmt.Errorf("publish rotation target %d: %w", target, err)
 			}
 			continue
 		}
 		if err := logger.removeMetadataIfExists(logger.canonicalPath(target)); err != nil {
-			return fmt.Errorf("remove empty rotation target %d: %w", target, err)
+			return false, fmt.Errorf("remove empty rotation target %d: %w", target, err)
 		}
 	}
-	if err := logger.renameMetadata(logger.rotationNewPath(), logger.path); err != nil {
-		return fmt.Errorf("publish new current audit file: %w", err)
+	if err := logger.hooks.rename(logger.rotationNewPath(), logger.path); err != nil {
+		return false, fmt.Errorf("publish new current audit file: %w", err)
 	}
-	return nil
+	if err := logger.syncMetadata(); err != nil {
+		return true, fmt.Errorf("sync published current audit file: %w", err)
+	}
+	return true, nil
 }
 
 func (logger *Logger) rollbackRotation(limit int) error {
