@@ -38,6 +38,8 @@ var (
 	ErrUnsafePath        = errors.New("unsafe audit path")
 	ErrUnsafePermissions = errors.New("unsafe audit permissions")
 	ErrUnsafeOwner       = errors.New("unsafe audit owner")
+
+	syncAuditDirectory = syncDirectory
 )
 
 type Options struct {
@@ -109,7 +111,7 @@ func New(dir string, options Options) (*Logger, error) {
 		maxBytes: maxBytes,
 		backups:  options.Backups,
 		syncFile: func(file *os.File) error { return file.Sync() },
-		syncDir:  syncDirectory,
+		syncDir:  syncAuditDirectory,
 	}
 	file, created, err := openAuditFile(logger.path)
 	if err != nil {
@@ -122,6 +124,9 @@ func New(dir string, options Options) (*Logger, error) {
 		if err := logger.syncDir(dir); err != nil {
 			return nil, fmt.Errorf("sync audit directory: %w", err)
 		}
+	}
+	if err := logger.cleanupExcessBackups(); err != nil {
+		return nil, err
 	}
 	return logger, nil
 }
@@ -292,6 +297,35 @@ func (logger *Logger) rotate() error {
 		return fmt.Errorf("rotate current audit file: %w", err)
 	}
 	return nil
+}
+
+func (logger *Logger) cleanupExcessBackups() error {
+	removed := false
+	for index := logger.backups + 1; index <= maxBackups; index++ {
+		path := backupPath(logger.path, index)
+		exists, err := inspectPrivateFileIfExists(path)
+		if err != nil {
+			return logger.finishBackupCleanup(removed, fmt.Errorf("inspect excess audit backup %d: %w", index, err))
+		}
+		if !exists {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			return logger.finishBackupCleanup(removed, fmt.Errorf("remove excess audit backup %d: %w", index, err))
+		}
+		removed = true
+	}
+	return logger.finishBackupCleanup(removed, nil)
+}
+
+func (logger *Logger) finishBackupCleanup(removed bool, cleanupErr error) error {
+	if !removed {
+		return cleanupErr
+	}
+	if err := logger.syncDir(logger.dir); err != nil {
+		return errors.Join(cleanupErr, fmt.Errorf("sync audit directory after backup cleanup: %w", err))
+	}
+	return cleanupErr
 }
 
 func backupPath(path string, index int) string {

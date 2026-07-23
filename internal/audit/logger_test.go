@@ -117,6 +117,39 @@ func TestWriteHashesExactCommandAndRedactsPreview(t *testing.T) {
 	}
 }
 
+func TestWriteRedactsEachCommandPreviewCategoryIndependently(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		secret  string
+		marker  string
+	}{
+		{"IP address", "192.0.2.42 echo ip", "192.0.2.42", "[REDACTED:IP_ADDRESS]"},
+		{"private key block", "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-KEY-PAYLOAD\n-----END PRIVATE KEY-----", "SYNTHETIC-KEY-PAYLOAD", "[REDACTED:PRIVATE_KEY_BLOCK]"},
+		{"bearer token", "Bearer synthetic.header.signature", "synthetic.header.signature", "[REDACTED:BEARER_TOKEN]"},
+		{"access key", "AKIA" + strings.Repeat("S", 16), "AKIA" + strings.Repeat("S", 16), "[REDACTED:ACCESS_KEY]"},
+		{"URL credential", "https://alice:synthetic-password@example.test/path", "alice:synthetic-password", "[REDACTED:URL_CREDENTIAL]"},
+		{"credential assignment", "password=synthetic-assignment", "synthetic-assignment", "[REDACTED:CREDENTIAL_ASSIGNMENT]"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := privateTempDir(t)
+			logger := newTestLogger(t, dir, Options{})
+			if err := logger.Write(Event{Command: test.command}); err != nil {
+				t.Fatalf("Write(): %v", err)
+			}
+			raw := readAuditFile(t, filepath.Join(dir, auditFilename))
+			if strings.Contains(string(raw), test.secret) {
+				t.Errorf("audit log leaked %q: %s", test.secret, raw)
+			}
+			preview, ok := decodeRecord(t, raw)["command_preview"].(string)
+			if !ok || !strings.Contains(preview, test.marker) {
+				t.Errorf("command_preview = %q, want marker %q", preview, test.marker)
+			}
+		})
+	}
+}
+
 func TestWriteProducesValidBoundedUTF8JSON(t *testing.T) {
 	dir := privateTempDir(t)
 	logger := newTestLogger(t, dir, Options{MaxBytes: 1 << 20})
@@ -410,6 +443,120 @@ func TestWriteRotatesAndRetainsOnlyConfiguredBackups(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(dir, auditFilename+".3")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unexpected .3 backup: %v", err)
+	}
+}
+
+func TestNewRemovesBackupsBeyondChangedRetention(t *testing.T) {
+	dir := privateTempDir(t)
+	logger := newTestLogger(t, dir, Options{MaxBytes: 128, Backups: 3})
+	for i := range 4 {
+		if err := logger.Write(Event{RequestID: strconv.Itoa(i), Command: "echo retention"}); err != nil {
+			t.Fatalf("Write(%d): %v", i, err)
+		}
+	}
+	for index := 1; index <= 3; index++ {
+		assertMode(t, backupPath(filepath.Join(dir, auditFilename), index), 0o600)
+	}
+	unmatched := filepath.Join(dir, auditFilename+".extra")
+	if err := os.WriteFile(unmatched, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outOfRange := backupPath(filepath.Join(dir, auditFilename), maxBackups+1)
+	if err := os.WriteFile(outOfRange, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New(dir, Options{MaxBytes: 128, Backups: 2}); err != nil {
+		t.Fatalf("New(Backups=2): %v", err)
+	}
+	for index := 1; index <= 2; index++ {
+		assertMode(t, backupPath(filepath.Join(dir, auditFilename), index), 0o600)
+	}
+	if _, err := os.Lstat(backupPath(filepath.Join(dir, auditFilename), 3)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup .3 remains after retention shrank to 2: %v", err)
+	}
+
+	if _, err := New(dir, Options{MaxBytes: 128, Backups: 0}); err != nil {
+		t.Fatalf("New(Backups=0): %v", err)
+	}
+	for index := 1; index <= maxBackups; index++ {
+		if _, err := os.Lstat(backupPath(filepath.Join(dir, auditFilename), index)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("backup .%d remains with retention disabled: %v", index, err)
+		}
+	}
+	if got, err := os.ReadFile(unmatched); err != nil || string(got) != "keep" {
+		t.Fatalf("non-matching file changed: data=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(outOfRange); err != nil || string(got) != "keep" {
+		t.Fatalf("out-of-range backup changed: data=%q err=%v", got, err)
+	}
+}
+
+func TestNewRejectsUnsafeExcessBackupWithoutDeletingIt(t *testing.T) {
+	dir := privateTempDir(t)
+	logger := newTestLogger(t, dir, Options{MaxBytes: 128, Backups: 3})
+	for range 4 {
+		if err := logger.Write(Event{Command: "echo unsafe retention"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unsafe := backupPath(filepath.Join(dir, auditFilename), 3)
+	if err := os.Chmod(unsafe, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(dir, Options{MaxBytes: 128, Backups: 2}); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("New() error = %v, want ErrUnsafePermissions", err)
+	}
+	if info, err := os.Lstat(unsafe); err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("unsafe excess backup was changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestNewSyncsDirectoryAfterRemovingExcessBackups(t *testing.T) {
+	dir := privateTempDir(t)
+	logger := newTestLogger(t, dir, Options{MaxBytes: 128, Backups: 1})
+	for range 2 {
+		if err := logger.Write(Event{Command: "echo cleanup sync"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	original := syncAuditDirectory
+	t.Cleanup(func() { syncAuditDirectory = original })
+	syncCalls := 0
+	syncAuditDirectory = func(path string) error {
+		syncCalls++
+		if path != dir {
+			t.Errorf("sync path = %q, want %q", path, dir)
+		}
+		return nil
+	}
+	if _, err := New(dir, Options{MaxBytes: 128, Backups: 0}); err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("directory sync calls = %d, want 1", syncCalls)
+	}
+}
+
+func TestNewPropagatesDirectorySyncFailureAfterBackupCleanup(t *testing.T) {
+	dir := privateTempDir(t)
+	logger := newTestLogger(t, dir, Options{MaxBytes: 128, Backups: 1})
+	for range 2 {
+		if err := logger.Write(Event{Command: "echo cleanup sync failure"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	original := syncAuditDirectory
+	t.Cleanup(func() { syncAuditDirectory = original })
+	want := errors.New("synthetic cleanup directory sync failure")
+	syncAuditDirectory = func(string) error { return want }
+	if _, err := New(dir, Options{MaxBytes: 128, Backups: 0}); !errors.Is(err, want) {
+		t.Fatalf("New() error = %v, want wrapped sync failure", err)
+	}
+	if _, err := os.Lstat(backupPath(filepath.Join(dir, auditFilename), 1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("excess backup remains after reported sync failure: %v", err)
 	}
 }
 
