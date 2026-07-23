@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func TestApprovalIsBoundAndSingleUse(t *testing.T) {
 		t.Fatalf("unexpected approval lifetime: %v to %v", created.CreatedAt, created.ExpiresAt)
 	}
 	for _, r := range created.Code {
-		if !(r >= 'A' && r <= 'Z') && !(r >= '2' && r <= '9') {
+		if !strings.ContainsRune(codeAlphabet, r) {
 			t.Fatalf("code contains ambiguous character %q", r)
 		}
 	}
@@ -75,6 +76,43 @@ func TestApprovalExpires(t *testing.T) {
 	if _, err := store.Consume(created.ID, created.Code); !errors.Is(err, ErrExpired) {
 		t.Fatalf("consume after ttl = %v; want ErrExpired", err)
 	}
+}
+
+func TestExpiredApprovalTakesPriorityAndIsRemoved(t *testing.T) {
+	t.Run("wrong code", func(t *testing.T) {
+		now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+		store := newTestStore(t, &now)
+		created, err := store.Create("prod", []byte("echo ok"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now = created.ExpiresAt
+		if _, err := store.Consume(created.ID, "AAAA"); !errors.Is(err, ErrExpired) {
+			t.Fatalf("expired approval with wrong code = %v; want ErrExpired", err)
+		}
+		if _, err := store.Consume(created.ID, created.Code); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("consume after expiry cleanup = %v; want ErrNotFound", err)
+		}
+	})
+
+	t.Run("already used", func(t *testing.T) {
+		now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+		store := newTestStore(t, &now)
+		created, err := store.Create("prod", []byte("echo ok"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Consume(created.ID, created.Code); err != nil {
+			t.Fatal(err)
+		}
+		now = created.ExpiresAt
+		if _, err := store.Consume(created.ID, created.Code); !errors.Is(err, ErrExpired) {
+			t.Fatalf("expired used approval = %v; want ErrExpired", err)
+		}
+		if _, err := store.Consume(created.ID, created.Code); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("consume after expiry cleanup = %v; want ErrNotFound", err)
+		}
+	})
 }
 
 func TestWrongCodeDoesNotConsumeApproval(t *testing.T) {

@@ -62,7 +62,6 @@ func (s *Store) Create(serverAlias string, command []byte, categories []policy.C
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cleanupLocked("")
 
 	idBytes := make([]byte, 16)
 	if _, err := io.ReadFull(s.random, idBytes); err != nil {
@@ -78,6 +77,7 @@ func (s *Store) Create(serverAlias string, command []byte, categories []policy.C
 		return Approval{}, fmt.Errorf("%w: duplicate approval id", ErrRandom)
 	}
 	createdAt := s.now()
+	s.cleanupLocked(createdAt, "")
 	approval := Approval{
 		ID:          id,
 		Code:        code,
@@ -93,15 +93,20 @@ func (s *Store) Create(serverAlias string, command []byte, categories []policy.C
 
 // Consume validates and atomically marks an approval as used.
 func (s *Store) Consume(id, code string) (Approval, error) {
-	if s == nil || s.now == nil || s.random == nil || id == "" || code == "" {
+	if s == nil || s.now == nil || s.random == nil || id == "" {
 		return Approval{}, ErrInvalidInput
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Keep the requested entry until it is inspected, so the first consume at
-	// its expiry reports ErrExpired instead of looking like an unknown ID.
-	s.cleanupLocked(id)
 	item, ok := s.items[id]
+	now := s.now()
+	// Expiration wins over every other validation result and removes the
+	// record, making this the only call that reports ErrExpired.
+	if ok && !now.Before(item.ExpiresAt) {
+		delete(s.items, id)
+		return Approval{}, ErrExpired
+	}
+	s.cleanupLocked(now, id)
 	if !ok {
 		return Approval{}, ErrNotFound
 	}
@@ -115,18 +120,13 @@ func (s *Store) Consume(id, code string) (Approval, error) {
 	if codeMatch != 1 || lengthMatch != 1 {
 		return Approval{}, ErrCode
 	}
-	if !s.now().Before(item.ExpiresAt) {
-		delete(s.items, id)
-		return Approval{}, ErrExpired
-	}
 	item.used = true
 	item.Approval.Used = true
 	s.items[id] = item
 	return cloneApproval(item.Approval), nil
 }
 
-func (s *Store) cleanupLocked(except string) {
-	now := s.now()
+func (s *Store) cleanupLocked(now time.Time, except string) {
 	for id, item := range s.items {
 		if id != except && !now.Before(item.ExpiresAt) {
 			delete(s.items, id)
