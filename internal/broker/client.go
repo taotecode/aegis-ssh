@@ -1,9 +1,11 @@
 package broker
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"sync/atomic"
 
@@ -90,9 +92,7 @@ func (client *Client) call(ctx context.Context, method string, params any, resul
 		err      error
 	}, 1)
 	go func() {
-		var response Response
-		decoder := json.NewDecoder(ioLimitReader(connection, MaxFrameBytes+1))
-		err := decoder.Decode(&response)
+		response, err := readResponseFrame(connection)
 		readResult <- struct {
 			response Response
 			err      error
@@ -103,8 +103,11 @@ func (client *Client) call(ctx context.Context, method string, params any, resul
 		_ = connection.Close()
 		return ctx.Err()
 	case read := <-readResult:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if read.err != nil {
-			return ErrUnavailable
+			return read.err
 		}
 		if read.response.Error != nil {
 			return read.response.Error
@@ -114,6 +117,33 @@ func (client *Client) call(ctx context.Context, method string, params any, resul
 		}
 		return json.Unmarshal(read.response.Result, result)
 	}
+}
+
+func readResponseFrame(connection net.Conn) (Response, error) {
+	reader := bufio.NewReader(io.LimitReader(connection, MaxFrameBytes+2))
+	line, err := reader.ReadBytes('\n')
+	hasNewline := len(line) != 0 && line[len(line)-1] == '\n'
+	contentBytes := len(line)
+	if hasNewline {
+		contentBytes--
+	}
+	if contentBytes > MaxFrameBytes {
+		return Response{}, ErrFrameTooLarge
+	}
+	if err != nil || !hasNewline {
+		return Response{}, ErrInvalidProtocol
+	}
+	if _, err := reader.ReadByte(); err == nil {
+		return Response{}, ErrInvalidProtocol
+	} else if !errors.Is(err, io.EOF) {
+		return Response{}, ErrInvalidProtocol
+	}
+
+	var response Response
+	if json.Unmarshal(line[:contentBytes], &response) != nil {
+		return Response{}, ErrInvalidProtocol
+	}
+	return response, nil
 }
 
 func (client *Client) nextID() string {
@@ -133,25 +163,4 @@ func formatUint(value uint64) string {
 		value /= 10
 	}
 	return string(buffer[index:])
-}
-
-type limitedReader struct {
-	reader net.Conn
-	left   int64
-}
-
-func ioLimitReader(reader net.Conn, limit int64) *limitedReader {
-	return &limitedReader{reader: reader, left: limit}
-}
-
-func (reader *limitedReader) Read(buffer []byte) (int, error) {
-	if reader.left <= 0 {
-		return 0, errors.New("response frame too large")
-	}
-	if int64(len(buffer)) > reader.left {
-		buffer = buffer[:reader.left]
-	}
-	count, err := reader.reader.Read(buffer)
-	reader.left -= int64(count)
-	return count, err
 }

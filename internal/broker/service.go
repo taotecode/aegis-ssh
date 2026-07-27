@@ -166,7 +166,7 @@ func (service *Service) Execute(ctx context.Context, request model.ExecuteReques
 			Approval: &model.ApprovalInfo{
 				ID:        created.ID,
 				Code:      created.Code,
-				Message:   "Approval required for: " + categoryList(analysis.Categories),
+				Message:   fmt.Sprintf("检测到风险类别：%s。请由用户确认后回复：允许 %s", categoryList(analysis.Categories), created.Code),
 				ExpiresAt: created.ExpiresAt.UTC().Format(time.RFC3339),
 			},
 		}
@@ -215,8 +215,12 @@ func (service *Service) executeRemote(
 		preflight.ApprovalState = "consumed"
 		preflight.RequireSync = true
 	}
-	if err := service.auditor.Write(preflight); err != nil && failClosed {
-		return failed(model.ErrAudit)
+	auditFailed := false
+	if err := service.auditor.Write(preflight); err != nil {
+		if failClosed {
+			return failed(model.ErrAudit)
+		}
+		auditFailed = true
 	}
 
 	started := service.now()
@@ -253,8 +257,14 @@ func (service *Service) executeRemote(
 	finalEvent.TimedOut = result.Error != nil && result.Error.Code() == model.CodeTimeout
 	finalEvent.Truncated = result.Truncated
 	finalEvent.Redactions = cloneCounts(result.Redactions.Counts)
-	if err := service.auditor.Write(finalEvent); err != nil && failClosed {
-		return failed(model.ErrAudit)
+	if err := service.auditor.Write(finalEvent); err != nil {
+		if failClosed {
+			return failed(model.ErrAudit)
+		}
+		auditFailed = true
+	}
+	if auditFailed {
+		result.Error = model.ErrAudit
 	}
 	return result
 }

@@ -32,10 +32,18 @@ func (executor *fakeExecutor) Execute(_ context.Context, _ vault.ServerSecret, c
 }
 
 type fakeAudit struct {
-	err error
+	err        error
+	calls      int
+	errOnCalls map[int]error
 }
 
-func (auditor *fakeAudit) Write(audit.Event) error { return auditor.err }
+func (auditor *fakeAudit) Write(audit.Event) error {
+	auditor.calls++
+	if err := auditor.errOnCalls[auditor.calls]; err != nil {
+		return err
+	}
+	return auditor.err
+}
 
 type memorySecrets struct {
 	servers map[string]vault.ServerSecret
@@ -109,6 +117,16 @@ func TestServiceExecuteSensitiveCommandCreatesApprovalWithoutSSH(t *testing.T) {
 	if got.Status != model.StatusRequiresApproval || executor.calls != 0 || got.Approval == nil {
 		t.Fatal(got)
 	}
+	wantConfirmation := "允许 " + got.Approval.Code
+	if !strings.Contains(got.Approval.Message, wantConfirmation) ||
+		!strings.Contains(got.Approval.Message, string(policy.NetworkIdentity)) {
+		t.Fatalf("approval message = %q, want confirmation %q and risk category", got.Approval.Message, wantConfirmation)
+	}
+	for _, sensitive := range []string{"secret-host", "root", "password-value", "SHA256:fixture", "ip route"} {
+		if strings.Contains(got.Approval.Message, sensitive) {
+			t.Fatalf("approval message leaked %q: %q", sensitive, got.Approval.Message)
+		}
+	}
 }
 
 func TestServiceExecuteApprovedUsesStoredCommand(t *testing.T) {
@@ -157,8 +175,37 @@ func TestServiceExplicitAuditFailOpenAllowsOrdinaryExecution(t *testing.T) {
 
 	got := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
 
-	if got.Status != model.StatusCompleted || got.Stdout != "ok" || executor.calls != 1 {
+	if got.Status != model.StatusCompleted || got.Stdout != "ok" || executor.calls != 1 ||
+		got.Error == nil || got.Error.Code() != model.CodeAudit {
 		t.Fatalf("result=%+v calls=%d", got, executor.calls)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("disk full")) {
+		t.Fatalf("result leaked audit error: %s", raw)
+	}
+}
+
+func TestServiceExplicitAuditFailOpenSurfacesFinalAuditFailure(t *testing.T) {
+	executor := &fakeExecutor{result: sshclient.Result{Stdout: "ok", Stderr: "warning", ExitCode: 7, Truncated: true}}
+	auditor := &fakeAudit{errOnCalls: map[int]error{2: errors.New("final audit contains secret-host")}}
+	service := newTestServiceWithAuditMode(executor, auditor, true)
+
+	got := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
+
+	if got.Status != model.StatusCompleted || got.Stdout != "ok" || got.Stderr != "warning" ||
+		got.ExitCode != 7 || !got.Truncated || got.Error == nil || got.Error.Code() != model.CodeAudit ||
+		executor.calls != 1 || auditor.calls != 2 {
+		t.Fatalf("result=%+v executor_calls=%d audit_calls=%d", got, executor.calls, auditor.calls)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("final audit")) || bytes.Contains(raw, []byte("secret-host")) {
+		t.Fatalf("result leaked audit error: %s", raw)
 	}
 }
 

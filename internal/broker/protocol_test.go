@@ -244,6 +244,77 @@ func TestProtocolClientCancellationReturnsContextError(t *testing.T) {
 	}
 }
 
+func TestProtocolClientRequiresOneNewlineDelimitedResponseFrame(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload func(requestID string) []byte
+		wantErr error
+	}{
+		{
+			name: "missing newline",
+			payload: func(requestID string) []byte {
+				return validStatusResponse(t, requestID)
+			},
+			wantErr: ErrInvalidProtocol,
+		},
+		{
+			name: "oversized before newline",
+			payload: func(string) []byte {
+				return append([]byte(strings.Repeat("sensitive-payload", MaxFrameBytes/len("sensitive-payload")+2)), '\n')
+			},
+			wantErr: ErrFrameTooLarge,
+		},
+		{
+			name: "trailing second frame",
+			payload: func(requestID string) []byte {
+				return append(append(validStatusResponse(t, requestID), '\n'), []byte("{\"secret-host\":true}\n")...)
+			},
+			wantErr: ErrInvalidProtocol,
+		},
+		{
+			name: "nonempty trailing data",
+			payload: func(requestID string) []byte {
+				return append(append(validStatusResponse(t, requestID), '\n'), []byte("secret-host")...)
+			},
+			wantErr: ErrInvalidProtocol,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := serveRawClientResponse(t, test.payload)
+			_, err := NewClient(path).Status(context.Background())
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("Status() error = %v, want %v", err, test.wantErr)
+			}
+			for _, sensitive := range []string{path, "sensitive-payload", "secret-host"} {
+				if strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("Status() error leaked %q: %v", sensitive, err)
+				}
+			}
+		})
+	}
+}
+
+func TestProtocolClientCancellationInterruptsBlockedResponseRead(t *testing.T) {
+	path := serveRawClientResponse(t, func(string) []byte { return nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := NewClient(path).Status(ctx)
+		callDone <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-callDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Status() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Status() remained blocked reading response")
+	}
+}
+
 func TestProtocolClientCancellationInterruptsBlockedWrite(t *testing.T) {
 	directory := newPrivateProtocolDir(t)
 	path := filepath.Join(directory, "blocked.sock")
@@ -523,4 +594,58 @@ func rawProtocolCall(t *testing.T, path string, frame []byte) Response {
 		t.Fatal(err)
 	}
 	return response
+}
+
+func validStatusResponse(t *testing.T, requestID string) []byte {
+	t.Helper()
+	result, err := json.Marshal(model.BrokerStatus{DaemonReachable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := json.Marshal(Response{Version: ProtocolVersion, RequestID: requestID, Result: result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func serveRawClientResponse(t *testing.T, response func(requestID string) []byte) string {
+	t.Helper()
+	path := filepath.Join(newPrivateProtocolDir(t), "raw.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		line, err := bufio.NewReader(connection).ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var request Request
+		if json.Unmarshal(line[:len(line)-1], &request) != nil {
+			return
+		}
+		payload := response(request.RequestID)
+		if payload == nil {
+			_, _ = connection.Read(make([]byte, 1))
+			return
+		}
+		_, _ = connection.Write(payload)
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("raw response server did not stop")
+		}
+	})
+	return path
 }
