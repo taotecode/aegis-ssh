@@ -124,6 +124,11 @@ func codedErrorForCode(code ErrorCode) *CodedError {
 	}
 }
 
+// ErrorForCode returns the immutable canonical error for a known wire code.
+func ErrorForCode(code ErrorCode) *CodedError {
+	return codedErrorForCode(code)
+}
+
 type ExecuteRequest struct {
 	ServerAlias    string `json:"server_alias"`
 	Command        string `json:"command"`

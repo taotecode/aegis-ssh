@@ -1,9 +1,11 @@
 package broker
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 )
 
 const (
@@ -53,4 +55,20 @@ func (err *RPCError) Error() string {
 
 func protocolError(requestID, code, message string) Response {
 	return Response{Version: ProtocolVersion, RequestID: requestID, Error: &RPCError{Code: code, Message: message}}
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return ErrInvalidProtocol
+		}
+		return err
+	}
+	return nil
 }

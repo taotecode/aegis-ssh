@@ -1,17 +1,17 @@
 package broker
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenjw/aegis-ssh/internal/model"
 )
@@ -31,6 +31,9 @@ type Server struct {
 	remove  func(string) error
 	dial    func(string, string, time.Duration) (net.Conn, error)
 
+	requestReadTimeout time.Duration
+	slots              chan struct{}
+
 	mu       sync.Mutex
 	listener net.Listener
 	conns    map[net.Conn]struct{}
@@ -41,12 +44,19 @@ type Server struct {
 func NewServer(path string, service BrokerService) *Server {
 	return &Server{
 		path: path, service: service, conns: make(map[net.Conn]struct{}),
-		listen: net.Listen,
-		accept: func(listener net.Listener) (net.Conn, error) { return listener.Accept() },
-		remove: os.Remove,
-		dial:   net.DialTimeout,
+		listen:             net.Listen,
+		accept:             func(listener net.Listener) (net.Conn, error) { return listener.Accept() },
+		remove:             os.Remove,
+		dial:               net.DialTimeout,
+		requestReadTimeout: defaultRequestReadTimeout,
+		slots:              make(chan struct{}, maxProtocolConnections),
 	}
 }
+
+const (
+	defaultRequestReadTimeout = 5 * time.Second
+	maxProtocolConnections    = 64
+)
 
 var umaskMu sync.Mutex
 
@@ -102,6 +112,17 @@ func (server *Server) Serve(ctx context.Context) error {
 			}
 			return ErrSocketOperation
 		}
+		select {
+		case server.slots <- struct{}{}:
+		default:
+			_ = connection.Close()
+			continue
+		}
+		if serveCtx.Err() != nil {
+			<-server.slots
+			_ = connection.Close()
+			continue
+		}
 		server.mu.Lock()
 		server.conns[connection] = struct{}{}
 		server.handlers.Add(1)
@@ -116,10 +137,16 @@ func (server *Server) handle(parent context.Context, connection net.Conn) {
 		delete(server.conns, connection)
 		server.mu.Unlock()
 		_ = connection.Close()
+		<-server.slots
 		server.handlers.Done()
 	}()
 
-	request, response := readRequest(connection)
+	readDeadline := time.Now().Add(server.requestReadTimeout)
+	if err := connection.SetReadDeadline(readDeadline); err != nil {
+		return
+	}
+	request, response := readRequest(connection, readDeadline)
+	_ = connection.SetReadDeadline(time.Time{})
 	if response.Error != nil {
 		writeResponse(connection, response)
 		return
@@ -141,12 +168,18 @@ func (server *Server) dispatch(ctx context.Context, request Request) Response {
 	}
 	switch request.Method {
 	case "status":
+		if len(request.Params) != 0 {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "status params must be empty")
+		}
 		result, err := server.service.Status(ctx)
 		if err != nil {
 			return protocolServiceError(request.RequestID, err)
 		}
 		return marshalResult(request.RequestID, result)
 	case "list_servers":
+		if len(request.Params) != 0 {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "list params must be empty")
+		}
 		result, err := server.service.ListServers(ctx)
 		if err != nil {
 			return protocolServiceError(request.RequestID, err)
@@ -154,13 +187,13 @@ func (server *Server) dispatch(ctx context.Context, request Request) Response {
 		return marshalResult(request.RequestID, result)
 	case "execute":
 		var execute model.ExecuteRequest
-		if json.Unmarshal(params, &execute) != nil {
+		if decodeStrictJSON(params, &execute) != nil {
 			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid execute params")
 		}
 		return marshalResult(request.RequestID, server.service.Execute(ctx, execute))
 	case "execute_approved":
 		var approved model.ApprovedRequest
-		if json.Unmarshal(params, &approved) != nil {
+		if decodeStrictJSON(params, &approved) != nil {
 			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid approved params")
 		}
 		return marshalResult(request.RequestID, server.service.ExecuteApproved(ctx, approved))
@@ -169,20 +202,16 @@ func (server *Server) dispatch(ctx context.Context, request Request) Response {
 	}
 }
 
-func readRequest(connection net.Conn) (Request, Response) {
-	line, err := bufio.NewReaderSize(connection, MaxFrameBytes+2).ReadBytes('\n')
-	if len(line) > MaxFrameBytes+1 || (errors.Is(err, bufio.ErrBufferFull) && len(line) >= MaxFrameBytes) {
+func readRequest(connection net.Conn, deadline time.Time) (Request, Response) {
+	line, err := readSingleFrame(connection, deadline)
+	if errors.Is(err, ErrFrameTooLarge) {
 		return Request{}, protocolError("", ErrorFrameTooLarge, "request frame too large")
 	}
-	if err != nil && !errors.Is(err, io.EOF) {
+	if err != nil {
 		return Request{}, protocolError("", ErrorInvalidRequest, "invalid request")
 	}
-	if len(line) == 0 || line[len(line)-1] != '\n' {
-		return Request{}, protocolError("", ErrorInvalidRequest, "request must end with newline")
-	}
-	line = line[:len(line)-1]
 	var request Request
-	if json.Unmarshal(line, &request) != nil {
+	if decodeStrictJSON(line, &request) != nil {
 		return Request{}, protocolError("", ErrorInvalidRequest, "invalid JSON")
 	}
 	return request, Response{}
@@ -194,15 +223,105 @@ func writeResponse(connection net.Conn, response Response) {
 		data, _ = json.Marshal(protocolError(response.RequestID, ErrorInternal, "response unavailable"))
 	}
 	data = append(data, '\n')
-	_, _ = connection.Write(data)
+	_ = connection.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
+	_ = writeAll(connection, data)
 }
 
 func marshalResult(requestID string, value any) Response {
+	switch result := value.(type) {
+	case model.ExecuteResult:
+		return marshalExecuteResult(requestID, result)
+	case *model.ExecuteResult:
+		if result == nil {
+			return protocolError(requestID, ErrorInternal, "response unavailable")
+		}
+		return marshalExecuteResult(requestID, *result)
+	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return protocolError(requestID, ErrorInternal, "response unavailable")
 	}
 	return Response{Version: ProtocolVersion, RequestID: requestID, Result: data}
+}
+
+func marshalExecuteResult(requestID string, result model.ExecuteResult) Response {
+	stdout := normalizeUTF8(result.Stdout)
+	stderr := normalizeUTF8(result.Stderr)
+	if stdout != result.Stdout || stderr != result.Stderr {
+		result.Truncated = true
+	}
+	result.Stdout = stdout
+	result.Stderr = stderr
+	if len(result.Stdout)+len(result.Stderr) <= MaxFrameBytes {
+		if response, size, ok := encodedResultResponse(requestID, result); ok && size <= MaxFrameBytes {
+			return response
+		}
+	}
+
+	result.Truncated = true
+	maximum := max(len(stdout), len(stderr))
+	if maximum > MaxFrameBytes {
+		maximum = MaxFrameBytes
+	}
+	best, _, ok := encodedResultResponse(requestID, withOutputCap(result, stdout, stderr, 0))
+	if !ok {
+		return protocolError(requestID, ErrorInternal, "response unavailable")
+	}
+	encodedBest, err := json.Marshal(best)
+	if err != nil || len(encodedBest) > MaxFrameBytes {
+		return protocolError(requestID, ErrorInternal, "response unavailable")
+	}
+	for low, high := 1, maximum; low <= high; {
+		middle := low + (high-low)/2
+		candidate, size, valid := encodedResultResponse(requestID, withOutputCap(result, stdout, stderr, middle))
+		if valid && size <= MaxFrameBytes {
+			best = candidate
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	return best
+}
+
+func encodedResultResponse(requestID string, result model.ExecuteResult) (Response, int, bool) {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return Response{}, 0, false
+	}
+	response := Response{Version: ProtocolVersion, RequestID: requestID, Result: data}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return Response{}, 0, false
+	}
+	return response, len(encoded), true
+}
+
+func withOutputCap(result model.ExecuteResult, stdout, stderr string, limit int) model.ExecuteResult {
+	result.Stdout = utf8Prefix(stdout, limit)
+	result.Stderr = utf8Prefix(stderr, limit)
+	return result
+}
+
+func normalizeUTF8(value string) string {
+	if utf8.ValidString(value) {
+		return value
+	}
+	return strings.ToValidUTF8(value, "\uFFFD")
+}
+
+func utf8Prefix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
 }
 
 func protocolServiceError(requestID string, err error) Response {

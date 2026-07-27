@@ -1,13 +1,11 @@
 package broker
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
-	"io"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/chenjw/aegis-ssh/internal/model"
 )
@@ -15,11 +13,20 @@ import (
 var ErrUnavailable = model.ErrUnavailableDaemon
 
 type Client struct {
-	path     string
-	sequence atomic.Uint64
+	path         string
+	sequence     atomic.Uint64
+	writeTimeout time.Duration
+	readTimeout  time.Duration
 }
 
-func NewClient(path string) *Client { return &Client{path: path} }
+const (
+	defaultWriteTimeout = 5 * time.Second
+	defaultReadTimeout  = 31 * time.Minute
+)
+
+func NewClient(path string) *Client {
+	return &Client{path: path, writeTimeout: defaultWriteTimeout, readTimeout: defaultReadTimeout}
+}
 
 func (client *Client) Status(ctx context.Context) (model.BrokerStatus, error) {
 	var result model.BrokerStatus
@@ -81,66 +88,62 @@ func (client *Client) call(ctx context.Context, method string, params any, resul
 	stopContextWatch := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stopContextWatch()
 	requestBytes = append(requestBytes, '\n')
-	if _, err := connection.Write(requestBytes); err != nil {
+	contextDeadline, hasContextDeadline := ctx.Deadline()
+	writeDeadline := phaseDeadline(contextDeadline, hasContextDeadline, client.writeTimeout)
+	if err := connection.SetWriteDeadline(writeDeadline); err != nil {
+		return ErrUnavailable
+	}
+	if err := writeAll(connection, requestBytes); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if hasContextDeadline && !time.Now().Before(contextDeadline) {
+			return context.DeadlineExceeded
+		}
 		return ErrUnavailable
 	}
-	readResult := make(chan struct {
-		response Response
-		err      error
-	}, 1)
-	go func() {
-		response, err := readResponseFrame(connection)
-		readResult <- struct {
-			response Response
-			err      error
-		}{response, err}
-	}()
-	select {
-	case <-ctx.Done():
-		_ = connection.Close()
-		return ctx.Err()
-	case read := <-readResult:
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if read.err != nil {
-			return read.err
-		}
-		if read.response.Error != nil {
-			return read.response.Error
-		}
-		if read.response.RequestID != requestID || read.response.Version != ProtocolVersion {
-			return errors.New("invalid broker response")
-		}
-		return json.Unmarshal(read.response.Result, result)
+	_ = connection.SetWriteDeadline(time.Time{})
+	readDeadline := phaseDeadline(contextDeadline, hasContextDeadline, client.readTimeout)
+	if err := connection.SetReadDeadline(readDeadline); err != nil {
+		return ErrInvalidProtocol
 	}
+	response, err := readResponseFrame(connection, readDeadline)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
+		if hasContextDeadline && !time.Now().Before(contextDeadline) {
+			return context.DeadlineExceeded
+		}
+		return err
+	}
+	if response.RequestID != requestID || response.Version != ProtocolVersion {
+		return ErrInvalidProtocol
+	}
+	hasResult := len(response.Result) != 0 && string(response.Result) != "null"
+	hasError := response.Error != nil
+	if hasResult == hasError {
+		return ErrInvalidProtocol
+	}
+	if hasError {
+		if canonical := model.ErrorForCode(model.ErrorCode(response.Error.Code)); canonical != nil {
+			return canonical
+		}
+		return response.Error
+	}
+	if decodeStrictJSON(response.Result, result) != nil {
+		return ErrInvalidProtocol
+	}
+	return nil
 }
 
-func readResponseFrame(connection net.Conn) (Response, error) {
-	reader := bufio.NewReader(io.LimitReader(connection, MaxFrameBytes+2))
-	line, err := reader.ReadBytes('\n')
-	hasNewline := len(line) != 0 && line[len(line)-1] == '\n'
-	contentBytes := len(line)
-	if hasNewline {
-		contentBytes--
+func readResponseFrame(connection net.Conn, deadline time.Time) (Response, error) {
+	line, err := readSingleFrame(connection, deadline)
+	if err != nil {
+		return Response{}, err
 	}
-	if contentBytes > MaxFrameBytes {
-		return Response{}, ErrFrameTooLarge
-	}
-	if err != nil || !hasNewline {
-		return Response{}, ErrInvalidProtocol
-	}
-	if _, err := reader.ReadByte(); err == nil {
-		return Response{}, ErrInvalidProtocol
-	} else if !errors.Is(err, io.EOF) {
-		return Response{}, ErrInvalidProtocol
-	}
-
 	var response Response
-	if json.Unmarshal(line[:contentBytes], &response) != nil {
+	if decodeStrictJSON(line, &response) != nil {
 		return Response{}, ErrInvalidProtocol
 	}
 	return response, nil
