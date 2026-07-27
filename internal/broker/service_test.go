@@ -175,10 +175,10 @@ func TestServiceExplicitAuditFailOpenAllowsOrdinaryExecution(t *testing.T) {
 
 	got := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
 
-	if got.Status != model.StatusCompleted || got.Stdout != "ok" || executor.calls != 1 ||
-		got.Error == nil || got.Error.Code() != model.CodeAudit {
+	if got.Status != model.StatusCompleted || got.Stdout != "ok" || executor.calls != 1 || got.Error != nil {
 		t.Fatalf("result=%+v calls=%d", got, executor.calls)
 	}
+	assertOnlyAuditWarning(t, got)
 	raw, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
@@ -196,16 +196,87 @@ func TestServiceExplicitAuditFailOpenSurfacesFinalAuditFailure(t *testing.T) {
 	got := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
 
 	if got.Status != model.StatusCompleted || got.Stdout != "ok" || got.Stderr != "warning" ||
-		got.ExitCode != 7 || !got.Truncated || got.Error == nil || got.Error.Code() != model.CodeAudit ||
+		got.ExitCode != 7 || !got.Truncated || got.Error != nil ||
 		executor.calls != 1 || auditor.calls != 2 {
 		t.Fatalf("result=%+v executor_calls=%d audit_calls=%d", got, executor.calls, auditor.calls)
 	}
+	assertOnlyAuditWarning(t, got)
 	raw, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(raw, []byte("final audit")) || bytes.Contains(raw, []byte("secret-host")) {
 		t.Fatalf("result leaked audit error: %s", raw)
+	}
+}
+
+func TestServiceAuditWarningsDoNotReplaceExecutionErrors(t *testing.T) {
+	executionErrors := []struct {
+		name string
+		err  *model.CodedError
+	}{
+		{name: "authentication", err: model.ErrAuthentication},
+		{name: "timeout", err: model.ErrTimeout},
+	}
+	auditFailures := []struct {
+		name    string
+		auditor func() *fakeAudit
+	}{
+		{
+			name: "preflight",
+			auditor: func() *fakeAudit {
+				return &fakeAudit{errOnCalls: map[int]error{1: errors.New("preflight secret-host")}}
+			},
+		},
+		{
+			name: "final",
+			auditor: func() *fakeAudit {
+				return &fakeAudit{errOnCalls: map[int]error{2: errors.New("final password-value")}}
+			},
+		},
+		{
+			name: "both",
+			auditor: func() *fakeAudit {
+				return &fakeAudit{err: errors.New("both SHA256:fixture")}
+			},
+		},
+	}
+	for _, executionFailure := range executionErrors {
+		for _, auditFailure := range auditFailures {
+			t.Run(executionFailure.name+"/"+auditFailure.name, func(t *testing.T) {
+				executor := &fakeExecutor{
+					result: sshclient.Result{Stdout: "partial", Stderr: "remote failure", ExitCode: 255, Truncated: true},
+					err:    executionFailure.err,
+				}
+				auditor := auditFailure.auditor()
+				service := newTestServiceWithAuditMode(executor, auditor, true)
+
+				got := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
+
+				if got.Status != model.StatusFailed || got.Error == nil || got.Error.Code() != executionFailure.err.Code() ||
+					got.Stdout != "partial" || got.Stderr != "remote failure" || got.ExitCode != 255 || !got.Truncated ||
+					executor.calls != 1 || executor.lastCommand != "uptime" || auditor.calls != 2 {
+					t.Fatalf("result=%+v executor=%+v audit_calls=%d", got, executor, auditor.calls)
+				}
+				assertOnlyAuditWarning(t, got)
+				raw, err := json.Marshal(got)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, secret := range []string{"preflight secret-host", "final password-value", "both SHA256:fixture"} {
+					if bytes.Contains(raw, []byte(secret)) {
+						t.Fatalf("result leaked audit error %q: %s", secret, raw)
+					}
+				}
+			})
+		}
+	}
+}
+
+func assertOnlyAuditWarning(t *testing.T, result model.ExecuteResult) {
+	t.Helper()
+	if len(result.Warnings) != 1 || result.Warnings[0] == nil || result.Warnings[0].Code() != model.CodeAudit {
+		t.Fatalf("warnings = %+v, want one audit warning", result.Warnings)
 	}
 }
 

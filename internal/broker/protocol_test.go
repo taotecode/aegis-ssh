@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,13 +20,14 @@ import (
 )
 
 type fakeProtocolService struct {
-	mu       sync.Mutex
-	executes []model.ExecuteRequest
-	approved []model.ApprovedRequest
-	entered  chan struct{}
-	canceled chan struct{}
-	release  chan struct{}
-	finished chan struct{}
+	mu            sync.Mutex
+	executes      []model.ExecuteRequest
+	approved      []model.ApprovedRequest
+	executeResult *model.ExecuteResult
+	entered       chan struct{}
+	canceled      chan struct{}
+	release       chan struct{}
+	finished      chan struct{}
 }
 
 func (service *fakeProtocolService) Status(context.Context) (model.BrokerStatus, error) {
@@ -39,6 +41,7 @@ func (service *fakeProtocolService) ListServers(context.Context) ([]model.Server
 func (service *fakeProtocolService) Execute(ctx context.Context, request model.ExecuteRequest) model.ExecuteResult {
 	service.mu.Lock()
 	service.executes = append(service.executes, request)
+	configured := service.executeResult
 	service.mu.Unlock()
 	if service.entered != nil {
 		close(service.entered)
@@ -46,6 +49,9 @@ func (service *fakeProtocolService) Execute(ctx context.Context, request model.E
 		close(service.canceled)
 		<-service.release
 		close(service.finished)
+	}
+	if configured != nil {
+		return *configured
 	}
 	return model.ExecuteResult{Status: model.StatusCompleted, Stdout: "ran:" + request.Command}
 }
@@ -147,6 +153,30 @@ func TestProtocolDispatchesAllMethods(t *testing.T) {
 	approved, err := client.ExecuteApproved(ctx, model.ApprovedRequest{ApprovalID: "approval-1", ApprovalCode: "ABCD"})
 	if err != nil || approved.Status != model.StatusCompleted || approved.Stdout != "approved:approval-1" {
 		t.Fatalf("ExecuteApproved() = %+v, %v", approved, err)
+	}
+}
+
+func TestProtocolExecuteRoundTripPreservesErrorAndWarning(t *testing.T) {
+	service := &fakeProtocolService{executeResult: &model.ExecuteResult{
+		Status:   model.StatusFailed,
+		Error:    model.ErrAuthentication,
+		Warnings: []*model.CodedError{model.ErrAudit},
+	}}
+	path, _, _ := startProtocolServer(t, service)
+
+	result, err := NewClient(path).Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"})
+
+	if err != nil || result.Status != model.StatusFailed || result.Error == nil ||
+		result.Error.Code() != model.CodeAuthentication || len(result.Warnings) != 1 ||
+		result.Warnings[0] == nil || result.Warnings[0].Code() != model.CodeAudit {
+		t.Fatalf("Execute() = %+v, %v", result, err)
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("secret-host")) {
+		t.Fatalf("roundtrip result leaked secret: %s", raw)
 	}
 }
 

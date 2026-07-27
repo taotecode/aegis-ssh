@@ -264,7 +264,7 @@ func (service *Service) executeRemote(
 		auditFailed = true
 	}
 	if auditFailed {
-		result.Error = model.ErrAudit
+		result.Warnings = []*model.CodedError{model.ErrAudit}
 	}
 	return result
 }

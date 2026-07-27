@@ -1,6 +1,9 @@
 package model
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
 
 type Status string
 
@@ -47,6 +50,21 @@ func (e *CodedError) MarshalJSON() ([]byte, error) {
 	}{Code: e.code, Message: e.message})
 }
 
+func (e *CodedError) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Code ErrorCode `json:"code"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	canonical := codedErrorForCode(wire.Code)
+	if canonical == nil {
+		return errors.New("invalid coded error")
+	}
+	*e = *canonical
+	return nil
+}
+
 var (
 	ErrAuthentication    = &CodedError{code: CodeAuthentication, message: "authentication failed"}
 	ErrConnection        = &CodedError{code: CodeConnection, message: "remote connection failed"}
@@ -58,6 +76,31 @@ var (
 	ErrApproval          = &CodedError{code: CodeApproval, message: "request approval failed"}
 	ErrAudit             = &CodedError{code: CodeAudit, message: "audit operation failed"}
 )
+
+func codedErrorForCode(code ErrorCode) *CodedError {
+	switch code {
+	case CodeAuthentication:
+		return ErrAuthentication
+	case CodeConnection:
+		return ErrConnection
+	case CodeHostKey:
+		return ErrHostKey
+	case CodeTimeout:
+		return ErrTimeout
+	case CodeUnavailableDaemon:
+		return ErrUnavailableDaemon
+	case CodeLockedVault:
+		return ErrLockedVault
+	case CodeValidation:
+		return ErrValidation
+	case CodeApproval:
+		return ErrApproval
+	case CodeAudit:
+		return ErrAudit
+	default:
+		return nil
+	}
+}
 
 type ExecuteRequest struct {
 	ServerAlias    string `json:"server_alias"`
@@ -79,6 +122,7 @@ type ExecuteResult struct {
 	DurationMS int64            `json:"duration_ms,omitempty"`
 	Truncated  bool             `json:"truncated"`
 	Error      *CodedError      `json:"error,omitempty"`
+	Warnings   []*CodedError    `json:"warnings,omitempty"`
 	Approval   *ApprovalInfo    `json:"approval,omitempty"`
 	Redactions RedactionSummary `json:"redactions"`
 }

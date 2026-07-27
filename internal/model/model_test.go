@@ -61,6 +61,26 @@ func TestCodedErrorsHaveStableSanitizedJSONAndRemainComparable(t *testing.T) {
 	}
 }
 
+func TestExecuteResultPreservesWarningsInJSONRoundTrip(t *testing.T) {
+	raw := []byte(`{"status":"failed","exit_code":0,"truncated":false,"error":{"code":"authentication_failed","message":"password-value"},"warnings":[{"code":"audit_failed","message":"secret-host"}],"redactions":{"applied":false}}`)
+	var result model.ExecuteResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := string(encoded)
+	if !strings.Contains(wire, `"error":{"code":"authentication_failed","message":"authentication failed"}`) ||
+		!strings.Contains(wire, `"warnings":[{"code":"audit_failed","message":"audit operation failed"}]`) {
+		t.Fatalf("ExecuteResult JSON did not preserve canonical errors: %s", encoded)
+	}
+	if strings.Contains(wire, "password-value") || strings.Contains(wire, "secret-host") {
+		t.Fatalf("ExecuteResult JSON leaked input messages: %s", encoded)
+	}
+}
+
 func TestPublicModelJSONContracts(t *testing.T) {
 	approval := model.ApprovalInfo{
 		ID:        "approval-1",
@@ -103,10 +123,11 @@ func TestPublicModelJSONContracts(t *testing.T) {
 				DurationMS: 25,
 				Truncated:  true,
 				Error:      model.ErrTimeout,
+				Warnings:   []*model.CodedError{model.ErrAudit},
 				Approval:   &approval,
 				Redactions: redactions,
 			},
-			want: `{"status":"completed","stdout":"ok","stderr":"warning","exit_code":0,"duration_ms":25,"truncated":true,"error":{"code":"timeout","message":"operation timed out"},"approval":{"id":"approval-1","code":"M7K2","message":"Approve production command","expires_at":"2026-07-18T16:00:00Z"},"redactions":{"applied":true,"counts":{"credential":2,"token":1}}}`,
+			want: `{"status":"completed","stdout":"ok","stderr":"warning","exit_code":0,"duration_ms":25,"truncated":true,"error":{"code":"timeout","message":"operation timed out"},"warnings":[{"code":"audit_failed","message":"audit operation failed"}],"approval":{"id":"approval-1","code":"M7K2","message":"Approve production command","expires_at":"2026-07-18T16:00:00Z"},"redactions":{"applied":true,"counts":{"credential":2,"token":1}}}`,
 		},
 		{
 			name:  "approval info",
