@@ -43,6 +43,13 @@ func (e *CodedError) Code() ErrorCode {
 	return e.code
 }
 
+func (e *CodedError) Is(target error) bool {
+	other, ok := target.(*CodedError)
+	return ok && e != nil && other != nil &&
+		codedErrorForCode(e.code) != nil && codedErrorForCode(other.code) != nil &&
+		e.code == other.code
+}
+
 func (e *CodedError) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Code    ErrorCode `json:"code"`

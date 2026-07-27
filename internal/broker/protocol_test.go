@@ -171,6 +171,9 @@ func TestProtocolExecuteRoundTripPreservesErrorAndWarning(t *testing.T) {
 		result.Warnings[0] == nil || result.Warnings[0].Code() != model.CodeAudit {
 		t.Fatalf("Execute() = %+v, %v", result, err)
 	}
+	if !errors.Is(result.Error, model.ErrAuthentication) || !errors.Is(result.Warnings[0], model.ErrAudit) {
+		t.Fatalf("roundtrip errors are not comparable: error=%v warnings=%+v", result.Error, result.Warnings)
+	}
 	raw, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)

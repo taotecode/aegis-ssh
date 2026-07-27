@@ -79,6 +79,25 @@ func TestExecuteResultPreservesWarningsInJSONRoundTrip(t *testing.T) {
 	if strings.Contains(wire, "password-value") || strings.Contains(wire, "secret-host") {
 		t.Fatalf("ExecuteResult JSON leaked input messages: %s", encoded)
 	}
+	if !errors.Is(result.Error, model.ErrAuthentication) {
+		t.Fatalf("roundtrip error %v does not match ErrAuthentication", result.Error)
+	}
+	if len(result.Warnings) != 1 || !errors.Is(result.Warnings[0], model.ErrAudit) {
+		t.Fatalf("roundtrip warnings %+v do not match ErrAudit", result.Warnings)
+	}
+}
+
+func TestCodedErrorIsMatchesOnlyKnownEqualCodes(t *testing.T) {
+	if errors.Is(model.ErrAuthentication, model.ErrTimeout) {
+		t.Fatal("different canonical error codes matched")
+	}
+	var nilCoded *model.CodedError
+	if errors.Is(nilCoded, model.ErrAudit) || errors.Is(model.ErrAudit, nilCoded) {
+		t.Fatal("typed nil CodedError matched a canonical error")
+	}
+	if errors.Is(&model.CodedError{}, &model.CodedError{}) || errors.Is(&model.CodedError{}, model.ErrAudit) {
+		t.Fatal("empty CodedError matched")
+	}
 }
 
 func TestPublicModelJSONContracts(t *testing.T) {
