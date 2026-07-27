@@ -33,8 +33,9 @@ type CommandAnalyzer interface {
 }
 
 type ApprovalStore interface {
-	Create(serverAlias string, command []byte, categories []policy.Category) (approval.Approval, error)
+	Create(serverAlias string, command []byte, categories []policy.Category, limits approval.ExecutionLimits) (approval.Approval, error)
 	Consume(id, code string) (approval.Approval, error)
+	Revoke(id string) error
 }
 
 type SSHExecutor interface {
@@ -143,22 +144,31 @@ func (service *Service) Execute(ctx context.Context, request model.ExecuteReques
 	if !ok {
 		return failed(model.ErrValidation)
 	}
+	secret.Password = append([]byte(nil), secret.Password...)
 	defer vault.Zero(secret.Password)
 
 	analysis, err := service.analyzer.Analyze(request.Command)
 	if err != nil {
 		return failed(model.ErrValidation)
 	}
+	limits := requestLimits(request, service)
 	if len(analysis.Categories) != 0 {
-		created, err := service.approvals.Create(request.ServerAlias, []byte(request.Command), analysis.Categories)
+		created, err := service.approvals.Create(
+			request.ServerAlias,
+			[]byte(request.Command),
+			analysis.Categories,
+			approval.ExecutionLimits{Timeout: limits.Timeout, MaxOutputBytes: limits.MaxOutputBytes},
+		)
 		if err != nil {
 			return failed(model.ErrApproval)
 		}
-		event := service.auditEvent(request.ServerAlias, request.Command, analysis.Categories)
+		defer vault.Zero(created.Command)
+		event := service.auditEvent(approvalRequestID(created.ID), request.ServerAlias, request.Command, analysis.Categories)
 		event.Decision = string(model.StatusRequiresApproval)
 		event.ApprovalState = "created"
 		event.RequireSync = true
 		if err := service.auditor.Write(event); err != nil {
+			_ = service.approvals.Revoke(created.ID)
 			return failed(model.ErrAudit)
 		}
 		return model.ExecuteResult{
@@ -172,7 +182,7 @@ func (service *Service) Execute(ctx context.Context, request model.ExecuteReques
 		}
 	}
 
-	return service.executeRemote(ctx, request.ServerAlias, request.Command, requestLimits(request, service), nil, false, secret)
+	return service.executeRemote(ctx, service.nextRequestID(), request.ServerAlias, request.Command, limits, nil, false, secret)
 }
 
 func (service *Service) ExecuteApproved(ctx context.Context, request model.ApprovedRequest) model.ExecuteResult {
@@ -187,12 +197,14 @@ func (service *Service) ExecuteApproved(ctx context.Context, request model.Appro
 	if !ok {
 		return failed(model.ErrValidation)
 	}
+	secret.Password = append([]byte(nil), secret.Password...)
 	defer vault.Zero(secret.Password)
 	return service.executeRemote(
 		ctx,
+		approvalRequestID(approved.ID),
 		approved.ServerAlias,
 		string(approved.Command),
-		sshclient.Limits{Timeout: service.defaultTimeout, MaxOutputBytes: service.defaultMaxOutput},
+		sshclient.Limits{Timeout: approved.Limits.Timeout, MaxOutputBytes: approved.Limits.MaxOutputBytes},
 		approved.Categories,
 		true,
 		secret,
@@ -201,6 +213,7 @@ func (service *Service) ExecuteApproved(ctx context.Context, request model.Appro
 
 func (service *Service) executeRemote(
 	ctx context.Context,
+	requestID string,
 	alias string,
 	command string,
 	limits sshclient.Limits,
@@ -209,7 +222,7 @@ func (service *Service) executeRemote(
 	secret vault.ServerSecret,
 ) model.ExecuteResult {
 	failClosed := service.auditFailClosed || approved
-	preflight := service.auditEvent(alias, command, categories)
+	preflight := service.auditEvent(requestID, alias, command, categories)
 	preflight.Decision = "execute_preflight"
 	if approved {
 		preflight.ApprovalState = "consumed"
@@ -246,7 +259,7 @@ func (service *Service) executeRemote(
 		result.Error = publicError(executeErr)
 	}
 
-	finalEvent := service.auditEvent(alias, command, categories)
+	finalEvent := service.auditEvent(requestID, alias, command, categories)
 	finalEvent.Decision = string(result.Status)
 	if approved {
 		finalEvent.ApprovalState = "executed"
@@ -258,9 +271,6 @@ func (service *Service) executeRemote(
 	finalEvent.Truncated = result.Truncated
 	finalEvent.Redactions = cloneCounts(result.Redactions.Counts)
 	if err := service.auditor.Write(finalEvent); err != nil {
-		if failClosed {
-			return failed(model.ErrAudit)
-		}
 		auditFailed = true
 	}
 	if auditFailed {
@@ -288,12 +298,21 @@ func requestLimits(request model.ExecuteRequest, service *Service) sshclient.Lim
 	return sshclient.Limits{Timeout: timeout, MaxOutputBytes: maxOutput}
 }
 
-func (service *Service) auditEvent(alias, command string, categories []policy.Category) audit.Event {
+func (service *Service) nextRequestID() string {
 	now := service.now()
 	sequence := service.requestSequence.Add(1)
+	return fmt.Sprintf("broker-%d-%d", now.UnixNano(), sequence)
+}
+
+func approvalRequestID(id string) string {
+	return "approval-" + id
+}
+
+func (service *Service) auditEvent(requestID, alias, command string, categories []policy.Category) audit.Event {
+	now := service.now()
 	return audit.Event{
 		Timestamp:      now,
-		RequestID:      fmt.Sprintf("broker-%d-%d", now.UnixNano(), sequence),
+		RequestID:      requestID,
 		Interface:      "unix",
 		ServerAlias:    alias,
 		Command:        command,

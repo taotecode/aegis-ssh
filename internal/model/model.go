@@ -36,10 +36,16 @@ type CodedError struct {
 }
 
 func (e *CodedError) Error() string {
+	if e == nil {
+		return ""
+	}
 	return e.message
 }
 
 func (e *CodedError) Code() ErrorCode {
+	if e == nil {
+		return ""
+	}
 	return e.code
 }
 
@@ -58,6 +64,9 @@ func (e *CodedError) MarshalJSON() ([]byte, error) {
 }
 
 func (e *CodedError) UnmarshalJSON(data []byte) error {
+	if e == nil || isCanonicalCodedError(e) {
+		return errors.New("invalid coded error receiver")
+	}
 	var wire struct {
 		Code ErrorCode `json:"code"`
 	}
@@ -70,6 +79,12 @@ func (e *CodedError) UnmarshalJSON(data []byte) error {
 	}
 	*e = *canonical
 	return nil
+}
+
+func isCanonicalCodedError(candidate *CodedError) bool {
+	return candidate == ErrAuthentication || candidate == ErrConnection || candidate == ErrHostKey ||
+		candidate == ErrTimeout || candidate == ErrUnavailableDaemon || candidate == ErrLockedVault ||
+		candidate == ErrValidation || candidate == ErrApproval || candidate == ErrAudit
 }
 
 var (

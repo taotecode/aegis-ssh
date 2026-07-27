@@ -17,6 +17,8 @@ const (
 	defaultTTL       = 5 * time.Minute
 	maxStoreEntries  = 256
 	maxCommandBytes  = 128 << 10
+	maxTimeout       = 30 * time.Minute
+	maxOutputBytes   = int64(4 << 20)
 	approvalCodeSize = 4
 )
 
@@ -30,6 +32,11 @@ var (
 	ErrExpired      = errors.New("approval expired")
 )
 
+type ExecutionLimits struct {
+	Timeout        time.Duration
+	MaxOutputBytes int64
+}
+
 // Approval is a snapshot of an approval request. Command and Categories are
 // copied on input and output, so callers cannot mutate store-owned state.
 type Approval struct {
@@ -38,6 +45,7 @@ type Approval struct {
 	ServerAlias string
 	Command     []byte
 	Categories  []policy.Category
+	Limits      ExecutionLimits
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
 	Used        bool
@@ -62,8 +70,9 @@ func NewStore(now func() time.Time, random io.Reader) *Store {
 }
 
 // Create records a single-use approval with the default five-minute TTL.
-func (s *Store) Create(serverAlias string, command []byte, categories []policy.Category) (Approval, error) {
-	if s == nil || s.now == nil || s.random == nil || serverAlias == "" || len(command) == 0 || len(command) > maxCommandBytes {
+func (s *Store) Create(serverAlias string, command []byte, categories []policy.Category, limits ExecutionLimits) (Approval, error) {
+	if s == nil || s.now == nil || s.random == nil || serverAlias == "" || len(command) == 0 || len(command) > maxCommandBytes ||
+		limits.Timeout <= 0 || limits.Timeout > maxTimeout || limits.MaxOutputBytes <= 0 || limits.MaxOutputBytes > maxOutputBytes {
 		return Approval{}, ErrInvalidInput
 	}
 	s.mu.Lock()
@@ -93,6 +102,7 @@ func (s *Store) Create(serverAlias string, command []byte, categories []policy.C
 		ServerAlias: serverAlias,
 		Command:     append([]byte(nil), command...),
 		Categories:  normalizeCategories(categories),
+		Limits:      limits,
 		CreatedAt:   createdAt,
 		ExpiresAt:   createdAt.Add(defaultTTL),
 	}
@@ -131,6 +141,7 @@ func (s *Store) Consume(id, code string) (Approval, error) {
 	}
 	consumed := cloneApproval(item.Approval)
 	consumed.Used = true
+	zeroBytes(item.Command)
 	s.items[id] = storedApproval{
 		Approval: Approval{
 			ID:        item.ID,
@@ -140,6 +151,26 @@ func (s *Store) Consume(id, code string) (Approval, error) {
 		used: true,
 	}
 	return consumed, nil
+}
+
+// Revoke removes an unused approval. Missing IDs are treated as already
+// revoked, while used tombstones are retained so replay remains distinguishable.
+func (s *Store) Revoke(id string) error {
+	if s == nil || s.now == nil || id == "" {
+		return ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.items[id]
+	if !ok {
+		return nil
+	}
+	if item.used {
+		return ErrUsed
+	}
+	zeroBytes(item.Command)
+	delete(s.items, id)
+	return nil
 }
 
 func (s *Store) cleanupLocked(now time.Time, except string) {
@@ -187,4 +218,10 @@ func cloneApproval(approval Approval) Approval {
 	approval.Command = append([]byte(nil), approval.Command...)
 	approval.Categories = append([]policy.Category(nil), approval.Categories...)
 	return approval
+}
+
+func zeroBytes(data []byte) {
+	for index := range data {
+		data[index] = 0
+	}
 }

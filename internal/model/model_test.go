@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/chenjw/aegis-ssh/internal/model"
@@ -97,6 +98,86 @@ func TestCodedErrorIsMatchesOnlyKnownEqualCodes(t *testing.T) {
 	}
 	if errors.Is(&model.CodedError{}, &model.CodedError{}) || errors.Is(&model.CodedError{}, model.ErrAudit) {
 		t.Fatal("empty CodedError matched")
+	}
+}
+
+func TestCodedErrorNilReceiverIsSafe(t *testing.T) {
+	var coded *model.CodedError
+	if got := coded.Error(); got != "" {
+		t.Fatalf("nil Error() = %q, want empty", got)
+	}
+	if got := coded.Code(); got != "" {
+		t.Fatalf("nil Code() = %q, want empty", got)
+	}
+	if err := coded.UnmarshalJSON([]byte(`{"code":"audit_failed"}`)); err == nil {
+		t.Fatal("nil UnmarshalJSON() succeeded")
+	}
+}
+
+func TestCodedErrorCanonicalSentinelsRejectDirectJSONMutation(t *testing.T) {
+	tests := []*model.CodedError{
+		model.ErrAuthentication, model.ErrConnection, model.ErrHostKey, model.ErrTimeout,
+		model.ErrUnavailableDaemon, model.ErrLockedVault, model.ErrValidation, model.ErrApproval, model.ErrAudit,
+	}
+	for _, sentinel := range tests {
+		original, err := json.Marshal(sentinel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(`{"code":"timeout","message":"secret-host"}`), sentinel); err == nil {
+			_ = json.Unmarshal(original, sentinel)
+			t.Fatalf("canonical sentinel %s accepted direct mutation", original)
+		}
+		after, err := json.Marshal(sentinel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(after) != string(original) {
+			_ = json.Unmarshal(original, sentinel)
+			t.Fatalf("canonical sentinel changed: before=%s after=%s", original, after)
+		}
+	}
+}
+
+func TestCodedErrorCanonicalSentinelsRejectConcurrentJSONMutation(t *testing.T) {
+	sentinels := []*model.CodedError{
+		model.ErrAuthentication, model.ErrConnection, model.ErrHostKey, model.ErrTimeout,
+		model.ErrUnavailableDaemon, model.ErrLockedVault, model.ErrValidation, model.ErrApproval, model.ErrAudit,
+	}
+	original := make([][]byte, len(sentinels))
+	for index, sentinel := range sentinels {
+		encoded, err := json.Marshal(sentinel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		original[index] = encoded
+	}
+	var wait sync.WaitGroup
+	errorsByAttempt := make(chan error, len(sentinels)*16)
+	for _, sentinel := range sentinels {
+		for range 16 {
+			wait.Add(1)
+			go func(target *model.CodedError) {
+				defer wait.Done()
+				errorsByAttempt <- json.Unmarshal([]byte(`{"code":"timeout","message":"secret-host"}`), target)
+			}(sentinel)
+		}
+	}
+	wait.Wait()
+	close(errorsByAttempt)
+	for err := range errorsByAttempt {
+		if err == nil {
+			t.Fatal("concurrent canonical mutation succeeded")
+		}
+	}
+	for index, sentinel := range sentinels {
+		encoded, err := json.Marshal(sentinel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != string(original[index]) {
+			t.Fatalf("canonical sentinel changed: before=%s after=%s", original[index], encoded)
+		}
 	}
 }
 
