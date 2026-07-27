@@ -64,7 +64,7 @@ func startProtocolServer(t *testing.T, service BrokerService) (string, context.C
 	server := NewServer(path, service)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := serveInBackground(server, ctx)
-	waitForProtocolSocket(t, path, done)
+	waitForProtocolReachable(t, ctx, path, done)
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -101,23 +101,28 @@ func serveInBackground(server *Server, ctx context.Context) <-chan error {
 	return done
 }
 
-func waitForProtocolSocket(t *testing.T, path string, done <-chan error) {
+func waitForProtocolReachable(t *testing.T, ctx context.Context, path string, done <-chan error) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.NewTimer(2 * time.Second)
+	retry := time.NewTicker(5 * time.Millisecond)
+	defer deadline.Stop()
+	defer retry.Stop()
+	var status model.BrokerStatus
+	var statusErr error
 	for {
-		info, err := os.Lstat(path)
-		if err == nil && info.Mode()&os.ModeSocket != 0 {
-			break
+		attemptCtx, stopAttempt := context.WithTimeout(ctx, 100*time.Millisecond)
+		status, statusErr = NewClient(path).Status(attemptCtx)
+		stopAttempt()
+		if statusErr == nil && status.DaemonReachable {
+			return
 		}
 		select {
 		case err := <-done:
 			t.Fatalf("server stopped during startup: %v", err)
-		default:
+		case <-deadline.C:
+			t.Fatalf("server did not become reachable: status=%+v err=%v", status, statusErr)
+		case <-retry.C:
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for Unix socket")
-		}
-		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -182,6 +187,28 @@ func TestProtocolSocketModeIsPrivate(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("socket mode = %04o, want 0600", got)
+	}
+}
+
+func TestProtocolSocketPathDoesNotProveReachability(t *testing.T) {
+	path := filepath.Join(newPrivateProtocolDir(t), "bound.sock")
+	fileDescriptor, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fileDescriptor)
+	if err := syscall.Bind(fileDescriptor, &syscall.SockaddrUnix{Name: path}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("bound path mode = %v, want socket", info.Mode())
+	}
+	if _, err := NewClient(path).Status(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Status() error = %v, want ErrUnavailable before listen", err)
 	}
 }
 
@@ -442,11 +469,7 @@ func TestProtocolConcurrentServerStartupHasSingleReachableWinner(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("neither concurrent Serve returned")
 	}
-	waitForProtocolSocket(t, path, make(chan error))
-	status, err := NewClient(path).Status(context.Background())
-	if err != nil || !status.DaemonReachable {
-		t.Fatalf("winner is not reachable: status=%+v err=%v", status, err)
-	}
+	waitForProtocolReachable(t, ctx, path, winner)
 	cancel()
 	select {
 	case err := <-winner:
@@ -556,7 +579,7 @@ func TestProtocolConcurrentServeLeavesPermanentPrivateUmask(t *testing.T) {
 		serveInBackground(NewServer(paths[1], &fakeProtocolService{}), ctx),
 	}
 	for index, path := range paths {
-		waitForProtocolSocket(t, path, done[index])
+		waitForProtocolReachable(t, ctx, path, done[index])
 		info, err := os.Lstat(path)
 		if err != nil || info.Mode().Perm() != 0o600 {
 			t.Fatalf("socket %d mode = %v err=%v", index, info.Mode().Perm(), err)
