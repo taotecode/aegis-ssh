@@ -648,7 +648,7 @@ git commit -m "feat: add redacted audit logging"
 - Create: `internal/broker/client.go`
 - Create: `internal/broker/protocol_test.go`
 
-- [ ] **Step 1: Write failing orchestration tests using fakes**
+- [x] **Step 1: Write failing orchestration tests using fakes**
 
 ```go
 func TestExecuteOrdinaryCommandFiltersBeforeReturn(t *testing.T) {
@@ -703,13 +703,13 @@ containing the four fixture values used by the no-leak test. `newTestService`
 uses a real analyzer, redactor, and approval store with a fake clock while
 injecting those fakes. `newTestServiceWithAudit` replaces only the auditor.
 
-- [ ] **Step 2: Run service tests and confirm the red state**
+- [x] **Step 2: Run service tests and confirm the red state**
 
 Run: `go test ./internal/broker -run Service -v`
 
 Expected: FAIL because service interfaces and methods are missing.
 
-- [ ] **Step 3: Implement service dependency interfaces and orchestration**
+- [x] **Step 3: Implement service dependency interfaces and orchestration**
 
 Define narrow interfaces for secret lookup, analyzer, approvals, SSH executor,
 redactor, and auditor. `Execute` order is validate -> alias lookup -> policy ->
@@ -720,7 +720,7 @@ The default fail-closed audit preflight occurs before SSH; the optional
 fail-open setting must be explicit in non-secret configuration and covered by a
 separate test.
 
-- [ ] **Step 4: Write failing Unix protocol tests**
+- [x] **Step 4: Write failing Unix protocol tests**
 
 Use a temporary Unix socket and a real `broker.Server` with a fake service.
 Test `status`, `list_servers`, `execute`, and `execute_approved`; malformed JSON,
@@ -730,7 +730,7 @@ Run: `go test ./internal/broker -run Protocol -v`
 
 Expected: FAIL before server and client are implemented.
 
-- [ ] **Step 5: Implement one-request-per-connection JSON protocol**
+- [x] **Step 5: Implement one-request-per-connection JSON protocol**
 
 Frames are newline-delimited JSON capped at 1 MiB. `Request` contains version,
 request ID, method, and `json.RawMessage` params. `Response` contains the same
@@ -738,7 +738,7 @@ request ID, result, or a stable structured error. The server removes a stale
 socket only after proving no daemon is listening, binds with umask `0077`,
 verifies mode `0600`, and closes cleanly on context cancellation.
 
-- [ ] **Step 6: Verify race safety and commit**
+- [x] **Step 6: Verify race safety and commit**
 
 Run: `go test -race ./internal/broker -v && go test ./...`
 
