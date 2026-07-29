@@ -38,6 +38,8 @@ aegis-ssh server add
 aegis-ssh server list
 ```
 
+每个交互字段、可信主机密钥校验、连接测试、密码轮换、删除和故障排查的完整说明见[添加和管理 SSH 服务器](docs/server-setup.zh-CN.md)。
+
 只能在 daemon 已停止时修改或删除服务器别名：
 
 ```bash

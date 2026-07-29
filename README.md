@@ -38,6 +38,8 @@ aegis-ssh server add
 aegis-ssh server list
 ```
 
+See [Add And Manage SSH Servers](docs/server-setup.md) for every prompt, trusted host-key verification, testing, password rotation, removal, and troubleshooting.
+
 Edit or remove an alias only while the daemon is stopped:
 
 ```bash
