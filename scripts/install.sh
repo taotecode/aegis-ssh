@@ -24,7 +24,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 if [ -z "$binary" ]; then
     command -v go >/dev/null 2>&1 || { echo "go is required when --binary is omitted" >&2; exit 1; }
     temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/aegis-install.XXXXXX")

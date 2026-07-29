@@ -108,6 +108,12 @@ Rotate a server password with `aegis-ssh server edit <alias>`, then restart `aeg
 - Server changes are refused: run `aegis-ssh lock`, then retry the management command.
 - Output contains `[REDACTED:...]`: the broker intentionally withheld sensitive data. Do not attempt to reconstruct it.
 
+## Releases
+
+Published versions and platform archives are available from [GitHub Releases](https://github.com/taotecode/aegis-ssh/releases).
+
+Maintainers release a version by adding a non-empty, bilingual `.github/releases/vX.Y.Z.md` file and pushing the matching `vX.Y.Z` tag. The Release workflow runs tests on macOS and Linux, builds all supported archives, verifies checksums, and publishes the GitHub Release. A missing release-notes file fails the workflow, so every published version has an explicit description.
+
 ## Development
 
 ```bash

@@ -133,6 +133,12 @@ Aegis SSH 提供凭据隔离、最佳努力的命令风险分析、批准、输�
 
 完整的威胁边界、安全操作规则和漏洞报告方式见 [SECURITY.zh-CN.md](SECURITY.zh-CN.md)。
 
+## 版本发布
+
+已发布版本和各平台压缩包可从 [GitHub Releases](https://github.com/taotecode/aegis-ssh/releases) 下载。
+
+维护者发布新版本时，需要先添加非空的中英双语 `.github/releases/vX.Y.Z.md` 文件，再推送对应的 `vX.Y.Z` 标签。Release 工作流会在 macOS 和 Linux 上运行测试，构建全部支持平台的压缩包，校验校验和，然后发布 GitHub Release。如果缺少版本说明文件，工作流会直接失败，因此每个正式发布的版本都会有明确说明。
+
 ## 开发
 
 ```bash

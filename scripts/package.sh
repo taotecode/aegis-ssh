@@ -3,12 +3,12 @@ set -eu
 
 [ "$#" -eq 1 ] || { echo "usage: scripts/package.sh OUTPUT_DIR" >&2; exit 2; }
 output=$1
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 version=$(cd "$root" && git describe --tags --always --dirty 2>/dev/null || true)
 [ -n "$version" ] || { echo "unable to determine worktree version" >&2; exit 1; }
 
 mkdir -p "$output"
-output=$(CDPATH= cd -- "$output" && pwd)
+output=$(CDPATH='' cd -- "$output" && pwd)
 stage=$(mktemp -d "${TMPDIR:-/tmp}/aegis-package.XXXXXX")
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 manifest="$stage/archives"
