@@ -145,22 +145,26 @@ func (server *Server) handle(parent context.Context, connection net.Conn) {
 	if err := connection.SetReadDeadline(readDeadline); err != nil {
 		return
 	}
-	request, response := readRequest(connection, readDeadline)
+	request, response := readRequest(connection)
 	_ = connection.SetReadDeadline(time.Time{})
 	if response.Error != nil {
 		writeResponse(connection, response)
 		return
 	}
-	requestCtx, cancel := context.WithCancel(parent)
-	defer cancel()
-	go watchConnection(requestCtx, cancel, connection)
-	response = server.dispatch(requestCtx, request)
+	// EOF proves that the request contains exactly one frame. After this
+	// expected half-close, another read cannot distinguish a live client from a
+	// disconnected one, so execution remains bounded by the daemon context and
+	// the request's SSH timeout rather than connection-read cancellation.
+	response = server.dispatch(parent, request)
 	writeResponse(connection, response)
 }
 
 func (server *Server) dispatch(ctx context.Context, request Request) Response {
 	if request.Version != ProtocolVersion || request.RequestID == "" || request.Method == "" {
 		return protocolError(request.RequestID, ErrorInvalidRequest, "invalid request")
+	}
+	if len(request.RequestID) > maxRequestIDBytes {
+		return protocolError("", ErrorInvalidRequest, "invalid request")
 	}
 	var params []byte
 	if len(request.Params) != 0 {
@@ -202,8 +206,8 @@ func (server *Server) dispatch(ctx context.Context, request Request) Response {
 	}
 }
 
-func readRequest(connection net.Conn, deadline time.Time) (Request, Response) {
-	line, err := readSingleFrame(connection, deadline)
+func readRequest(connection net.Conn) (Request, Response) {
+	line, err := readSingleFrame(connection)
 	if errors.Is(err, ErrFrameTooLarge) {
 		return Request{}, protocolError("", ErrorFrameTooLarge, "request frame too large")
 	}
@@ -220,7 +224,14 @@ func readRequest(connection net.Conn, deadline time.Time) (Request, Response) {
 func writeResponse(connection net.Conn, response Response) {
 	data, err := json.Marshal(response)
 	if err != nil || len(data) > MaxFrameBytes {
-		data, _ = json.Marshal(protocolError(response.RequestID, ErrorInternal, "response unavailable"))
+		requestID := response.RequestID
+		if len(requestID) > maxRequestIDBytes {
+			requestID = ""
+		}
+		data, err = json.Marshal(protocolError(requestID, ErrorInternal, "response unavailable"))
+	}
+	if err != nil || len(data) > MaxFrameBytes {
+		data = []byte(`{"version":"1","request_id":"","error":{"code":"internal_error","message":"response unavailable"}}`)
 	}
 	data = append(data, '\n')
 	_ = connection.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
@@ -259,29 +270,26 @@ func marshalExecuteResult(requestID string, result model.ExecuteResult) Response
 	}
 
 	result.Truncated = true
-	maximum := max(len(stdout), len(stderr))
-	if maximum > MaxFrameBytes {
-		maximum = MaxFrameBytes
-	}
-	best, _, ok := encodedResultResponse(requestID, withOutputCap(result, stdout, stderr, 0))
+	result.Stdout = ""
+	result.Stderr = ""
+	base, baseSize, ok := encodedResultResponse(requestID, result)
 	if !ok {
 		return protocolError(requestID, ErrorInternal, "response unavailable")
 	}
-	encodedBest, err := json.Marshal(best)
-	if err != nil || len(encodedBest) > MaxFrameBytes {
+	if baseSize > MaxFrameBytes {
 		return protocolError(requestID, ErrorInternal, "response unavailable")
 	}
-	for low, high := 1, maximum; low <= high; {
-		middle := low + (high-low)/2
-		candidate, size, valid := encodedResultResponse(requestID, withOutputCap(result, stdout, stderr, middle))
-		if valid && size <= MaxFrameBytes {
-			best = candidate
-			low = middle + 1
-		} else {
-			high = middle - 1
-		}
+	stdout, stderr = fitExecuteOutput(stdout, stderr, MaxFrameBytes-baseSize)
+	if stdout == "" && stderr == "" {
+		return base
 	}
-	return best
+	result.Stdout = stdout
+	result.Stderr = stderr
+	data, err := json.Marshal(result)
+	if err != nil {
+		return protocolError(requestID, ErrorInternal, "response unavailable")
+	}
+	return Response{Version: ProtocolVersion, RequestID: requestID, Result: data}
 }
 
 func encodedResultResponse(requestID string, result model.ExecuteResult) (Response, int, bool) {
@@ -297,12 +305,6 @@ func encodedResultResponse(requestID string, result model.ExecuteResult) (Respon
 	return response, len(encoded), true
 }
 
-func withOutputCap(result model.ExecuteResult, stdout, stderr string, limit int) model.ExecuteResult {
-	result.Stdout = utf8Prefix(stdout, limit)
-	result.Stderr = utf8Prefix(stderr, limit)
-	return result
-}
-
 func normalizeUTF8(value string) string {
 	if utf8.ValidString(value) {
 		return value
@@ -310,18 +312,113 @@ func normalizeUTF8(value string) string {
 	return strings.ToValidUTF8(value, "\uFFFD")
 }
 
-func utf8Prefix(value string, limit int) string {
-	if limit <= 0 {
-		return ""
+const (
+	stdoutFieldBytes = len(`,"stdout":`)
+	stderrFieldBytes = len(`,"stderr":`)
+	jsonStringQuotes = 2
+)
+
+// fitExecuteOutput divides the available encoded-response bytes fairly between
+// stdout and stderr. The returned prefixes are valid UTF-8 and their exact JSON
+// representation, including field names and quotes, never exceeds available.
+func fitExecuteOutput(stdout, stderr string, available int) (string, string) {
+	type output struct {
+		value     string
+		fieldSize int
+		fullSize  int
+		budget    int
+		isStdout  bool
 	}
-	if len(value) <= limit {
-		return value
+	outputs := make([]output, 0, 2)
+	if stdout != "" {
+		outputs = append(outputs, output{value: stdout, fieldSize: stdoutFieldBytes, isStdout: true})
 	}
-	end := limit
-	for end > 0 && !utf8.RuneStart(value[end]) {
-		end--
+	if stderr != "" {
+		outputs = append(outputs, output{value: stderr, fieldSize: stderrFieldBytes})
 	}
-	return value[:end]
+	if len(outputs) == 0 {
+		return "", ""
+	}
+	fixed := 0
+	for index := range outputs {
+		fixed += outputs[index].fieldSize + jsonStringQuotes
+	}
+	contentBudget := available - fixed
+	if contentBudget <= 0 {
+		return "", ""
+	}
+	for index := range outputs {
+		outputs[index].fullSize = jsonEscapedContentSize(outputs[index].value, contentBudget)
+	}
+	if len(outputs) == 1 {
+		outputs[0].budget = min(outputs[0].fullSize, contentBudget)
+	} else {
+		half := contentBudget / 2
+		outputs[0].budget = min(outputs[0].fullSize, half)
+		outputs[1].budget = min(outputs[1].fullSize, half)
+		remaining := contentBudget - outputs[0].budget - outputs[1].budget
+		if outputs[0].budget < outputs[0].fullSize {
+			added := min(outputs[0].fullSize-outputs[0].budget, remaining)
+			outputs[0].budget += added
+			remaining -= added
+		}
+		if outputs[1].budget < outputs[1].fullSize {
+			outputs[1].budget += min(outputs[1].fullSize-outputs[1].budget, remaining)
+		}
+	}
+
+	prefixes := [2]string{}
+	for index := range outputs {
+		prefixes[index], _ = jsonPrefix(outputs[index].value, outputs[index].budget)
+	}
+	if len(outputs) == 1 {
+		if outputs[0].isStdout {
+			return prefixes[0], ""
+		}
+		return "", prefixes[0]
+	}
+	return prefixes[0], prefixes[1]
+}
+
+// jsonEscapedContentSize mirrors encoding/json's default string escaping. It
+// stops once the result is known to exceed limit, avoiding integer overflow and
+// needless scanning of output that cannot fit in one protocol frame.
+func jsonEscapedContentSize(value string, limit int) int {
+	size := 0
+	for _, character := range value {
+		size += jsonRuneSize(character)
+		if size > limit {
+			return limit + 1
+		}
+	}
+	return size
+}
+
+func jsonPrefix(value string, budget int) (string, int) {
+	end := 0
+	used := 0
+	for offset, character := range value {
+		cost := jsonRuneSize(character)
+		if used+cost > budget {
+			break
+		}
+		used += cost
+		end = offset + utf8.RuneLen(character)
+	}
+	return value[:end], used
+}
+
+func jsonRuneSize(character rune) int {
+	switch character {
+	case '\b', '\f', '\n', '\r', '\t', '"', '\\':
+		return 2
+	case '<', '>', '&', '\u2028', '\u2029':
+		return 6
+	}
+	if character < 0x20 {
+		return 6
+	}
+	return utf8.RuneLen(character)
 }
 
 func protocolServiceError(requestID string, err error) Response {
@@ -330,18 +427,6 @@ func protocolServiceError(requestID string, err error) Response {
 		return protocolError(requestID, string(coded.Code()), "broker request failed")
 	}
 	return protocolError(requestID, ErrorUnavailable, "broker request unavailable")
-}
-
-func watchConnection(ctx context.Context, cancel context.CancelFunc, connection net.Conn) {
-	buffer := make([]byte, 1)
-	readResult := make(chan error, 1)
-	go func() { _, err := connection.Read(buffer); readResult <- err }()
-	select {
-	case <-ctx.Done():
-		_ = connection.Close()
-	case <-readResult:
-		cancel()
-	}
 }
 
 func (server *Server) closeActive() {

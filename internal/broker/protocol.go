@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	ProtocolVersion = "1"
-	MaxFrameBytes   = 1 << 20
+	ProtocolVersion   = "1"
+	MaxFrameBytes     = 1 << 20
+	maxRequestIDBytes = 128
 
 	ErrorInvalidRequest = "invalid_request"
 	ErrorMethodNotFound = "method_not_found"

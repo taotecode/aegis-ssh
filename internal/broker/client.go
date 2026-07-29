@@ -103,11 +103,21 @@ func (client *Client) call(ctx context.Context, method string, params any, resul
 		return ErrUnavailable
 	}
 	_ = connection.SetWriteDeadline(time.Time{})
+	unixConnection, ok := connection.(*net.UnixConn)
+	if !ok {
+		return ErrInvalidProtocol
+	}
+	if err := unixConnection.CloseWrite(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrUnavailable
+	}
 	readDeadline := phaseDeadline(contextDeadline, hasContextDeadline, client.readTimeout)
 	if err := connection.SetReadDeadline(readDeadline); err != nil {
 		return ErrInvalidProtocol
 	}
-	response, err := readResponseFrame(connection, readDeadline)
+	response, err := readResponseFrame(connection)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
@@ -137,8 +147,8 @@ func (client *Client) call(ctx context.Context, method string, params any, resul
 	return nil
 }
 
-func readResponseFrame(connection net.Conn, deadline time.Time) (Response, error) {
-	line, err := readSingleFrame(connection, deadline)
+func readResponseFrame(connection net.Conn) (Response, error) {
+	line, err := readSingleFrame(connection)
 	if err != nil {
 		return Response{}, err
 	}

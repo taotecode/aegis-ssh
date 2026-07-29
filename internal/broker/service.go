@@ -193,6 +193,7 @@ func (service *Service) ExecuteApproved(ctx context.Context, request model.Appro
 	if err != nil {
 		return failed(model.ErrApproval)
 	}
+	defer vault.Zero(approved.Command)
 	secret, ok := service.secrets.Lookup(approved.ServerAlias)
 	if !ok {
 		return failed(model.ErrValidation)

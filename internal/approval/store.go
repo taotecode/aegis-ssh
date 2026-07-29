@@ -122,6 +122,7 @@ func (s *Store) Consume(id, code string) (Approval, error) {
 	// Expiration wins over every other validation result and removes the
 	// record, making this the only call that reports ErrExpired.
 	if ok && !now.Before(item.ExpiresAt) {
+		zeroBytes(item.Command)
 		delete(s.items, id)
 		return Approval{}, ErrExpired
 	}
@@ -176,6 +177,7 @@ func (s *Store) Revoke(id string) error {
 func (s *Store) cleanupLocked(now time.Time, except string) {
 	for id, item := range s.items {
 		if id != except && !now.Before(item.ExpiresAt) {
+			zeroBytes(item.Command)
 			delete(s.items, id)
 		}
 	}

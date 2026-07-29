@@ -28,6 +28,8 @@ type fakeProtocolService struct {
 	canceled      chan struct{}
 	release       chan struct{}
 	finished      chan struct{}
+	holdEntered   chan struct{}
+	holdRelease   chan struct{}
 }
 
 func (service *fakeProtocolService) Status(context.Context) (model.BrokerStatus, error) {
@@ -43,6 +45,10 @@ func (service *fakeProtocolService) Execute(ctx context.Context, request model.E
 	service.executes = append(service.executes, request)
 	configured := service.executeResult
 	service.mu.Unlock()
+	if service.holdEntered != nil {
+		close(service.holdEntered)
+		<-service.holdRelease
+	}
 	if service.entered != nil {
 		close(service.entered)
 		<-ctx.Done()
@@ -641,6 +647,7 @@ func rawProtocolCall(t *testing.T, path string, frame []byte) Response {
 	if _, err := connection.Write(frame); err != nil {
 		t.Fatal(err)
 	}
+	closeUnixWrite(t, connection)
 	line, err := bufio.NewReader(connection).ReadBytes('\n')
 	if err != nil {
 		t.Fatal(err)
@@ -673,6 +680,7 @@ func serveRawClientResponse(t *testing.T, response func(requestID string) []byte
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
+	release := make(chan struct{})
 	go func() {
 		defer close(done)
 		connection, err := listener.Accept()
@@ -690,12 +698,13 @@ func serveRawClientResponse(t *testing.T, response func(requestID string) []byte
 		}
 		payload := response(request.RequestID)
 		if payload == nil {
-			_, _ = connection.Read(make([]byte, 1))
+			<-release
 			return
 		}
 		_, _ = connection.Write(payload)
 	}()
 	t.Cleanup(func() {
+		close(release)
 		_ = listener.Close()
 		select {
 		case <-done:

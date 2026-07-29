@@ -135,9 +135,10 @@ func newTestServiceWithDependencies(executor SSHExecutor, auditor Auditor, appro
 }
 
 type observingApprovalStore struct {
-	inner          *approval.Store
-	revokeErr      error
-	createdCommand []byte
+	inner           *approval.Store
+	revokeErr       error
+	createdCommand  []byte
+	consumedCommand []byte
 }
 
 func (store *observingApprovalStore) Create(alias string, command []byte, categories []policy.Category, limits approval.ExecutionLimits) (approval.Approval, error) {
@@ -147,7 +148,9 @@ func (store *observingApprovalStore) Create(alias string, command []byte, catego
 }
 
 func (store *observingApprovalStore) Consume(id, code string) (approval.Approval, error) {
-	return store.inner.Consume(id, code)
+	consumed, err := store.inner.Consume(id, code)
+	store.consumedCommand = consumed.Command
+	return consumed, err
 }
 
 func (store *observingApprovalStore) Revoke(id string) error {
@@ -259,6 +262,46 @@ func TestServiceExecuteApprovedUsesStoredNormalizedDefaultLimits(t *testing.T) {
 	if got.Status != model.StatusCompleted || executor.lastLimits != wantLimits {
 		t.Fatalf("result=%+v limits=%+v, want %+v", got, executor.lastLimits, wantLimits)
 	}
+}
+
+func TestServiceZerosConsumedApprovalCommandOnEveryReturn(t *testing.T) {
+	now := func() time.Time { return time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC) }
+
+	t.Run("successful execution", func(t *testing.T) {
+		store := &observingApprovalStore{inner: approval.NewStore(now, rand.Reader)}
+		service := newTestServiceWithDependencies(&fakeExecutor{}, &fakeAudit{}, store, false, now)
+		blocked := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "ip route"})
+		got := service.ExecuteApproved(context.Background(), model.ApprovedRequest{
+			ApprovalID: blocked.Approval.ID, ApprovalCode: blocked.Approval.Code,
+		})
+		if got.Status != model.StatusCompleted {
+			t.Fatal(got)
+		}
+		if !bytes.Equal(store.consumedCommand, make([]byte, len(store.consumedCommand))) {
+			t.Fatalf("consumed command was not zeroed: %q", store.consumedCommand)
+		}
+	})
+
+	t.Run("alias lookup failure", func(t *testing.T) {
+		store := &observingApprovalStore{inner: approval.NewStore(now, rand.Reader)}
+		created, err := store.inner.Create(
+			"missing", []byte("ip route"), []policy.Category{policy.NetworkIdentity},
+			approval.ExecutionLimits{Timeout: time.Second, MaxOutputBytes: 4 << 10},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		service := newTestServiceWithDependencies(&fakeExecutor{}, &fakeAudit{}, store, false, now)
+		got := service.ExecuteApproved(context.Background(), model.ApprovedRequest{
+			ApprovalID: created.ID, ApprovalCode: created.Code,
+		})
+		if got.Status != model.StatusFailed || !errors.Is(got.Error, model.ErrValidation) {
+			t.Fatal(got)
+		}
+		if !bytes.Equal(store.consumedCommand, make([]byte, len(store.consumedCommand))) {
+			t.Fatalf("consumed command after lookup failure was not zeroed: %q", store.consumedCommand)
+		}
+	})
 }
 
 func TestServiceUnknownAliasNeverRevealsVaultData(t *testing.T) {

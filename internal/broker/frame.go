@@ -8,12 +8,9 @@ import (
 	"time"
 )
 
-const (
-	initialFrameBufferBytes = 4 << 10
-	trailingProbeTimeout    = 2 * time.Millisecond
-)
+const initialFrameBufferBytes = 4 << 10
 
-func readSingleFrame(connection net.Conn, phaseDeadline time.Time) ([]byte, error) {
+func readSingleFrame(connection net.Conn) ([]byte, error) {
 	reader := bufio.NewReaderSize(connection, initialFrameBufferBytes)
 	var frame []byte
 	for {
@@ -59,24 +56,11 @@ func readSingleFrame(connection net.Conn, phaseDeadline time.Time) ([]byte, erro
 	if reader.Buffered() != 0 {
 		return nil, ErrInvalidProtocol
 	}
-	probeDeadline := time.Now().Add(trailingProbeTimeout)
-	if !phaseDeadline.IsZero() && phaseDeadline.Before(probeDeadline) {
-		probeDeadline = phaseDeadline
-	}
-	if err := connection.SetReadDeadline(probeDeadline); err != nil {
-		_, peekErr := reader.Peek(1)
-		if errors.Is(peekErr, io.EOF) {
-			return frame, nil
-		}
-		return nil, ErrInvalidProtocol
-	}
-	_, err := reader.Peek(1)
-	_ = connection.SetReadDeadline(phaseDeadline)
+	_, err := reader.ReadByte()
 	if err == nil {
 		return nil, ErrInvalidProtocol
 	}
-	var networkError net.Error
-	if errors.Is(err, io.EOF) || (errors.As(err, &networkError) && networkError.Timeout()) {
+	if errors.Is(err, io.EOF) {
 		return frame, nil
 	}
 	return nil, ErrInvalidProtocol

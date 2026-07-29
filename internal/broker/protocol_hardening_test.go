@@ -38,21 +38,184 @@ func TestProtocolServerRejectsTwoFramesFromOneWriteBeforeDispatch(t *testing.T) 
 	}
 }
 
-func TestProtocolClientReturnsAfterOneFrameWhilePeerStaysOpen(t *testing.T) {
-	path := serveHoldingClientResponse(t, func(requestID string) []byte {
-		return append(validStatusResponse(t, requestID), '\n')
+func TestProtocolServerRejectsDelayedSecondFrameBeforeDispatch(t *testing.T) {
+	service := &fakeProtocolService{holdEntered: make(chan struct{}), holdRelease: make(chan struct{})}
+	_, path, _, _ := startConfiguredProtocolServer(t, service, func(server *Server) {
+		server.requestReadTimeout = time.Second
 	})
+	connection, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	first := mustRequestFrame(t, Request{
+		Version: ProtocolVersion, RequestID: "execute-1", Method: "execute",
+		Params: mustRawJSON(t, model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"}),
+	})
+	if _, err := connection.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-service.holdEntered:
+	case <-time.After(30 * time.Millisecond):
+	}
+	second := mustRequestFrame(t, Request{Version: ProtocolVersion, RequestID: "status-2", Method: "status"})
+	if _, err := connection.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	closeUnixWrite(t, connection)
+	close(service.holdRelease)
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(connection).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response Response
+	if err := json.Unmarshal(bytes.TrimSuffix(line, []byte{'\n'}), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != ErrorInvalidRequest {
+		t.Fatalf("response = %+v", response)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.executes) != 0 {
+		t.Fatalf("Execute calls = %d, want 0", len(service.executes))
+	}
+}
+
+func TestProtocolServerRequiresRequestHalfCloseBeforeDispatch(t *testing.T) {
+	service := &fakeProtocolService{}
+	_, path, _, _ := startConfiguredProtocolServer(t, service, func(server *Server) {
+		server.requestReadTimeout = 30 * time.Millisecond
+	})
+	connection, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	request := mustRequestFrame(t, Request{
+		Version: ProtocolVersion, RequestID: "no-half-close", Method: "execute",
+		Params: mustRawJSON(t, model.ExecuteRequest{ServerAlias: "prod", Command: "uptime"}),
+	})
+	if _, err := connection.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(connection).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response Response
+	if err := json.Unmarshal(bytes.TrimSuffix(line, []byte{'\n'}), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != ErrorInvalidRequest {
+		t.Fatalf("response = %+v", response)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.executes) != 0 {
+		t.Fatalf("Execute calls = %d, want 0", len(service.executes))
+	}
+}
+
+func TestProtocolClientHalfClosesRequestBeforeReadingResponse(t *testing.T) {
+	path := serveResponseAfterRequestEOF(t)
 	client := NewClient(path)
 	client.readTimeout = time.Second
-	started := time.Now()
 
 	status, err := client.Status(context.Background())
 
 	if err != nil || !status.DaemonReachable {
 		t.Fatalf("Status() = %+v, %v", status, err)
 	}
-	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
-		t.Fatalf("Status() waited for peer close: %v", elapsed)
+}
+
+func TestProtocolRequestHalfCloseDoesNotCancelDispatchedContext(t *testing.T) {
+	service := &fakeProtocolService{
+		entered: make(chan struct{}), canceled: make(chan struct{}),
+		release: make(chan struct{}), finished: make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(service.release)
+		}
+	}()
+	path, cancel, done := startProtocolServer(t, service)
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := NewClient(path).Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "block"})
+		callDone <- err
+	}()
+	select {
+	case <-service.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("service was not called")
+	}
+	select {
+	case <-service.canceled:
+		t.Fatal("request half-close canceled the dispatched context")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-service.canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server cancellation did not reach dispatched context")
+	}
+	close(service.release)
+	released = true
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	<-callDone
+}
+
+func TestProtocolServerAcceptsFragmentedRequestAfterHalfClose(t *testing.T) {
+	service := &fakeProtocolService{}
+	path, _, _ := startProtocolServer(t, service)
+	connection, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	command := strings.Repeat("x", 120<<10)
+	frame := mustRequestFrame(t, Request{
+		Version: ProtocolVersion, RequestID: "fragmented", Method: "execute",
+		Params: mustRawJSON(t, model.ExecuteRequest{ServerAlias: "prod", Command: command}),
+	})
+	for len(frame) != 0 {
+		chunk := min(257, len(frame))
+		if err := writeAll(connection, frame[:chunk]); err != nil {
+			t.Fatal(err)
+		}
+		frame = frame[chunk:]
+	}
+	closeUnixWrite(t, connection)
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(connection).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response Response
+	if err := json.Unmarshal(bytes.TrimSuffix(line, []byte{'\n'}), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != nil || response.RequestID != "fragmented" {
+		t.Fatalf("response = %+v", response)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.executes) != 1 || service.executes[0].Command != command {
+		t.Fatalf("Execute calls = %d", len(service.executes))
 	}
 }
 
@@ -79,7 +242,8 @@ func TestProtocolFrameReaderAcceptsExactMaximumFrame(t *testing.T) {
 		_ = writer.Close()
 	}()
 
-	frame, err := readSingleFrame(reader, time.Now().Add(time.Second))
+	_ = reader.SetReadDeadline(time.Now().Add(time.Second))
+	frame, err := readSingleFrame(reader)
 
 	if err != nil || len(frame) != MaxFrameBytes {
 		t.Fatalf("readSingleFrame() bytes = %d, error = %v", len(frame), err)
@@ -311,12 +475,43 @@ func TestProtocolFitsLargeExecuteResultWithoutReplacingOutcome(t *testing.T) {
 	if !utf8.ValidString(got.Stdout) || !utf8.ValidString(got.Stderr) {
 		t.Fatal("fitted result split UTF-8 output")
 	}
+	allocations := testing.AllocsPerRun(3, func() {
+		if fitted := marshalResult("allocation-1", want); fitted.Error != nil {
+			panic("large execute result was replaced")
+		}
+	})
+	if allocations > 80 {
+		t.Fatalf("marshalResult() allocations = %.0f, want <= 80", allocations)
+	}
 
 	service := &fakeProtocolService{executeResult: &want}
 	path, _, _ := startProtocolServer(t, service)
 	roundTrip, err := NewClient(path).Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "large"})
 	if err != nil || roundTrip.Status != want.Status || !roundTrip.Truncated || roundTrip.ExitCode != want.ExitCode {
 		t.Fatalf("Execute() = %+v, %v", roundTrip, err)
+	}
+}
+
+func TestFitExecuteOutputPreservesSingleStream(t *testing.T) {
+	const available = 64
+	stdout, stderr := fitExecuteOutput(strings.Repeat("out", 100), "", available)
+	if stdout == "" || stderr != "" {
+		t.Fatalf("stdout-only fit = (%q, %q)", stdout, stderr)
+	}
+	stdout, stderr = fitExecuteOutput("", strings.Repeat("err", 100), available)
+	if stdout != "" || stderr == "" {
+		t.Fatalf("stderr-only fit = (%q, %q)", stdout, stderr)
+	}
+}
+
+func TestJSONEscapedContentSizeMatchesEncodingJSON(t *testing.T) {
+	value := "\b\f\n\r\t\"\\<>&\u2028\u2029\x00界"
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := jsonEscapedContentSize(value, MaxFrameBytes), len(encoded)-2; got != want {
+		t.Fatalf("escaped content bytes = %d, want %d (%s)", got, want, encoded)
 	}
 }
 
@@ -401,6 +596,7 @@ func TestProtocolServerConnectionLimitRejectsAndReleases(t *testing.T) {
 	if _, err := replacement.Write(mustRequestFrame(t, Request{Version: ProtocolVersion, RequestID: "replacement", Method: "status"})); err != nil {
 		t.Fatal(err)
 	}
+	closeUnixWrite(t, replacement)
 	line, err := bufio.NewReader(replacement).ReadBytes('\n')
 	if err != nil {
 		t.Fatal(err)
@@ -475,7 +671,7 @@ func TestProtocolClientReadDeadlineBoundsIncompleteFrames(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			path := serveHoldingClientResponse(t, test.payload)
+			path := serveUnclosedClientResponse(t, test.payload)
 			client := NewClient(path)
 			client.readTimeout = test.timeout
 			started := time.Now()
@@ -491,7 +687,7 @@ func TestProtocolClientReadDeadlineBoundsIncompleteFrames(t *testing.T) {
 }
 
 func TestProtocolClientUsesEarlierContextReadDeadline(t *testing.T) {
-	path := serveHoldingClientResponse(t, func(string) []byte { return nil })
+	path := serveUnclosedClientResponse(t, func(string) []byte { return nil })
 	client := NewClient(path)
 	client.readTimeout = time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -556,6 +752,53 @@ func TestProtocolWriteAllHandlesPartialWrites(t *testing.T) {
 	}
 	if !bytes.Equal(writer.Bytes(), payload) {
 		t.Fatalf("written = %q, want %q", writer.Bytes(), payload)
+	}
+}
+
+func TestProtocolRequestIDLengthBoundary(t *testing.T) {
+	path, _, _ := startProtocolServer(t, &fakeProtocolService{})
+	acceptedID := strings.Repeat("r", maxRequestIDBytes)
+	accepted := rawProtocolCall(t, path, mustRequestFrame(t, Request{
+		Version: ProtocolVersion, RequestID: acceptedID, Method: "status",
+	}))
+	if accepted.Error != nil || accepted.RequestID != acceptedID {
+		t.Fatalf("accepted response = %+v", accepted)
+	}
+
+	rejected := rawProtocolCall(t, path, mustRequestFrame(t, Request{
+		Version: ProtocolVersion, RequestID: acceptedID + "r", Method: "status",
+	}))
+	if rejected.Error == nil || rejected.Error.Code != ErrorInvalidRequest {
+		t.Fatalf("rejected response = %+v", rejected)
+	}
+}
+
+func TestProtocolWriteResponseFallbackAlwaysFitsFrame(t *testing.T) {
+	client, server := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		writeResponse(server, Response{
+			Version: ProtocolVersion, RequestID: strings.Repeat("r", MaxFrameBytes),
+			Result: mustRawJSON(t, strings.Repeat("\x00", MaxFrameBytes)),
+		})
+		_ = server.Close()
+	}()
+	data, err := io.ReadAll(client)
+	_ = client.Close()
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 || data[len(data)-1] != '\n' || len(data)-1 > MaxFrameBytes {
+		t.Fatalf("fallback frame bytes = %d", len(data))
+	}
+	var response Response
+	if err := json.Unmarshal(data[:len(data)-1], &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != ErrorInternal {
+		t.Fatalf("fallback response = %+v", response)
 	}
 }
 
@@ -662,4 +905,92 @@ func serveHoldingClientResponse(t *testing.T, response func(requestID string) []
 		}
 	})
 	return path
+}
+
+func serveUnclosedClientResponse(t *testing.T, response func(requestID string) []byte) string {
+	t.Helper()
+	path := filepath.Join(newPrivateProtocolDir(t), "unclosed-response.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		line, readErr := bufio.NewReader(connection).ReadBytes('\n')
+		if readErr != nil {
+			return
+		}
+		var request Request
+		if json.Unmarshal(bytes.TrimSuffix(line, []byte{'\n'}), &request) != nil {
+			return
+		}
+		if payload := response(request.RequestID); payload != nil {
+			_ = writeAll(connection, payload)
+		}
+		<-release
+	}()
+	t.Cleanup(func() {
+		close(release)
+		_ = listener.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("unclosed response server did not stop")
+		}
+	})
+	return path
+}
+
+func serveResponseAfterRequestEOF(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(newPrivateProtocolDir(t), "request-eof.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		frame, readErr := io.ReadAll(connection)
+		if readErr != nil || len(frame) == 0 || frame[len(frame)-1] != '\n' {
+			return
+		}
+		var request Request
+		if json.Unmarshal(frame[:len(frame)-1], &request) != nil {
+			return
+		}
+		_, _ = connection.Write(append(validStatusResponse(t, request.RequestID), '\n'))
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("request EOF server did not stop")
+		}
+	})
+	return path
+}
+
+func closeUnixWrite(t *testing.T, connection net.Conn) {
+	t.Helper()
+	unixConnection, ok := connection.(*net.UnixConn)
+	if !ok {
+		t.Fatalf("connection type = %T, want *net.UnixConn", connection)
+	}
+	if err := unixConnection.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -102,6 +102,42 @@ func TestApprovalExpires(t *testing.T) {
 	}
 }
 
+func TestExpiredApprovalRemovalZerosCommandBacking(t *testing.T) {
+	t.Run("direct consume", func(t *testing.T) {
+		now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+		store := newTestStore(t, &now)
+		created, err := store.Create("prod", []byte("cat /root/.ssh/id_rsa"), nil, testExecutionLimits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		commandBacking := store.items[created.ID].Command
+		now = created.ExpiresAt
+		if _, err := store.Consume(created.ID, created.Code); !errors.Is(err, ErrExpired) {
+			t.Fatalf("Consume() = %v, want ErrExpired", err)
+		}
+		if !bytes.Equal(commandBacking, make([]byte, len(commandBacking))) {
+			t.Fatalf("expired command backing was not zeroed: %q", commandBacking)
+		}
+	})
+
+	t.Run("opportunistic cleanup", func(t *testing.T) {
+		now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+		store := newTestStore(t, &now)
+		created, err := store.Create("prod", []byte("cat /root/.ssh/id_rsa"), nil, testExecutionLimits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		commandBacking := store.items[created.ID].Command
+		now = created.ExpiresAt
+		if _, err := store.Create("other", []byte("uptime"), nil, testExecutionLimits); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(commandBacking, make([]byte, len(commandBacking))) {
+			t.Fatalf("cleaned command backing was not zeroed: %q", commandBacking)
+		}
+	})
+}
+
 func TestExpiredApprovalTakesPriorityAndIsRemoved(t *testing.T) {
 	t.Run("wrong code", func(t *testing.T) {
 		now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
