@@ -52,6 +52,21 @@ func (client *Client) ExecuteApproved(ctx context.Context, request model.Approve
 	return result, err
 }
 
+// Lock asks the local daemon to clear its in-memory credentials and stop. It
+// is intentionally not part of the public MCP surface.
+func (client *Client) Lock(ctx context.Context) error {
+	var result struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := client.call(ctx, "lock", nil, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return ErrInvalidProtocol
+	}
+	return nil
+}
+
 func (client *Client) call(ctx context.Context, method string, params any, result any) error {
 	if client == nil || client.path == "" {
 		return ErrInvalidProtocol

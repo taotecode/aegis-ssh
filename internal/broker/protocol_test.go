@@ -30,6 +30,7 @@ type fakeProtocolService struct {
 	finished      chan struct{}
 	holdEntered   chan struct{}
 	holdRelease   chan struct{}
+	locked        chan struct{}
 }
 
 func (service *fakeProtocolService) Status(context.Context) (model.BrokerStatus, error) {
@@ -67,6 +68,12 @@ func (service *fakeProtocolService) ExecuteApproved(_ context.Context, request m
 	service.approved = append(service.approved, request)
 	service.mu.Unlock()
 	return model.ExecuteResult{Status: model.StatusCompleted, Stdout: "approved:" + request.ApprovalID}
+}
+
+func (service *fakeProtocolService) Lock(context.Context) {
+	if service.locked != nil {
+		close(service.locked)
+	}
 }
 
 func startProtocolServer(t *testing.T, service BrokerService) (string, context.CancelFunc, <-chan error) {
@@ -139,7 +146,7 @@ func waitForProtocolReachable(t *testing.T, ctx context.Context, path string, do
 }
 
 func TestProtocolDispatchesAllMethods(t *testing.T) {
-	service := &fakeProtocolService{}
+	service := &fakeProtocolService{locked: make(chan struct{})}
 	path, _, _ := startProtocolServer(t, service)
 	client := NewClient(path)
 	ctx := context.Background()
@@ -159,6 +166,14 @@ func TestProtocolDispatchesAllMethods(t *testing.T) {
 	approved, err := client.ExecuteApproved(ctx, model.ApprovedRequest{ApprovalID: "approval-1", ApprovalCode: "ABCD"})
 	if err != nil || approved.Status != model.StatusCompleted || approved.Stdout != "approved:approval-1" {
 		t.Fatalf("ExecuteApproved() = %+v, %v", approved, err)
+	}
+	if err := client.Lock(ctx); err != nil {
+		t.Fatalf("Lock() = %v", err)
+	}
+	select {
+	case <-service.locked:
+	case <-time.After(time.Second):
+		t.Fatal("Lock() response completed without invoking service lock")
 	}
 }
 

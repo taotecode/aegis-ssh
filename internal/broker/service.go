@@ -25,6 +25,8 @@ const (
 var ErrInvalidServiceOptions = errors.New("invalid broker service options")
 
 type SecretLookup interface {
+	// Lookup returns a caller-owned password buffer. The service clears it
+	// after each request.
 	Lookup(alias string) (vault.ServerSecret, bool)
 }
 
@@ -144,7 +146,6 @@ func (service *Service) Execute(ctx context.Context, request model.ExecuteReques
 	if !ok {
 		return failed(model.ErrValidation)
 	}
-	secret.Password = append([]byte(nil), secret.Password...)
 	defer vault.Zero(secret.Password)
 
 	analysis, err := service.analyzer.Analyze(request.Command)
@@ -198,7 +199,6 @@ func (service *Service) ExecuteApproved(ctx context.Context, request model.Appro
 	if !ok {
 		return failed(model.ErrValidation)
 	}
-	secret.Password = append([]byte(nil), secret.Password...)
 	defer vault.Zero(secret.Password)
 	return service.executeRemote(
 		ctx,

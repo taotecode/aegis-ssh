@@ -74,7 +74,9 @@ type sharedPasswordSecrets struct {
 }
 
 func (secrets *sharedPasswordSecrets) Lookup(string) (vault.ServerSecret, bool) {
-	return secrets.secret, true
+	secret := secrets.secret
+	secret.Password = append([]byte(nil), secret.Password...)
+	return secret, true
 }
 
 type passwordObservingExecutor struct {

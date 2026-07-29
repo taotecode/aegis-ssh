@@ -35,10 +35,16 @@ type Result struct {
 	Truncated bool
 }
 
-type Client struct{}
+type Client struct {
+	connectTimeout time.Duration
+}
 
 func New() *Client {
 	return &Client{}
+}
+
+func NewWithConnectTimeout(timeout time.Duration) *Client {
+	return &Client{connectTimeout: timeout}
 }
 
 func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command string, limits Limits) (Result, error) {
@@ -46,13 +52,21 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 		return Result{}, model.ErrValidation
 	}
 
-	opCtx, cancel := context.WithTimeout(ctx, limits.Timeout)
-	defer cancel()
+	var connectTimeout time.Duration
+	if c != nil {
+		connectTimeout = c.connectTimeout
+	}
+	if connectTimeout <= 0 {
+		connectTimeout = limits.Timeout
+	}
+	connectCtx, cancelConnect := context.WithTimeout(ctx, connectTimeout)
 
 	address := net.JoinHostPort(secret.Host, strconv.FormatUint(uint64(secret.Port), 10))
-	conn, err := (&net.Dialer{}).DialContext(opCtx, "tcp", address)
+	conn, err := (&net.Dialer{}).DialContext(connectCtx, "tcp", address)
 	if err != nil {
-		return Result{}, connectionError(opCtx)
+		result := connectionError(connectCtx)
+		cancelConnect()
+		return Result{}, result
 	}
 
 	hostKeyRejected := false
@@ -69,13 +83,18 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 		},
 	}
 
-	sshConn, channels, requests, err := handshake(opCtx, conn, address, config)
+	sshConn, channels, requests, err := handshake(connectCtx, conn, address, config)
 	if err != nil {
 		_ = conn.Close()
-		return Result{}, handshakeError(opCtx, err, hostKeyRejected)
+		result := handshakeError(connectCtx, err, hostKeyRejected)
+		cancelConnect()
+		return Result{}, result
 	}
+	cancelConnect()
 	client := ssh.NewClient(sshConn, channels, requests)
 	defer client.Close()
+	opCtx, cancel := context.WithTimeout(ctx, limits.Timeout)
+	defer cancel()
 
 	stopContextWatch := make(chan struct{})
 	var stopOnce sync.Once

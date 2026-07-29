@@ -23,6 +23,10 @@ type BrokerService interface {
 	ExecuteApproved(context.Context, model.ApprovedRequest) model.ExecuteResult
 }
 
+type lockService interface {
+	Lock(context.Context)
+}
+
 type Server struct {
 	path    string
 	service BrokerService
@@ -157,6 +161,9 @@ func (server *Server) handle(parent context.Context, connection net.Conn) {
 	// the request's SSH timeout rather than connection-read cancellation.
 	response = server.dispatch(parent, request)
 	writeResponse(connection, response)
+	if request.Method == "lock" && response.Error == nil {
+		server.service.(lockService).Lock(parent)
+	}
 }
 
 func (server *Server) dispatch(ctx context.Context, request Request) Response {
@@ -201,6 +208,16 @@ func (server *Server) dispatch(ctx context.Context, request Request) Response {
 			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid approved params")
 		}
 		return marshalResult(request.RequestID, server.service.ExecuteApproved(ctx, approved))
+	case "lock":
+		if len(request.Params) != 0 {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "lock params must be empty")
+		}
+		if _, ok := server.service.(lockService); !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		return marshalResult(request.RequestID, struct {
+			Accepted bool `json:"accepted"`
+		}{Accepted: true})
 	default:
 		return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
 	}
