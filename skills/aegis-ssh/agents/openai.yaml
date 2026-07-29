@@ -1,0 +1,4 @@
+interface:
+  display_name: "Aegis SSH"
+  short_description: "Operate password-only SSH servers by safe alias"
+  default_prompt: "Use $aegis-ssh to inspect a configured server by alias."

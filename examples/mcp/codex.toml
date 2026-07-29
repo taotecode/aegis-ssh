@@ -1,0 +1,3 @@
+[mcp_servers.aegis-ssh]
+command = "aegis-ssh"
+args = ["mcp"]
