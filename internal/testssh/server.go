@@ -43,16 +43,6 @@ type Server struct {
 
 func Start(t testing.TB, username, password string) *Server {
 	t.Helper()
-
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate SSH host key: %v", err)
-	}
-	signer, err := ssh.NewSignerFromKey(privateKey)
-	if err != nil {
-		t.Fatalf("create SSH host signer: %v", err)
-	}
-
 	config := &ssh.ServerConfig{
 		PasswordCallback: func(metadata ssh.ConnMetadata, candidate []byte) (*ssh.Permissions, error) {
 			userOK := subtle.ConstantTimeCompare([]byte(metadata.User()), []byte(username)) == 1
@@ -65,6 +55,37 @@ func Start(t testing.TB, username, password string) *Server {
 		PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 			return nil, errors.New("public key authentication rejected")
 		},
+	}
+	return start(t, config)
+}
+
+func StartWithPublicKey(t testing.TB, username string, authorizedKey ssh.PublicKey) *Server {
+	t.Helper()
+	config := &ssh.ServerConfig{
+		PasswordCallback: func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
+			return nil, errors.New("password authentication rejected")
+		},
+		PublicKeyCallback: func(metadata ssh.ConnMetadata, candidate ssh.PublicKey) (*ssh.Permissions, error) {
+			userOK := subtle.ConstantTimeCompare([]byte(metadata.User()), []byte(username)) == 1
+			keyOK := authorizedKey != nil && subtle.ConstantTimeCompare(candidate.Marshal(), authorizedKey.Marshal()) == 1
+			if userOK && keyOK {
+				return nil, nil
+			}
+			return nil, errors.New("public key authentication rejected")
+		},
+	}
+	return start(t, config)
+}
+
+func start(t testing.TB, config *ssh.ServerConfig) *Server {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
 	}
 	config.AddHostKey(signer)
 

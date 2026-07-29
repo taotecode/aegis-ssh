@@ -146,7 +146,7 @@ func (service *Service) Execute(ctx context.Context, request model.ExecuteReques
 	if !ok {
 		return failed(model.ErrValidation)
 	}
-	defer vault.Zero(secret.Password)
+	defer vault.ZeroServerSecret(&secret)
 
 	analysis, err := service.analyzer.Analyze(request.Command)
 	if err != nil {
@@ -199,7 +199,7 @@ func (service *Service) ExecuteApproved(ctx context.Context, request model.Appro
 	if !ok {
 		return failed(model.ErrValidation)
 	}
-	defer vault.Zero(secret.Password)
+	defer vault.ZeroServerSecret(&secret)
 	return service.executeRemote(
 		ctx,
 		approvalRequestID(approved.ID),

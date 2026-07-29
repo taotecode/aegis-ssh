@@ -4,7 +4,7 @@ English | [简体中文](SECURITY.zh-CN.md)
 
 ## Boundary
 
-Aegis SSH protects password-only connection details from normal AI-agent interfaces. Credentials are encrypted at rest, entered through `/dev/tty`, held by the daemon, and omitted from MCP schemas, CLI arguments, logs, and public result types. SSH host keys are pinned and checked on every connection.
+Aegis SSH protects password- and private-key-based connection details from normal AI-agent interfaces. Credentials are encrypted at rest, entered or imported through `/dev/tty`, held by the daemon, and omitted from MCP schemas, CLI arguments, logs, and public result types. Imported private-key contents and passphrases are encrypted in the vault; the source key path is not stored. SSH host keys are pinned and checked on every connection.
 
 This is credential isolation and best-effort disclosure control, not a remote shell sandbox.
 
@@ -21,7 +21,7 @@ The broker cannot cryptographically prove that an approval reply came from a hum
 - Keep `~/.aegis-ssh`, backups, and the local user account private.
 - Stop the daemon with `aegis-ssh lock` when it is not needed.
 - Verify host-key fingerprints through a trusted channel before enrollment.
-- Do not pass passwords through flags, environment variables, prompts, or MCP configuration.
+- Do not pass passwords, private keys, private-key paths, or passphrases through flags, environment variables, prompts, or MCP configuration.
 - Treat redaction markers as final; do not ask an agent to bypass them.
 - Back up `config.yaml` and `vault.enc` together while the daemon is stopped.
 
@@ -29,7 +29,7 @@ The broker cannot cryptographically prove that an approval reply came from a hum
 
 Share only the output of `aegis-ssh status`, public aliases from `aegis-ssh server list`, error codes, and audit lines reviewed to contain only aliases, command hashes/previews, decisions, and redaction counts. Preserve every redaction marker.
 
-Never share `vault.enc`, master or SSH passwords, process memory/core dumps, socket traffic, terminal recordings from enrollment, or raw remote output that triggered approval. Remove private aliases and command previews from public reports when they identify infrastructure or workloads.
+Never share `vault.enc`, master or SSH passwords, private keys, private-key passphrases or source paths, process memory/core dumps, socket traffic, terminal recordings from enrollment, or raw remote output that triggered approval. Remove private aliases and command previews from public reports when they identify infrastructure or workloads.
 
 ## Reporting
 

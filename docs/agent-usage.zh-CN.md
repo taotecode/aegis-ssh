@@ -1,0 +1,148 @@
+# 让 Agent 使用 Aegis SSH
+
+[English](agent-usage.md) | 简体中文
+
+本文介绍添加一台或多台服务器后，如何让 AI Agent 使用 Aegis SSH。Agent 只能看到 `prod` 之类的公开别名；密码认证和私钥认证都由本地 broker 处理，对 Agent 的使用方式完全相同。
+
+## MCP 与 Skill 的关系
+
+Aegis SSH 提供两种互补的 Agent 集成：
+
+- **MCP 是实际的工具传输层。** Agent 通过四个 MCP 工具查询 broker、列出别名、执行命令，以及完成已经由用户批准的命令。
+- **Skill 是行为说明。** 它指导支持 Skill 的 Agent 优先使用 MCP、只通过别名访问服务器、等待用户真实批准，并保留脱敏标记。
+
+Agent 要直接调用工具，必须配置 MCP。Skill 推荐安装，但不能替代 MCP。不支持 Skill 的客户端也可以只通过 MCP 使用 Aegis SSH。
+
+出于机密隔离目的，MCP 不提供服务器添加或修改工具。请由用户在真实终端中执行 `aegis-ssh init`、`server add`、`server edit` 和 `server remove`，使连接信息和凭据只通过 `/dev/tty` 输入。完整流程见[添加和管理 SSH 服务器](server-setup.zh-CN.md)。
+
+## 为 Codex 配置
+
+在源码目录或解压后的 Release 目录中安装二进制文件和 Skill：
+
+```bash
+scripts/install.sh --binary ./aegis-ssh --skill-dir "$HOME/.codex/skills"
+```
+
+如果需要直接从源码构建，可以省略 `--binary ./aegis-ssh`：
+
+```bash
+scripts/install.sh --skill-dir "$HOME/.codex/skills"
+```
+
+使用二进制文件的绝对路径注册 MCP：
+
+```bash
+codex mcp add aegis-ssh -- "$HOME/.local/bin/aegis-ssh" mcp
+codex mcp list
+```
+
+安装或更新 Skill、修改 MCP 配置后，请重新启动 Codex。已经运行的 Codex 会话不一定能发现启动后才发生的配置变化。
+
+## 启动 Broker
+
+要求 Agent 连接前，在单独终端中启动并解锁前台 daemon：
+
+```bash
+aegis-ssh daemon
+```
+
+在隐藏提示中输入本地主密码，并保持该终端运行。MCP 进程本身不会解锁 vault，而是与这个本地 daemon 通信。
+
+使用结束后，停止 daemon 并清除内存中的凭据：
+
+```bash
+aegis-ssh lock
+```
+
+## 向 Agent 下达任务
+
+提示词中只使用已经配置的别名，不要填写服务器地址、端口、用户名、密码、私钥、私钥口令或主机指纹。
+
+中文示例：
+
+```text
+使用 Aegis SSH 列出已经配置的服务器。
+使用 Aegis SSH 在 prod 上执行 uptime。
+使用 Aegis SSH 在 staging 上执行 `cd /srv/app && git status --short`。
+使用 Aegis SSH 检查 db-primary 的磁盘使用情况并总结结果。
+```
+
+英文示例：
+
+```text
+Use Aegis SSH to list the configured servers.
+Use Aegis SSH to run uptime on prod.
+Use Aegis SSH to run `cd /srv/app && git status --short` on staging.
+```
+
+密码服务器和私钥服务器的提示词完全相同。Agent 不需要知道某个别名使用哪种认证方式。
+
+## 工具调用流程
+
+正常请求应使用以下流程：
+
+```text
+get_ssh_broker_status
+        |
+        v
+list_ssh_servers        （别名未知或需要确认时）
+        |
+        v
+ssh_execute
+        |
+        +--> completed：返回过滤后的输出
+        |
+        +--> requires_approval：显示批准消息并等待用户
+                                      |
+                                      v
+                              ssh_execute_approved
+```
+
+四个 MCP 工具分别是：
+
+| 工具 | 用途 |
+| --- | --- |
+| `get_ssh_broker_status` | 检查 daemon 是否可访问、vault 是否已经解锁。 |
+| `list_ssh_servers` | 列出公开别名、描述和可用状态。 |
+| `ssh_execute` | 通过别名执行一条完整、非交互式命令。 |
+| `ssh_execute_approved` | 在用户精确确认后，执行已经保存的原命令；不能传入替换命令。 |
+
+## 批准流程
+
+有些命令可能暴露服务器敏感信息。第一次调用会返回 `requires_approval` 和类似以下内容的消息：
+
+```text
+检测到风险类别：network。请由用户确认后回复：允许 ABCD
+```
+
+Agent 必须原样显示该消息并停止。用户决定允许时，需要精确回复：
+
+```text
+允许 ABCD
+```
+
+收到完全一致的用户回复后，Agent 才能使用返回的一次性批准 ID 和代码调用 `ssh_execute_approved`。Agent 不得代替用户批准。批准有效期为五分钟、只能使用一次，并与原始别名、命令和执行限制绑定；修改命令后必须重新申请批准。
+
+批准后，命令输出仍会经过过滤。必须原样保留所有 `[REDACTED:...]` 标记和截断警告，不得要求 Agent 还原隐藏内容。
+
+## 其他 Agent 客户端
+
+所有客户端都启动同一个 stdio 命令：
+
+```text
+$HOME/.local/bin/aegis-ssh mcp
+```
+
+`examples/mcp/` 提供 Codex、Claude Code、Cursor 和 OpenClaw 的配置示例。将对应示例合并到客户端的 MCP 配置；如果客户端不会继承 Shell 的 `PATH`，请使用二进制文件的绝对路径。修改配置后重新启动客户端。
+
+支持可复用 Skill 的客户端可以加载 `skills/aegis-ssh`。不支持 Skill 的客户端可以依靠 MCP 工具说明和本文流程使用。
+
+## 故障排查
+
+- 找不到 MCP：检查 `codex mcp list` 或对应客户端配置，使用二进制绝对路径，然后重新启动客户端。
+- 提示 `daemon: unavailable`：在单独终端中运行 `aegis-ssh daemon` 并保持运行。
+- vault 未解锁：在 daemon 所在终端输入主密码，绝不能在 Agent 对话中输入。
+- 找不到别名：停止 daemon，在真实终端中运行 `aegis-ssh server add`，然后重新启动 daemon。
+- 认证失败：停止 daemon，运行 `aegis-ssh server edit <alias>` 替换密码或私钥。
+- 批准失败：重新提出原始请求，并在新代码过期前精确回复。
+- 输出被脱敏或截断：这是主动设置的数据披露边界，不是 MCP 传输故障。

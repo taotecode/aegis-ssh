@@ -3,6 +3,9 @@ package app_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"os"
 	"path/filepath"
@@ -17,6 +20,7 @@ import (
 	"github.com/taotecode/aegis-ssh/internal/model"
 	"github.com/taotecode/aegis-ssh/internal/testssh"
 	"github.com/taotecode/aegis-ssh/internal/vault"
+	"golang.org/x/crypto/ssh"
 )
 
 type fakeProbe struct {
@@ -67,6 +71,7 @@ func TestSecretArgumentsAndEnvironmentAreRejected(t *testing.T) {
 		{"server", "add", "--password", "pw"},
 		{"server", "add", "--host=secret.example"},
 		{"server", "edit", "prod", "--user", "root"},
+		{"server", "add", "--private-key", "/secret/key"},
 	} {
 		if err := application.Run(context.Background(), args); !errors.Is(err, app.ErrSecretArgument) {
 			t.Fatalf("Run(%q) = %v", args, err)
@@ -85,26 +90,37 @@ func TestServerLifecycleDoesNotExposeConnectionValues(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".aegis-ssh")
 	var stdout, stderr bytes.Buffer
 	master := "master fixture"
+	privateKey := privateKeyPEM(t, nil)
 	queue := &terminalQueue{terminals: []*fakeTerminal{
 		{secretAnswers: [][]byte{[]byte(master), []byte(master)}},
 		{
 			secretAnswers: [][]byte{[]byte(master), []byte("ssh-password-one")},
-			lineAnswers:   []string{"prod", "Production", "secret-host-one", "2222", "root-one", "TRUST"},
+			lineAnswers:   []string{"prod", "Production", "secret-host-one", "2222", "root-one", "password", "TRUST"},
+		},
+		{
+			secretAnswers: [][]byte{[]byte(master)},
+			lineAnswers:   []string{"staging", "Staging", "secret-key-host", "22", "deploy", "private-key", "TRUST", "/secret/id_ed25519"},
 		},
 		{
 			secretAnswers: [][]byte{[]byte(master), []byte("ssh-password-two")},
-			lineAnswers:   []string{"Updated", "secret-host-two", "2200", "root-two", "TRUST"},
+			lineAnswers:   []string{"Updated", "secret-host-two", "2200", "root-two", "password", "TRUST"},
 		},
 		{secretAnswers: [][]byte{[]byte(master)}, lineAnswers: []string{"prod"}},
 	}}
 	application := app.New(app.Dependencies{
 		Root: root, Stdout: &stdout, Stderr: &stderr, OpenTerminal: queue.open,
 		HostKeyProbe: fakeProbe{fingerprint: "SHA256:secret-fixture-fingerprint"},
+		ReadPrivateKey: func(path string) ([]byte, error) {
+			if path != "/secret/id_ed25519" {
+				return nil, app.ErrPrivateKey
+			}
+			return append([]byte(nil), privateKey...), nil
+		},
 		BrokerClient: func(string) app.BrokerClient { return unavailableBroker{} },
 	})
 
 	commands := [][]string{
-		{"init"}, {"server", "add"}, {"server", "list"},
+		{"init"}, {"server", "add"}, {"server", "add"}, {"server", "list"},
 		{"server", "edit", "prod"}, {"server", "list"}, {"server", "remove", "prod"}, {"server", "list"},
 	}
 	for _, command := range commands {
@@ -117,8 +133,8 @@ func TestServerLifecycleDoesNotExposeConnectionValues(t *testing.T) {
 		t.Fatalf("public alias missing from output: %q", output)
 	}
 	for _, secret := range []string{
-		"secret-host-one", "secret-host-two", "root-one", "root-two",
-		"ssh-password-one", "ssh-password-two", "SHA256:secret-fixture-fingerprint", master,
+		"secret-host-one", "secret-host-two", "secret-key-host", "root-one", "root-two", "deploy",
+		"ssh-password-one", "ssh-password-two", "/secret/id_ed25519", "SHA256:secret-fixture-fingerprint", master,
 	} {
 		if strings.Contains(output, secret) {
 			t.Fatalf("stdout/stderr leaked %q: %q", secret, output)
@@ -131,6 +147,54 @@ func TestServerLifecycleDoesNotExposeConnectionValues(t *testing.T) {
 	}
 	if info, err := os.Stat(root); err != nil || info.Mode().Perm() != 0o700 {
 		t.Fatalf("root permissions = %v, %v", info, err)
+	}
+	data, err := (vault.Store{Path: filepath.Join(root, "vault.enc")}).Load([]byte(master))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for alias, secret := range data.Servers {
+			vault.ZeroServerSecret(&secret)
+			delete(data.Servers, alias)
+		}
+	}()
+	staging, ok := data.Servers["staging"]
+	if !ok || len(data.Servers) != 1 || staging.EffectiveAuthMethod() != vault.AuthMethodPrivateKey || len(staging.PrivateKey) == 0 || len(staging.Password) != 0 {
+		t.Fatalf("remaining multi-server key entry = method %q aliases=%d", staging.EffectiveAuthMethod(), len(data.Servers))
+	}
+}
+
+func TestAddEncryptedPrivateKeyServerPromptsForPassphrase(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".aegis-ssh")
+	master := "master fixture"
+	passphrase := []byte("private-key-passphrase")
+	privateKey := privateKeyPEM(t, passphrase)
+	queue := &terminalQueue{terminals: []*fakeTerminal{
+		{secretAnswers: [][]byte{[]byte(master), []byte(master)}},
+		{
+			secretAnswers: [][]byte{[]byte(master), append([]byte(nil), passphrase...)},
+			lineAnswers:   []string{"key-prod", "Key server", "secret-key-host", "22", "deploy", "private-key", "TRUST", "~/.ssh/id_ed25519"},
+		},
+	}}
+	application := app.New(app.Dependencies{
+		Root: root, Stdout: ioDiscard{}, Stderr: ioDiscard{}, OpenTerminal: queue.open,
+		HostKeyProbe:   fakeProbe{fingerprint: "SHA256:fixture"},
+		ReadPrivateKey: func(string) ([]byte, error) { return append([]byte(nil), privateKey...), nil },
+	})
+	if err := application.Run(context.Background(), []string{"init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Run(context.Background(), []string{"server", "add"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := (vault.Store{Path: filepath.Join(root, "vault.enc")}).Load([]byte(master))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := data.Servers["key-prod"]
+	defer vault.ZeroServerSecret(&secret)
+	if secret.EffectiveAuthMethod() != vault.AuthMethodPrivateKey || string(secret.PrivateKeyPassphrase) != string(passphrase) {
+		t.Fatalf("stored key credential = method %q passphrase length %d", secret.EffectiveAuthMethod(), len(secret.PrivateKeyPassphrase))
 	}
 }
 
@@ -238,7 +302,7 @@ func TestDaemonRejectsConfigVaultAliasMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, secret := range data.Servers {
-		vault.Zero(secret.Password)
+		vault.ZeroServerSecret(&secret)
 	}
 }
 
@@ -294,3 +358,21 @@ func waitForDaemon(t *testing.T, client *broker.Client, done <-chan error) {
 type ioDiscard struct{}
 
 func (ioDiscard) Write(data []byte) (int, error) { return len(data), nil }
+
+func privateKeyPEM(t *testing.T, passphrase []byte) []byte {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var block *pem.Block
+	if len(passphrase) == 0 {
+		block, err = ssh.MarshalPrivateKey(privateKey, "aegis-ssh-app-test")
+	} else {
+		block, err = ssh.MarshalPrivateKeyWithPassphrase(privateKey, "aegis-ssh-app-test", passphrase)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(block)
+}

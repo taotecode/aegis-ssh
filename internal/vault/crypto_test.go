@@ -29,6 +29,11 @@ func TestSealOpenRoundTrip(t *testing.T) {
 			Password:        []byte("correct horse battery staple"),
 			HostFingerprint: "SHA256:abcdefghijklmnopqrstuvwxyz",
 		},
+		"key-prod": {
+			Host: "key.internal.example", Port: 22, User: "deploy",
+			AuthMethod: AuthMethodPrivateKey, PrivateKey: []byte("private-key"),
+			PrivateKeyPassphrase: []byte("key-passphrase"), HostFingerprint: "SHA256:key-fingerprint",
+		},
 	}}
 
 	sealed, err := Seal([]byte("master password"), want, testKDFParams)
@@ -41,6 +46,26 @@ func TestSealOpenRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Open() = %#v, want %#v", got, want)
+	}
+}
+
+func TestServerSecretLegacyAuthCloneAndZero(t *testing.T) {
+	legacy := ServerSecret{Password: []byte("legacy-password")}
+	if legacy.EffectiveAuthMethod() != AuthMethodPassword {
+		t.Fatalf("legacy method = %q", legacy.EffectiveAuthMethod())
+	}
+	original := ServerSecret{
+		AuthMethod: AuthMethodPrivateKey, PrivateKey: []byte("private-key"), PrivateKeyPassphrase: []byte("passphrase"),
+	}
+	cloned := CloneServerSecret(original)
+	if !reflect.DeepEqual(cloned, original) || &cloned.PrivateKey[0] == &original.PrivateKey[0] || &cloned.PrivateKeyPassphrase[0] == &original.PrivateKeyPassphrase[0] {
+		t.Fatal("CloneServerSecret did not make independent credential copies")
+	}
+	keyReference := cloned.PrivateKey
+	passphraseReference := cloned.PrivateKeyPassphrase
+	ZeroServerSecret(&cloned)
+	if cloned.PrivateKey != nil || cloned.PrivateKeyPassphrase != nil || !bytes.Equal(keyReference, make([]byte, len(keyReference))) || !bytes.Equal(passphraseReference, make([]byte, len(passphraseReference))) {
+		t.Fatal("ZeroServerSecret did not clear private-key credentials")
 	}
 }
 

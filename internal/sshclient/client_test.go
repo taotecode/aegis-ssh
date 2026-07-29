@@ -2,6 +2,9 @@ package sshclient_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"net"
 	"strconv"
@@ -14,6 +17,7 @@ import (
 	"github.com/taotecode/aegis-ssh/internal/sshclient"
 	"github.com/taotecode/aegis-ssh/internal/testssh"
 	"github.com/taotecode/aegis-ssh/internal/vault"
+	"golang.org/x/crypto/ssh"
 )
 
 var _ int64 = sshclient.Limits{}.MaxOutputBytes
@@ -32,6 +36,55 @@ func TestExecutePasswordAuthenticatedCommand(t *testing.T) {
 	if result.Stdout != "ok" || result.Stderr != "" || result.ExitCode != 0 || result.Truncated {
 		t.Fatalf("Execute() = %#v", result)
 	}
+}
+
+func TestExecutePrivateKeyAuthenticatedCommand(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		passphrase []byte
+	}{
+		{name: "unencrypted"},
+		{name: "encrypted", passphrase: []byte("synthetic-key-passphrase")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			privateKey, publicKey := privateKeyFixture(t, test.passphrase)
+			server := testssh.StartWithPublicKey(t, "deploy", publicKey)
+			secret := vault.ServerSecret{
+				Host: server.Host, Port: server.Port, User: "deploy",
+				AuthMethod: vault.AuthMethodPrivateKey, PrivateKey: privateKey,
+				PrivateKeyPassphrase: append([]byte(nil), test.passphrase...),
+				HostFingerprint:      server.Fingerprint,
+			}
+
+			result, err := sshclient.New().Execute(context.Background(), secret, "printf ok", testLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Stdout != "ok" || result.Stderr != "" || result.ExitCode != 0 || result.Truncated {
+				t.Fatalf("Execute() = %#v", result)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsInvalidOrUnauthorizedPrivateKey(t *testing.T) {
+	correctKey, correctPublicKey := privateKeyFixture(t, []byte("correct-passphrase"))
+	server := testssh.StartWithPublicKey(t, "deploy", correctPublicKey)
+
+	wrongPassphrase := vault.ServerSecret{
+		Host: server.Host, Port: server.Port, User: "deploy", AuthMethod: vault.AuthMethodPrivateKey,
+		PrivateKey: correctKey, PrivateKeyPassphrase: []byte("wrong-passphrase"), HostFingerprint: server.Fingerprint,
+	}
+	_, err := sshclient.New().Execute(context.Background(), wrongPassphrase, "printf ok", testLimits())
+	assertSanitizedError(t, err, model.ErrAuthentication, wrongPassphrase)
+
+	unauthorizedKey, _ := privateKeyFixture(t, nil)
+	unauthorized := vault.ServerSecret{
+		Host: server.Host, Port: server.Port, User: "deploy", AuthMethod: vault.AuthMethodPrivateKey,
+		PrivateKey: unauthorizedKey, HostFingerprint: server.Fingerprint,
+	}
+	_, err = sshclient.New().Execute(context.Background(), unauthorized, "printf ok", testLimits())
+	assertSanitizedError(t, err, model.ErrAuthentication, unauthorized)
 }
 
 func TestExecuteRejectsWrongPassword(t *testing.T) {
@@ -215,6 +268,10 @@ func TestExecuteValidatesInputs(t *testing.T) {
 		{name: "zero port", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.Port = 0 }), command: "true", limits: validLimits},
 		{name: "empty user", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.User = "" }), command: "true", limits: validLimits},
 		{name: "empty password", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.Password = nil }), command: "true", limits: validLimits},
+		{name: "unknown auth method", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.AuthMethod = "agent" }), command: "true", limits: validLimits},
+		{name: "password with private key", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.PrivateKey = []byte("key") }), command: "true", limits: validLimits},
+		{name: "private key missing", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.AuthMethod = vault.AuthMethodPrivateKey; s.Password = nil }), command: "true", limits: validLimits},
+		{name: "private key with password", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.AuthMethod = vault.AuthMethodPrivateKey; s.PrivateKey = []byte("key") }), command: "true", limits: validLimits},
 		{name: "empty fingerprint", secret: mutateSecret(validSecret, func(s *vault.ServerSecret) { s.HostFingerprint = "" }), command: "true", limits: validLimits},
 		{name: "empty command", secret: validSecret, command: "", limits: validLimits},
 		{name: "zero timeout", secret: validSecret, command: "true", limits: sshclient.Limits{MaxOutputBytes: 1}},
@@ -318,8 +375,7 @@ func TestExecuteClassifiesAndSanitizesInvalidSSHProtocol(t *testing.T) {
 }
 
 func mutateSecret(secret vault.ServerSecret, mutate func(*vault.ServerSecret)) vault.ServerSecret {
-	copy := secret
-	copy.Password = append([]byte(nil), secret.Password...)
+	copy := vault.CloneServerSecret(secret)
 	mutate(&copy)
 	return copy
 }
@@ -376,6 +432,8 @@ func assertSanitizedError(t *testing.T, err error, want error, secret vault.Serv
 		strconv.FormatUint(uint64(secret.Port), 10),
 		secret.User,
 		string(secret.Password),
+		string(secret.PrivateKey),
+		string(secret.PrivateKeyPassphrase),
 		secret.HostFingerprint,
 		net.JoinHostPort(secret.Host, strconv.FormatUint(uint64(secret.Port), 10)),
 	} {
@@ -383,4 +441,26 @@ func assertSanitizedError(t *testing.T, err error, want error, secret vault.Serv
 			t.Fatalf("error %q contains sensitive value %q", message, sensitive)
 		}
 	}
+}
+
+func privateKeyFixture(t *testing.T, passphrase []byte) ([]byte, ssh.PublicKey) {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var block *pem.Block
+	if len(passphrase) == 0 {
+		block, err = ssh.MarshalPrivateKey(privateKey, "aegis-ssh-test")
+	} else {
+		block, err = ssh.MarshalPrivateKeyWithPassphrase(privateKey, "aegis-ssh-test", passphrase)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(block), signer.PublicKey()
 }

@@ -2,9 +2,9 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Aegis SSH is a lightweight local broker for AI agents that must operate password-only SSH servers without putting connection details in prompts, MCP parameters, logs, environment variables, or process arguments.
+Aegis SSH is a lightweight local broker for AI agents that operate password- or private-key-authenticated SSH servers without putting connection details or credentials in prompts, MCP parameters, logs, environment variables, or process arguments.
 
-It is one Go binary for macOS and Linux. Agents use public aliases through standard MCP; the foreground daemon owns the decrypted vault and performs password authentication with the Go SSH library.
+It is one Go binary for macOS and Linux. Agents use public aliases through standard MCP; the foreground daemon owns the decrypted vault and performs SSH authentication with the Go SSH library.
 
 ## Install
 
@@ -31,14 +31,41 @@ Create encrypted local storage and choose a master password:
 aegis-ssh init
 ```
 
-Enroll a password-only server. Address, port, username, and password are read interactively from `/dev/tty`. Verify the displayed SSH host-key fingerprint before typing `TRUST`.
+Run `server add` once for each server. Every server gets a unique public alias, so the same vault can hold `prod`, `staging`, `db-primary`, and any other servers you add.
 
 ```bash
 aegis-ssh server add
 aegis-ssh server list
 ```
 
-See [Add And Manage SSH Servers](docs/server-setup.md) for every prompt, trusted host-key verification, testing, password rotation, removal, and troubleshooting.
+Password authentication prompts:
+
+```text
+Master password: [hidden]
+Alias: prod
+Description: Production application server
+Host: <server-host>
+Port: 22
+User: <ssh-user>
+Authentication method (password/private-key): password
+Host key fingerprint: SHA256:<fingerprint>
+Type TRUST to pin this host key: TRUST
+SSH password: [hidden]
+```
+
+Private-key authentication uses the same fields, but select `private-key`:
+
+```text
+Authentication method (password/private-key): private-key
+Host key fingerprint: SHA256:<fingerprint>
+Type TRUST to pin this host key: TRUST
+Private key file: ~/.ssh/id_ed25519
+Private key passphrase: [hidden, prompted only when the key is encrypted]
+```
+
+The private key file is read locally, validated, and imported into `vault.enc`; its path is not stored. All connection fields are read from `/dev/tty`. Verify the displayed host-key fingerprint through a trusted channel before typing `TRUST`.
+
+See [Add And Manage SSH Servers](docs/server-setup.md) for multiple-server examples, every prompt, key-file requirements, trusted host-key verification, credential rotation, removal, and troubleshooting.
 
 Edit or remove an alias only while the daemon is stopped:
 
@@ -77,6 +104,15 @@ Every supported client launches the same stdio server:
 aegis-ssh mcp
 ```
 
+Register it in Codex with the installed binary's absolute path:
+
+```bash
+codex mcp add aegis-ssh -- "$HOME/.local/bin/aegis-ssh" mcp
+codex mcp list
+```
+
+Restart Codex after installing or updating the MCP configuration or Skill.
+
 Copy the matching example from `examples/mcp/` into the client's MCP configuration:
 
 - `codex.toml`
@@ -87,6 +123,16 @@ Copy the matching example from `examples/mcp/` into the client's MCP configurati
 The tools are `get_ssh_broker_status`, `list_ssh_servers`, `ssh_execute`, and `ssh_execute_approved`. They expose aliases and filtered command results, never connection fields.
 
 Install `skills/aegis-ssh` into the agent's Skill directory or point the client at that directory. The Skill tells agents to prefer MCP, wait for real user approval, and preserve redaction markers.
+
+After starting `aegis-ssh daemon`, ask the Agent by alias:
+
+```text
+Use Aegis SSH to list the configured servers.
+Use Aegis SSH to run uptime on prod.
+Use Aegis SSH to run `cd /srv/app && git status --short` on staging.
+```
+
+See [Use Aegis SSH With Agents](docs/agent-usage.md) for Codex setup, the MCP/Skill relationship, tool-call flow, prompt examples, approvals, and troubleshooting.
 
 ## Storage And Operations
 
@@ -99,14 +145,14 @@ State is stored under `~/.aegis-ssh/` with private permissions:
 
 Back up `config.yaml` and `vault.enc` together while the daemon is stopped. Keep the backup private. The master password is not recoverable; losing it makes the vault unusable.
 
-Rotate a server password with `aegis-ssh server edit <alias>`, then restart `aegis-ssh daemon`. Reconfirm the host key only against a trusted source.
+Rotate a server password or replace a private key with `aegis-ssh server edit <alias>`, then restart `aegis-ssh daemon`. Reconfirm the host key only against a trusted source.
 
 ## Troubleshooting
 
 - `daemon: unavailable`: run `aegis-ssh daemon` in a separate terminal.
 - `credential vault is locked` or storage failure at startup: verify the master password and private ownership/modes under `~/.aegis-ssh`.
 - Host-key verification failure: stop and investigate the server identity; do not bypass pinning.
-- Authentication failure: stop the daemon, run `server edit`, and enter the current password.
+- Authentication failure: stop the daemon, run `server edit`, and enter the current password or import the current private key.
 - Server changes are refused: run `aegis-ssh lock`, then retry the management command.
 - Output contains `[REDACTED:...]`: the broker intentionally withheld sensitive data. Do not attempt to reconstruct it.
 

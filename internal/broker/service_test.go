@@ -65,8 +65,7 @@ type memorySecrets struct {
 
 func (secrets memorySecrets) Lookup(alias string) (vault.ServerSecret, bool) {
 	secret, ok := secrets.servers[alias]
-	secret.Password = append([]byte(nil), secret.Password...)
-	return secret, ok
+	return vault.CloneServerSecret(secret), ok
 }
 
 type sharedPasswordSecrets struct {
@@ -74,9 +73,7 @@ type sharedPasswordSecrets struct {
 }
 
 func (secrets *sharedPasswordSecrets) Lookup(string) (vault.ServerSecret, bool) {
-	secret := secrets.secret
-	secret.Password = append([]byte(nil), secret.Password...)
-	return secret, true
+	return vault.CloneServerSecret(secrets.secret), true
 }
 
 type passwordObservingExecutor struct {

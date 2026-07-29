@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version       = "0.1.0"
+	Version       = "0.2.0"
 	PolicyVersion = "1"
 
 	defaultConnectTimeout = 10 * time.Second
@@ -46,6 +46,8 @@ var (
 	ErrDaemonUnavailable  = errors.New("broker daemon unavailable")
 	ErrInvalidAlias       = errors.New("invalid server alias")
 	ErrInvalidServer      = errors.New("invalid server details")
+	ErrInvalidAuthMethod  = errors.New("authentication method must be password or private-key")
+	ErrPrivateKey         = errors.New("unable to load SSH private key")
 	ErrServerExists       = errors.New("server alias already exists")
 	ErrServerNotFound     = errors.New("server alias not found")
 	ErrHostKeyProbe       = errors.New("unable to probe SSH host key")
@@ -63,12 +65,13 @@ type BrokerClient interface {
 }
 
 type Dependencies struct {
-	Root         string
-	Stdout       io.Writer
-	Stderr       io.Writer
-	OpenTerminal func() (Terminal, error)
-	HostKeyProbe HostKeyProbe
-	BrokerClient func(string) BrokerClient
+	Root           string
+	Stdout         io.Writer
+	Stderr         io.Writer
+	OpenTerminal   func() (Terminal, error)
+	HostKeyProbe   HostKeyProbe
+	ReadPrivateKey func(string) ([]byte, error)
+	BrokerClient   func(string) BrokerClient
 }
 
 type App struct {
@@ -87,6 +90,9 @@ func New(deps Dependencies) *App {
 	}
 	if deps.HostKeyProbe == nil {
 		deps.HostKeyProbe = SSHHostKeyProbe{}
+	}
+	if deps.ReadPrivateKey == nil {
+		deps.ReadPrivateKey = readPrivateKeyFile
 	}
 	if deps.BrokerClient == nil {
 		deps.BrokerClient = func(path string) BrokerClient { return broker.NewClient(path) }
@@ -266,7 +272,7 @@ func (application *App) editServer(ctx context.Context, alias string) error {
 			return err
 		}
 		old := data.Servers[alias]
-		vault.Zero(old.Password)
+		vault.ZeroServerSecret(&old)
 		cfg.Servers[alias] = config.ServerPublic{Description: description}
 		data.Servers[alias] = secret
 		return nil
@@ -293,7 +299,7 @@ func (application *App) removeServer(ctx context.Context, alias string) error {
 			return ErrUsage
 		}
 		secret := data.Servers[alias]
-		vault.Zero(secret.Password)
+		vault.ZeroServerSecret(&secret)
 		delete(cfg.Servers, alias)
 		delete(data.Servers, alias)
 		return nil
@@ -325,6 +331,11 @@ func (application *App) readServer(ctx context.Context, terminal Terminal) (stri
 	if err != nil || user == "" {
 		return "", vault.ServerSecret{}, ErrInvalidServer
 	}
+	authText, err := ReadText(terminal, "Authentication method (password/private-key): ")
+	method := vault.AuthMethod(authText)
+	if err != nil || !validAuthMethod(method) {
+		return "", vault.ServerSecret{}, ErrInvalidAuthMethod
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, defaultConnectTimeout)
 	fingerprint, err := application.deps.HostKeyProbe.Probe(probeCtx, host, uint16(portValue))
 	cancel()
@@ -339,14 +350,15 @@ func (application *App) readServer(ctx context.Context, terminal Terminal) (stri
 	if !confirmed {
 		return "", vault.ServerSecret{}, ErrHostKeyUnconfirmed
 	}
-	password, err := ReadSecret(terminal, "SSH password: ")
+	secret, err := application.readAuthentication(terminal, method)
 	if err != nil {
 		return "", vault.ServerSecret{}, err
 	}
-	return description, vault.ServerSecret{
-		Host: host, Port: uint16(portValue), User: user,
-		Password: password, HostFingerprint: fingerprint,
-	}, nil
+	secret.Host = host
+	secret.Port = uint16(portValue)
+	secret.User = user
+	secret.HostFingerprint = fingerprint
+	return description, secret, nil
 }
 
 func (application *App) withUnlockedVault(ctx context.Context, mutate func(Terminal, *config.Config, *vault.Data) error) error {
@@ -664,8 +676,7 @@ func (secrets *memorySecrets) Lookup(alias string) (vault.ServerSecret, bool) {
 	secrets.mu.RLock()
 	defer secrets.mu.RUnlock()
 	secret, ok := secrets.servers[alias]
-	secret.Password = append([]byte(nil), secret.Password...)
-	return secret, ok
+	return vault.CloneServerSecret(secret), ok
 }
 
 func (secrets *memorySecrets) Available(alias string) bool {
@@ -679,7 +690,7 @@ func (secrets *memorySecrets) Lock() {
 	secrets.mu.Lock()
 	defer secrets.mu.Unlock()
 	for alias, secret := range secrets.servers {
-		vault.Zero(secret.Password)
+		vault.ZeroServerSecret(&secret)
 		delete(secrets.servers, alias)
 	}
 }
@@ -754,8 +765,7 @@ func publicServers(cfg config.Config, secrets *memorySecrets) []model.ServerSumm
 func cloneVaultData(data vault.Data) vault.Data {
 	cloned := vault.Data{Servers: make(map[string]vault.ServerSecret, len(data.Servers))}
 	for alias, secret := range data.Servers {
-		secret.Password = append([]byte(nil), secret.Password...)
-		cloned.Servers[alias] = secret
+		cloned.Servers[alias] = vault.CloneServerSecret(secret)
 	}
 	return cloned
 }
@@ -812,7 +822,7 @@ func zeroVaultData(data *vault.Data) {
 		return
 	}
 	for alias, secret := range data.Servers {
-		vault.Zero(secret.Password)
+		vault.ZeroServerSecret(&secret)
 		delete(data.Servers, alias)
 	}
 }
@@ -838,7 +848,8 @@ func hasSecretArgument(args []string) bool {
 		}
 		name := strings.ToLower(strings.SplitN(argument, "=", 2)[0])
 		switch name {
-		case "--password", "--master-password", "--host", "--port", "--user", "--fingerprint", "--host-key":
+		case "--password", "--master-password", "--host", "--port", "--user", "--fingerprint", "--host-key",
+			"--private-key", "--identity-file", "--private-key-passphrase":
 			return true
 		}
 	}
@@ -846,7 +857,10 @@ func hasSecretArgument(args []string) bool {
 }
 
 func hasSecretEnvironment() bool {
-	for _, name := range []string{"AEGIS_SSH_PASSWORD", "AEGIS_SSH_MASTER_PASSWORD", "AEGIS_SSH_HOST", "AEGIS_SSH_USER", "AEGIS_SSH_PORT"} {
+	for _, name := range []string{
+		"AEGIS_SSH_PASSWORD", "AEGIS_SSH_MASTER_PASSWORD", "AEGIS_SSH_HOST", "AEGIS_SSH_USER", "AEGIS_SSH_PORT",
+		"AEGIS_SSH_PRIVATE_KEY", "AEGIS_SSH_PRIVATE_KEY_PASSPHRASE",
+	} {
 		if _, present := os.LookupEnv(name); present {
 			return true
 		}

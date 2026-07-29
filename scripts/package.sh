@@ -19,10 +19,13 @@ for target in darwin-amd64 darwin-arm64 linux-amd64 linux-arm64; do
     arch=${target#*-}
     name="aegis-ssh-$version-$target"
     directory="$stage/$name"
-    mkdir -p "$directory/docs" "$directory/skills"
+    mkdir -p "$directory/docs" "$directory/examples/mcp" "$directory/scripts" "$directory/skills"
     (cd "$root" && CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "$directory/aegis-ssh" ./cmd/aegis-ssh)
     cp "$root/README.md" "$root/README.zh-CN.md" "$root/SECURITY.md" "$root/SECURITY.zh-CN.md" "$root/LICENSE" "$directory/"
-    cp "$root/docs/server-setup.md" "$root/docs/server-setup.zh-CN.md" "$directory/docs/"
+    cp "$root/docs/server-setup.md" "$root/docs/server-setup.zh-CN.md" \
+        "$root/docs/agent-usage.md" "$root/docs/agent-usage.zh-CN.md" "$directory/docs/"
+    cp "$root/examples/mcp/"* "$directory/examples/mcp/"
+    cp "$root/scripts/install.sh" "$directory/scripts/"
     cp -R "$root/skills/aegis-ssh" "$directory/skills/"
     (cd "$stage" && tar -czf "$output/$name.tar.gz" "$name")
     echo "$name.tar.gz" >> "$manifest"

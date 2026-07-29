@@ -51,6 +51,10 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 	if !valid(ctx, secret, command, limits) {
 		return Result{}, model.ErrValidation
 	}
+	auth, err := authenticationMethod(secret)
+	if err != nil {
+		return Result{}, err
+	}
 
 	var connectTimeout time.Duration
 	if c != nil {
@@ -72,7 +76,7 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 	hostKeyRejected := false
 	config := &ssh.ClientConfig{
 		User: secret.User,
-		Auth: []ssh.AuthMethod{ssh.Password(string(secret.Password))},
+		Auth: []ssh.AuthMethod{auth},
 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
 			actual := ssh.FingerprintSHA256(key)
 			if subtle.ConstantTimeCompare([]byte(actual), []byte(secret.HostFingerprint)) != 1 {
@@ -149,12 +153,46 @@ func valid(ctx context.Context, secret vault.ServerSecret, command string, limit
 		strings.TrimSpace(secret.Host) != "" &&
 		secret.Port != 0 &&
 		strings.TrimSpace(secret.User) != "" &&
-		len(secret.Password) != 0 &&
+		validAuthentication(secret) &&
 		strings.TrimSpace(secret.HostFingerprint) != "" &&
 		command != "" &&
 		len(command) <= maxCommandBytes &&
 		limits.Timeout > 0 && limits.Timeout <= maxTimeout &&
 		limits.MaxOutputBytes > 0 && limits.MaxOutputBytes <= maxOutputBytes
+}
+
+func validAuthentication(secret vault.ServerSecret) bool {
+	switch secret.EffectiveAuthMethod() {
+	case vault.AuthMethodPassword:
+		return len(secret.Password) != 0 && len(secret.PrivateKey) == 0 && len(secret.PrivateKeyPassphrase) == 0
+	case vault.AuthMethodPrivateKey:
+		return len(secret.Password) == 0 && len(secret.PrivateKey) != 0
+	default:
+		return false
+	}
+}
+
+func authenticationMethod(secret vault.ServerSecret) (ssh.AuthMethod, error) {
+	switch secret.EffectiveAuthMethod() {
+	case vault.AuthMethodPassword:
+		return ssh.Password(string(secret.Password)), nil
+	case vault.AuthMethodPrivateKey:
+		var (
+			signer ssh.Signer
+			err    error
+		)
+		if len(secret.PrivateKeyPassphrase) == 0 {
+			signer, err = ssh.ParsePrivateKey(secret.PrivateKey)
+		} else {
+			signer, err = ssh.ParsePrivateKeyWithPassphrase(secret.PrivateKey, secret.PrivateKeyPassphrase)
+		}
+		if err != nil {
+			return nil, model.ErrAuthentication
+		}
+		return ssh.PublicKeys(signer), nil
+	default:
+		return nil, model.ErrValidation
+	}
 }
 
 func handshake(ctx context.Context, conn net.Conn, address string, config *ssh.ClientConfig) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {

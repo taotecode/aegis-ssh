@@ -35,11 +35,49 @@ var (
 )
 
 type ServerSecret struct {
-	Host            string `json:"host"`
-	Port            uint16 `json:"port"`
-	User            string `json:"user"`
-	Password        []byte `json:"password"`
-	HostFingerprint string `json:"host_fingerprint"`
+	Host                 string     `json:"host"`
+	Port                 uint16     `json:"port"`
+	User                 string     `json:"user"`
+	AuthMethod           AuthMethod `json:"auth_method,omitempty"`
+	Password             []byte     `json:"password,omitempty"`
+	PrivateKey           []byte     `json:"private_key,omitempty"`
+	PrivateKeyPassphrase []byte     `json:"private_key_passphrase,omitempty"`
+	HostFingerprint      string     `json:"host_fingerprint"`
+}
+
+type AuthMethod string
+
+const (
+	AuthMethodPassword   AuthMethod = "password"
+	AuthMethodPrivateKey AuthMethod = "private-key"
+)
+
+// EffectiveAuthMethod keeps vaults created before auth_method was introduced
+// compatible by treating a populated password as password authentication.
+func (secret ServerSecret) EffectiveAuthMethod() AuthMethod {
+	if secret.AuthMethod == "" && len(secret.Password) != 0 {
+		return AuthMethodPassword
+	}
+	return secret.AuthMethod
+}
+
+func CloneServerSecret(secret ServerSecret) ServerSecret {
+	secret.Password = append([]byte(nil), secret.Password...)
+	secret.PrivateKey = append([]byte(nil), secret.PrivateKey...)
+	secret.PrivateKeyPassphrase = append([]byte(nil), secret.PrivateKeyPassphrase...)
+	return secret
+}
+
+func ZeroServerSecret(secret *ServerSecret) {
+	if secret == nil {
+		return
+	}
+	Zero(secret.Password)
+	Zero(secret.PrivateKey)
+	Zero(secret.PrivateKeyPassphrase)
+	secret.Password = nil
+	secret.PrivateKey = nil
+	secret.PrivateKeyPassphrase = nil
 }
 
 type Data struct {

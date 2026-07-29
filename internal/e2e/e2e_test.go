@@ -31,8 +31,7 @@ type memorySecrets struct {
 
 func (secrets memorySecrets) Lookup(alias string) (vault.ServerSecret, bool) {
 	secret, ok := secrets.servers[alias]
-	secret.Password = append([]byte(nil), secret.Password...)
-	return secret, ok
+	return vault.CloneServerSecret(secret), ok
 }
 
 type outputRedactor struct{}
