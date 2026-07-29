@@ -1,5 +1,7 @@
 # Aegis SSH
 
+English | [简体中文](README.zh-CN.md)
+
 Aegis SSH is a lightweight local broker for AI agents that must operate password-only SSH servers without putting connection details in prompts, MCP parameters, logs, environment variables, or process arguments.
 
 It is one Go binary for macOS and Linux. Agents use public aliases through standard MCP; the foreground daemon owns the decrypted vault and performs password authentication with the Go SSH library.
@@ -115,7 +117,7 @@ go vet ./...
 scripts/package.sh ./dist
 ```
 
-See [SECURITY.md](SECURITY.md) for the security boundary and reporting policy.
+See [SECURITY.md](SECURITY.md) for the security boundary and reporting policy. A complete Chinese translation is available in [SECURITY.zh-CN.md](SECURITY.zh-CN.md).
 
 ## License
 

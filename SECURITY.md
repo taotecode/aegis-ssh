@@ -1,5 +1,7 @@
 # Security
 
+English | [简体中文](SECURITY.zh-CN.md)
+
 ## Boundary
 
 Aegis SSH protects password-only connection details from normal AI-agent interfaces. Credentials are encrypted at rest, entered through `/dev/tty`, held by the daemon, and omitted from MCP schemas, CLI arguments, logs, and public result types. SSH host keys are pinned and checked on every connection.
