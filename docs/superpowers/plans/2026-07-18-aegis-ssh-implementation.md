@@ -755,7 +755,7 @@ git commit -m "feat: expose broker service over private unix socket"
 - Create: `internal/mcpserver/server.go`
 - Create: `internal/mcpserver/server_test.go`
 
-- [ ] **Step 1: Write failing MCP tool discovery and call tests**
+- [x] **Step 1: Write failing MCP tool discovery and call tests**
 
 ```go
 func TestToolsExposeOnlyPublicSchemas(t *testing.T) {
@@ -809,13 +809,13 @@ sessions. `listToolNames` sorts discovered names. `schemaPropertyKeys` walks
 only each JSON Schema `properties` map recursively and does not scan human tool
 descriptions.
 
-- [ ] **Step 2: Run tests and confirm the red state**
+- [x] **Step 2: Run tests and confirm the red state**
 
 Run: `go test ./internal/mcpserver -v`
 
 Expected: FAIL because the MCP server is missing.
 
-- [ ] **Step 3: Register typed tools with the official SDK**
+- [x] **Step 3: Register typed tools with the official SDK**
 
 Use `mcp.NewServer`, generic `mcp.AddTool`, descriptive JSON-schema tags, and
 `mcp.StdioTransport`. Each handler calls only the broker client. Return a short
@@ -830,7 +830,7 @@ Add a locked-vault tool test in which the broker returns `model.ErrVaultLocked`;
 the MCP result must set `IsError`, recommend starting and unlocking the daemon,
 and contain no socket path or vault filename.
 
-- [ ] **Step 4: Verify in-memory MCP integration and commit**
+- [x] **Step 4: Verify in-memory MCP integration and commit**
 
 Run: `go test -race ./internal/mcpserver -v && go test ./...`
 
