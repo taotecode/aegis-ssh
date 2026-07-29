@@ -1,4 +1,4 @@
-module github.com/chenjw/aegis-ssh
+module github.com/taotecode/aegis-ssh
 
 go 1.25.0
 

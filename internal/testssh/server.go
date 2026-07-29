@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/chenjw/aegis-ssh/internal/vault"
+	"github.com/taotecode/aegis-ssh/internal/vault"
 	"golang.org/x/crypto/ssh"
 )
 

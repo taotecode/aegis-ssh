@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/chenjw/aegis-ssh/internal/paths"
+	"github.com/taotecode/aegis-ssh/internal/paths"
 )
 
 func TestDefaultRootUsesPrivateHomeDirectory(t *testing.T) {

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chenjw/aegis-ssh/internal/model"
-	"github.com/chenjw/aegis-ssh/internal/sshclient"
-	"github.com/chenjw/aegis-ssh/internal/testssh"
-	"github.com/chenjw/aegis-ssh/internal/vault"
+	"github.com/taotecode/aegis-ssh/internal/model"
+	"github.com/taotecode/aegis-ssh/internal/sshclient"
+	"github.com/taotecode/aegis-ssh/internal/testssh"
+	"github.com/taotecode/aegis-ssh/internal/vault"
 )
 
 var _ int64 = sshclient.Limits{}.MaxOutputBytes

@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chenjw/aegis-ssh/internal/broker"
-	"github.com/chenjw/aegis-ssh/internal/mcpserver"
-	"github.com/chenjw/aegis-ssh/internal/model"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/taotecode/aegis-ssh/internal/broker"
+	"github.com/taotecode/aegis-ssh/internal/mcpserver"
+	"github.com/taotecode/aegis-ssh/internal/model"
 )
 
 type fakeBrokerClient struct {

@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/chenjw/aegis-ssh/internal/config"
+	"github.com/taotecode/aegis-ssh/internal/config"
 )
 
 func TestParseRejectsConnectionFields(t *testing.T) {

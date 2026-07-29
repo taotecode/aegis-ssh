@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/chenjw/aegis-ssh/internal/app"
+	"github.com/taotecode/aegis-ssh/internal/app"
 )
 
 type fakeTerminal struct {

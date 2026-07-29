@@ -8,12 +8,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/chenjw/aegis-ssh/internal/approval"
-	"github.com/chenjw/aegis-ssh/internal/audit"
-	"github.com/chenjw/aegis-ssh/internal/model"
-	"github.com/chenjw/aegis-ssh/internal/policy"
-	"github.com/chenjw/aegis-ssh/internal/sshclient"
-	"github.com/chenjw/aegis-ssh/internal/vault"
+	"github.com/taotecode/aegis-ssh/internal/approval"
+	"github.com/taotecode/aegis-ssh/internal/audit"
+	"github.com/taotecode/aegis-ssh/internal/model"
+	"github.com/taotecode/aegis-ssh/internal/policy"
+	"github.com/taotecode/aegis-ssh/internal/sshclient"
+	"github.com/taotecode/aegis-ssh/internal/vault"
 )
 
 const (

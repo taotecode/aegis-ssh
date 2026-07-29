@@ -13,16 +13,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chenjw/aegis-ssh/internal/approval"
-	"github.com/chenjw/aegis-ssh/internal/audit"
-	"github.com/chenjw/aegis-ssh/internal/broker"
-	"github.com/chenjw/aegis-ssh/internal/config"
-	"github.com/chenjw/aegis-ssh/internal/model"
-	"github.com/chenjw/aegis-ssh/internal/paths"
-	"github.com/chenjw/aegis-ssh/internal/policy"
-	"github.com/chenjw/aegis-ssh/internal/sshclient"
-	"github.com/chenjw/aegis-ssh/internal/testssh"
-	"github.com/chenjw/aegis-ssh/internal/vault"
+	"github.com/taotecode/aegis-ssh/internal/approval"
+	"github.com/taotecode/aegis-ssh/internal/audit"
+	"github.com/taotecode/aegis-ssh/internal/broker"
+	"github.com/taotecode/aegis-ssh/internal/config"
+	"github.com/taotecode/aegis-ssh/internal/model"
+	"github.com/taotecode/aegis-ssh/internal/paths"
+	"github.com/taotecode/aegis-ssh/internal/policy"
+	"github.com/taotecode/aegis-ssh/internal/sshclient"
+	"github.com/taotecode/aegis-ssh/internal/testssh"
+	"github.com/taotecode/aegis-ssh/internal/vault"
 )
 
 type memorySecrets struct {

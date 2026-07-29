@@ -71,7 +71,7 @@ utility layer.
 - [x] **Step 1: Create the module manifest and ignore runtime artifacts**
 
 ```go
-module github.com/chenjw/aegis-ssh
+module github.com/taotecode/aegis-ssh
 
 go 1.25.0
 

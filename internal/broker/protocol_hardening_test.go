@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/chenjw/aegis-ssh/internal/model"
+	"github.com/taotecode/aegis-ssh/internal/model"
 )
 
 func TestProtocolServerRejectsTwoFramesFromOneWriteBeforeDispatch(t *testing.T) {

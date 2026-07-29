@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chenjw/aegis-ssh/internal/policy"
+	"github.com/taotecode/aegis-ssh/internal/policy"
 )
 
 const (
