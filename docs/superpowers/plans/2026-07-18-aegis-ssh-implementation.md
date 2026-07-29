@@ -850,7 +850,7 @@ git commit -m "feat: provide standard MCP SSH tools"
 - Create: `internal/app/app_test.go`
 - Create: `cmd/aegis-ssh/main.go`
 
-- [ ] **Step 1: Write failing `/dev/tty` prompt tests through an injected terminal**
+- [x] **Step 1: Write failing `/dev/tty` prompt tests through an injected terminal**
 
 ```go
 func TestSecretPromptDoesNotUseStdinOrEcho(t *testing.T) {
@@ -872,13 +872,13 @@ recording whether the hidden input was copied to visible output. `testDeps`
 uses temporary paths, an in-memory broker client, and an injected host-key
 probe; it never opens the developer's real `~/.aegis-ssh` directory.
 
-- [ ] **Step 2: Run prompt tests and confirm the red state**
+- [x] **Step 2: Run prompt tests and confirm the red state**
 
 Run: `go test ./internal/app -run 'Prompt|Secret' -v`
 
 Expected: FAIL because prompt and command routing do not exist.
 
-- [ ] **Step 3: Implement CLI routing and interactive vault management**
+- [x] **Step 3: Implement CLI routing and interactive vault management**
 
 Use the standard `flag` package with a separate `FlagSet` per command. Open
 `/dev/tty` directly on macOS/Linux and use `term.ReadPassword`. `init` prompts
@@ -896,7 +896,7 @@ from retaining stale server records.
 the interactive prompt. `lock` asks the daemon to clear secrets and exit.
 `exec` and `status` use the broker client. `mcp` runs the MCP stdio server.
 
-- [ ] **Step 4: Write app integration tests and implement main wiring**
+- [x] **Step 4: Write app integration tests and implement main wiring**
 
 Test help, invalid commands, initialized/uninitialized vault, alias validation,
 daemon lock, signal cancellation, and a complete `server add -> server list ->
@@ -906,7 +906,7 @@ of the fixture host, username, password, or stored fingerprint. `main.go`
 creates a signal-aware context, constructs dependencies, calls `app.Run`,
 prints sanitized errors to stderr, and uses nonzero exit codes on failure.
 
-- [ ] **Step 5: Build, run CLI smoke tests, and commit**
+- [x] **Step 5: Build, run CLI smoke tests, and commit**
 
 Run:
 
