@@ -941,7 +941,7 @@ git commit -m "feat: add secure CLI and daemon entrypoint"
 - Create: `.github/workflows/ci.yml`
 - Create: `internal/e2e/e2e_test.go`
 
-- [ ] **Step 1: Write the failing end-to-end acceptance test**
+- [x] **Step 1: Write the failing end-to-end acceptance test**
 
 The test must create a temporary state directory, initialize a cheap-test vault,
 start the password-only SSH fixture and broker Unix server, connect a real broker
@@ -962,7 +962,7 @@ Run: `go test ./internal/e2e -v`
 Expected: FAIL until test-friendly broker construction and all integration
 boundaries are connected.
 
-- [ ] **Step 2: Add only the wiring needed to make the acceptance test pass**
+- [x] **Step 2: Add only the wiring needed to make the acceptance test pass**
 
 Export no secret-bearing types beyond internal packages. Add constructors or
 interfaces rather than test-only production branches. Re-run after each missing
@@ -972,14 +972,14 @@ Run: `go test ./internal/e2e -v`
 
 Expected: PASS for the complete acceptance sequence.
 
-- [ ] **Step 3: Create the Agent Skill and MCP examples**
+- [x] **Step 3: Create the Agent Skill and MCP examples**
 
 `SKILL.md` must require alias-only access, MCP preference, verbatim approval
 messages, waiting for the exact user reply, no self-approval, no credential
 inference, and preservation of redaction markers. Every client example must
 launch `aegis-ssh mcp` and contain no server information or secrets.
 
-- [ ] **Step 4: Write user and security documentation**
+- [x] **Step 4: Write user and security documentation**
 
 README must cover installation, `init`, server enrollment, daemon unlock,
 MCP setup, Agent Skill installation, command examples, backup of `vault.enc`,
@@ -987,7 +987,7 @@ credential rotation, audit location, and troubleshooting. `SECURITY.md` must
 state both accepted limitations: arbitrary remote shell is bypassable, and a
 same-user malicious local process can inspect broker memory.
 
-- [ ] **Step 5: Add installer and CI**
+- [x] **Step 5: Add installer and CI**
 
 `scripts/install.sh` installs a supplied or locally built binary into
 `${XDG_BIN_HOME:-$HOME/.local/bin}` with `0755`, installs the Skill only when an
@@ -1004,7 +1004,7 @@ CI matrix runs `go test ./...`, `go test -race ./...`, `go vet ./...`, checks
 require repository secrets. A packaging job runs `scripts/package.sh dist` and
 uploads the archives plus `SHA256SUMS` as workflow artifacts.
 
-- [ ] **Step 6: Run the complete verification suite**
+- [x] **Step 6: Run the complete verification suite**
 
 ```bash
 test -z "$(gofmt -l .)"
@@ -1024,7 +1024,7 @@ rg -n --hidden -g '*.go' -g '*.json' -g '*.toml' -g '*.yaml' -g '*.yml' \
 Expected: formatting check is empty; tests, race detector, vet, and all builds
 exit zero; the banned-pattern scan returns no matches in shipped files.
 
-- [ ] **Step 7: Review acceptance criteria and commit release-ready source**
+- [x] **Step 7: Review acceptance criteria and commit release-ready source**
 
 Read the design's eight acceptance criteria and cite the test or command proving
 each one in the commit notes. Do not mark this task complete when any criterion
