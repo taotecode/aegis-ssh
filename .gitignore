@@ -1,6 +1,7 @@
 /aegis-ssh
 /dist/
 /.aegis-ssh/
+/docs/superpowers/
 
 .DS_Store
 .idea/
