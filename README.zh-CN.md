@@ -59,23 +59,20 @@ broker 刻意保持轻量：一个 Go 二进制管理解密后的 vault 和 SSH 
 
 ### 1. 安装
 
-从 [GitHub Releases](https://github.com/taotecode/aegis-ssh/releases/latest) 下载对应平台的压缩包，解压后执行：
+安装最新且经过 checksum 校验的 GitHub Release，并自动配置检测到的 Agent：
 
 ```bash
-scripts/install.sh --binary ./aegis-ssh --skill-dir "$HOME/.codex/skills"
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh
 ```
 
-也可以使用 Go 1.25+ 直接从源码安装：
+使用同一脚本更新或卸载：
 
 ```bash
-git clone https://github.com/taotecode/aegis-ssh.git
-cd aegis-ssh
-scripts/install.sh
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- uninstall
 ```
 
-安装脚本不会初始化或读取 `~/.aegis-ssh`。
+安装器支持 macOS/Linux 的 amd64 和 arm64。需要时会自动将 `~/.local/bin` 写入 shell 启动文件；首次安装后重新打开终端即可。它不会初始化或读取 `~/.aegis-ssh`；普通卸载会保留加密用户数据。
 
 ### 2. 添加服务器
 
@@ -99,21 +96,30 @@ aegis-ssh status
 
 ### 4. 连接 Agent
 
-在 Codex 中注册已安装的 MCP 服务：
+安装时会自动配置检测到的 Codex、Claude Code、Gemini CLI、Cursor、VS Code 和 OpenClaw。可随时检查或修复：
+
+| Agent | 集成方式 | 自动配置方式 |
+|---|---|---|
+| Codex | MCP + Skill | 原生 `codex mcp` CLI |
+| Claude Code | MCP + Skill | 原生 `claude mcp` CLI，用户级配置 |
+| Gemini CLI | MCP + Skill | 原生 `gemini mcp` CLI，用户级配置 |
+| Cursor | MCP | 安全合并 `~/.cursor/mcp.json` |
+| VS Code | MCP | 原生 `code --add-mcp`；默认 profile 状态检查和卸载 |
+| OpenClaw | Skill + CLI fallback | 托管至 `~/.openclaw/skills` |
 
 ```bash
-codex mcp add aegis-ssh -- "$HOME/.local/bin/aegis-ssh" mcp
-codex mcp list
+aegis-ssh agent status
+aegis-ssh agent configure auto
 ```
 
-重启 Codex，然后只需指定别名：
+重启 Agent，然后只需指定别名：
 
 ```text
 使用 Aegis SSH 在 prod 上执行 `uptime`。
 使用 Aegis SSH 在 prod 和 staging 上执行 `df -h`。
 ```
 
-Codex、Claude Code、Cursor 和 OpenClaw 的配置示例位于 [`examples/mcp/`](examples/mcp/)。
+Codex、Claude Code、Gemini CLI、Cursor 和 VS Code 的 MCP 示例位于 [`examples/mcp/`](examples/mcp/)。OpenClaw 不是 MCP 客户端，使用自动安装的 Skill 和 CLI fallback。
 
 ## 常用命令
 

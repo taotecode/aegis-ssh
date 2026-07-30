@@ -13,7 +13,7 @@
 | 配置 | `config show`、`config set` |
 | 日志 | `log path`、`log show`、`log follow` |
 | 恢复 | `recovery enable`、`recovery restore`、`recovery reset` |
-| 分发 | `scripts/install.sh install\|update\|uninstall` |
+| 分发 | raw GitHub `install.sh` 安装/更新/卸载 |
 
 ## Broker 生命周期
 
@@ -87,18 +87,20 @@ aegis-ssh recovery restore
 ## 安装、更新和卸载
 
 ```bash
-scripts/install.sh install
-scripts/install.sh update
-scripts/install.sh uninstall
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- uninstall
 ```
 
-安装脚本会原子替换 `~/.local/bin/aegis-ssh`，默认同时安装 Codex Skill。更新会停止旧 broker，完成后运行 `aegis-ssh start`。普通卸载会保留加密用户数据。
+安装器会下载匹配平台且经过 checksum 校验的 Release，原子替换 `~/.local/bin/aegis-ssh`，并配置检测到的 Agent。更新会把原本运行的 broker 恢复为锁定状态，之后运行 `aegis-ssh unlock`。普通卸载会移除托管的 Agent 集成并保留加密用户数据。
 
 永久删除还必须同时提供 `--purge` 并交互输入 `PURGE`：
 
 ```bash
-scripts/install.sh uninstall --purge
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- uninstall --purge
 ```
+
+仅在 Go 1.25+ 的源码 checkout 中使用 `scripts/install.sh --source`；已有二进制可用 `--binary PATH` 安装。
 
 ## 排障检查表
 

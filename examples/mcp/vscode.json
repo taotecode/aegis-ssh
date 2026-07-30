@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "aegis-ssh": {
+      "type": "stdio",
+      "command": "aegis-ssh",
+      "args": ["mcp"]
+    }
+  }
+}

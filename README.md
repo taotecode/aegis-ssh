@@ -59,23 +59,20 @@ The broker is deliberately small: one Go binary owns the decrypted vault and SSH
 
 ### 1. Installation
 
-Download a package from [GitHub Releases](https://github.com/taotecode/aegis-ssh/releases/latest), extract it, and run:
+Install the latest checksum-verified GitHub Release and configure every detected Agent:
 
 ```bash
-scripts/install.sh --binary ./aegis-ssh --skill-dir "$HOME/.codex/skills"
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh
 ```
 
-Or build directly from source (Go 1.25+):
+Update or uninstall with the same script:
 
 ```bash
-git clone https://github.com/taotecode/aegis-ssh.git
-cd aegis-ssh
-scripts/install.sh
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- uninstall
 ```
 
-The installer does not initialize or read `~/.aegis-ssh`.
+The installer supports macOS and Linux on amd64 and arm64. When needed, it adds `~/.local/bin` to your shell startup file; open a new terminal after the first installation. It does not initialize or read `~/.aegis-ssh`; normal uninstall preserves encrypted user data.
 
 ### 2. Enroll a server
 
@@ -99,21 +96,30 @@ Enter the master password at the hidden prompt. The terminal can be closed after
 
 ### 4. Connect an agent
 
-Register the installed MCP server in Codex:
+Installation automatically configures detected Codex, Claude Code, Gemini CLI, Cursor, VS Code, and OpenClaw clients. Check or repair integrations at any time:
+
+| Agent | Integration | Automatic setup |
+|---|---|---|
+| Codex | MCP + Skill | Native `codex mcp` CLI |
+| Claude Code | MCP + Skill | Native `claude mcp` CLI, user scope |
+| Gemini CLI | MCP + Skill | Native `gemini mcp` CLI, user scope |
+| Cursor | MCP | Safely merges `~/.cursor/mcp.json` |
+| VS Code | MCP | Native `code --add-mcp`; default-profile status/removal |
+| OpenClaw | Skill + CLI fallback | Managed Skill under `~/.openclaw/skills` |
 
 ```bash
-codex mcp add aegis-ssh -- "$HOME/.local/bin/aegis-ssh" mcp
-codex mcp list
+aegis-ssh agent status
+aegis-ssh agent configure auto
 ```
 
-Restart Codex, then ask by alias:
+Restart the Agent, then ask by alias:
 
 ```text
 Use Aegis SSH to run `uptime` on prod.
 Use Aegis SSH to run `df -h` on prod and staging.
 ```
 
-Examples for Codex, Claude Code, Cursor, and OpenClaw are under [`examples/mcp/`](examples/mcp/).
+MCP examples for Codex, Claude Code, Gemini CLI, Cursor, and VS Code are under [`examples/mcp/`](examples/mcp/). OpenClaw uses the installed Skill and CLI fallback because it is not an MCP client.
 
 ## Everyday commands
 

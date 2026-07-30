@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	Version       = "0.3.0"
+	Version       = "0.4.0"
 	PolicyVersion = "2"
 
 	defaultConnectTimeout = 10 * time.Second
@@ -153,6 +153,11 @@ func (application *App) Run(ctx context.Context, args []string) error {
 			return ErrUsage
 		}
 		return application.start(ctx)
+	case "start-locked":
+		if len(args) != 1 {
+			return ErrUsage
+		}
+		return application.startLocked(ctx)
 	case "stop":
 		if len(args) != 1 {
 			return ErrUsage
@@ -183,6 +188,8 @@ func (application *App) Run(ctx context.Context, args []string) error {
 		return application.logCommand(ctx, args[1:])
 	case "service":
 		return application.serviceCommand(ctx, args[1:])
+	case "agent":
+		return application.agentCommand(ctx, args[1:])
 	case "server":
 		return application.server(ctx, args[1:])
 	case "exec":
@@ -667,6 +674,13 @@ func (application *App) daemon(ctx context.Context, unlockAtStart bool) error {
 }
 
 func (application *App) start(ctx context.Context) error {
+	if err := application.startLocked(ctx); err != nil {
+		return err
+	}
+	return application.unlock(ctx)
+}
+
+func (application *App) startLocked(ctx context.Context) error {
 	layout, err := application.layout()
 	if err != nil {
 		return ErrStorage
@@ -699,7 +713,7 @@ func (application *App) start(ctx context.Context) error {
 	for time.Now().Before(deadline) {
 		if running, _ := application.daemonReachable(ctx, layout.SocketFile); running {
 			_, _ = fmt.Fprintln(application.deps.Stdout, application.text("aegis-ssh daemon started (locked)", "aegis-ssh 后台服务已启动（锁定状态）"))
-			return application.unlock(ctx)
+			return nil
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -951,6 +965,7 @@ Commands:
   lock                         Clear in-memory credentials but keep broker running
   stop                         Stop the background broker
   status                       Show broker availability
+	agent configure|unconfigure|status [auto|client] Manage Agent integrations
   config show|set              Show or change safe settings
 	approval list|show|approve|deny  Manage local approvals
 	recovery enable|restore|reset Enable recovery, restore data, or start over
@@ -976,6 +991,7 @@ Commands:
   start / stop                 后台启动 / 停止 broker
   unlock / lock                解锁 / 清除内存凭据
   status                       查看运行状态
+	agent configure|unconfigure|status [auto|客户端] 管理 Agent 集成
   config show|set              查看或修改语言、风险和日志配置
 	approval list|show|approve|deny  在本机处理风险审批
 	recovery enable|restore|reset 启用恢复、保留数据恢复或归档重置

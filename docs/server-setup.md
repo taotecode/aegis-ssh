@@ -207,9 +207,9 @@ Type the exact alias when prompted. Removal deletes the alias from both public c
 - `interactive terminal unavailable`: run the management command in a real terminal rather than through an MCP tool or redirected stdin.
 - Lost master password: use `recovery restore` if recovery was previously enabled. Otherwise use `recovery reset` to archive the unreadable encrypted files and initialize an empty vault.
 
-## After Local Codex Installation
+## After Local Agent Installation
 
-Restart Codex so it discovers the newly installed Skill and MCP configuration. Run `aegis-ssh start`, then ask Codex to operate a server by alias, for example: `Use Aegis SSH to run uptime on prod.` See [Use Aegis SSH With Agents](agent-usage.md) for complete setup and prompt examples.
+Run `aegis-ssh agent status` and restart the configured Agent so it discovers the MCP or Skill integration. Run `aegis-ssh start`, then ask the Agent to operate a server by alias, for example: `Use Aegis SSH to run uptime on prod.` See [Use Aegis SSH With Agents](agent-usage.md) for complete setup and prompt examples.
 
 ---
 

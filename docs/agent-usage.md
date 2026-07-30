@@ -10,7 +10,7 @@
 | --- | --- |
 | Broker is running and unlocked | `aegis-ssh status` |
 | Public alias exists | `aegis-ssh server list` |
-| MCP is registered in Codex | `codex mcp list` |
+| Agent integration is configured | `aegis-ssh agent status` |
 
 > [!CAUTION]
 > Put only aliases and commands in Agent prompts. Never include connection fields, credentials, a master password, or a recovery code.
@@ -40,28 +40,26 @@ MCP is required for direct tool calls. The Skill is recommended but does not rep
 
 Server enrollment is deliberately not available through MCP. Run `aegis-ssh init`, `server add`, `server edit`, and `server remove` yourself in a real terminal so connection details and credentials are read only from `/dev/tty`. See [Add And Manage SSH Servers](server-setup.md).
 
-## Codex Setup
+## Automatic Agent Setup
 
-Install the binary and Skill from the source tree or an extracted release archive:
-
-```bash
-scripts/install.sh --binary ./aegis-ssh --skill-dir "$HOME/.codex/skills"
-```
-
-When building from source, omit `--binary ./aegis-ssh`:
+The one-line installer configures every detected supported client:
 
 ```bash
-scripts/install.sh --skill-dir "$HOME/.codex/skills"
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh
 ```
 
-Register the MCP server with an absolute binary path:
+Inspect all clients or configure one explicitly:
 
 ```bash
-codex mcp add aegis-ssh -- "$HOME/.local/bin/aegis-ssh" mcp
-codex mcp list
+aegis-ssh agent status
+aegis-ssh agent configure auto
+aegis-ssh agent configure claude
+aegis-ssh agent unconfigure cursor
 ```
 
-Restart Codex after installing or updating the Skill or MCP configuration. A running Codex session may not discover changes made after it started.
+Supported targets are `codex`, `claude`, `gemini`, `cursor`, `vscode`, and `openclaw`. Configuration is idempotent and repairs a stale Aegis SSH binary path without changing unrelated MCP servers.
+
+Codex, Claude Code, and Gemini CLI are configured through their native user-scoped MCP commands. Cursor's `~/.cursor/mcp.json` is updated atomically with a backup. VS Code is configured through `code --add-mcp`; non-default profiles may require `MCP: Open User Configuration` for inspection or removal. OpenClaw has no MCP client integration, so Aegis SSH installs a managed Skill that uses the CLI fallback. Restart an Agent after changing its integration.
 
 ## Start The Broker
 
@@ -150,13 +148,13 @@ All clients launch the same stdio command:
 $HOME/.local/bin/aegis-ssh mcp
 ```
 
-Configuration examples are available in `examples/mcp/` for Claude Code, Cursor, and OpenClaw as well as Codex. Merge the matching example into that client's MCP configuration and use an absolute binary path when the client does not inherit your shell `PATH`. Restart the client after changing its configuration.
+Configuration examples are available in `examples/mcp/` for Codex, Claude Code, Gemini CLI, Cursor, and VS Code. Merge one manually only when automatic configuration is unavailable, and use an absolute binary path when the client does not inherit your shell `PATH`.
 
 Clients that support reusable Skills can load `skills/aegis-ssh`. Clients without Skill support can rely on the MCP tool descriptions and the workflow in this guide.
 
 ## Troubleshooting
 
-- MCP server is missing: verify `codex mcp list` or the equivalent client configuration, use the absolute binary path, and restart the client.
+- MCP server is missing: run `aegis-ssh agent status`, then `aegis-ssh agent configure <client>` and restart the client.
 - `daemon: unavailable`: run `aegis-ssh start`.
 - Vault is locked: run `aegis-ssh unlock` in a local terminal, never enter the master password in Agent conversation.
 - Alias is missing: stop the daemon, run `aegis-ssh server add` in a real terminal, then restart the daemon.

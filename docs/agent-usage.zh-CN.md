@@ -1,6 +1,6 @@
 # 让 Agent 使用 Aegis SSH
 
-> 使用公开服务器别名连接 Codex、Claude Code、Cursor、OpenClaw 和其他 MCP 客户端。
+> 使用公开服务器别名连接 Codex、Claude Code、Gemini CLI、Cursor、VS Code、OpenClaw。
 
 [项目首页](../README.zh-CN.md) · [服务器配置](server-setup.zh-CN.md) · **Agent 使用** · [运维](operations.zh-CN.md) · [安全](../SECURITY.zh-CN.md) · [English](agent-usage.md)
 
@@ -10,7 +10,7 @@
 | --- | --- |
 | Broker 已运行并解锁 | `aegis-ssh status` |
 | 公开别名已存在 | `aegis-ssh server list` |
-| Codex 已注册 MCP | `codex mcp list` |
+| Agent 集成已配置 | `aegis-ssh agent status` |
 
 > [!CAUTION]
 > Agent 提示词中只能出现别名和命令。不得包含连接信息、凭据、主密码或恢复码。
@@ -40,28 +40,26 @@ Agent 要直接调用工具，必须配置 MCP。Skill 推荐安装，但不能�
 
 出于机密隔离目的，MCP 不提供服务器添加或修改工具。请由用户在真实终端中执行 `aegis-ssh init`、`server add`、`server edit` 和 `server remove`，使连接信息和凭据只通过 `/dev/tty` 输入。完整流程见[添加和管理 SSH 服务器](server-setup.zh-CN.md)。
 
-## 为 Codex 配置
+## Agent 自动配置
 
-在源码目录或解压后的 Release 目录中安装二进制文件和 Skill：
-
-```bash
-scripts/install.sh --binary ./aegis-ssh --skill-dir "$HOME/.codex/skills"
-```
-
-如果需要直接从源码构建，可以省略 `--binary ./aegis-ssh`：
+一键安装会配置检测到的全部受支持客户端：
 
 ```bash
-scripts/install.sh --skill-dir "$HOME/.codex/skills"
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh
 ```
 
-使用二进制文件的绝对路径注册 MCP：
+检查全部客户端，或显式配置某一个客户端：
 
 ```bash
-codex mcp add aegis-ssh -- "$HOME/.local/bin/aegis-ssh" mcp
-codex mcp list
+aegis-ssh agent status
+aegis-ssh agent configure auto
+aegis-ssh agent configure claude
+aegis-ssh agent unconfigure cursor
 ```
 
-安装或更新 Skill、修改 MCP 配置后，请重新启动 Codex。已经运行的 Codex 会话不一定能发现启动后才发生的配置变化。
+支持的目标为 `codex`、`claude`、`gemini`、`cursor`、`vscode` 和 `openclaw`。重复执行只会纠正 Aegis SSH 自己的过期路径，不修改其他 MCP。
+
+Codex、Claude Code、Gemini CLI 通过原生用户级 MCP 命令配置。Cursor 的 `~/.cursor/mcp.json` 会先备份再原子更新。VS Code 通过 `code --add-mcp` 配置；非默认 profile 的检查或移除可能需要执行命令面板中的 `MCP: Open User Configuration`。OpenClaw 没有 MCP 客户端能力，因此安装托管 Skill 并使用 CLI fallback。配置改变后需重启对应 Agent。
 
 ## 启动 Broker
 
@@ -150,13 +148,13 @@ aegis-ssh approval approve <id>  # 或 deny
 $HOME/.local/bin/aegis-ssh mcp
 ```
 
-`examples/mcp/` 提供 Codex、Claude Code、Cursor 和 OpenClaw 的配置示例。将对应示例合并到客户端的 MCP 配置；如果客户端不会继承 Shell 的 `PATH`，请使用二进制文件的绝对路径。修改配置后重新启动客户端。
+`examples/mcp/` 提供 Codex、Claude Code、Gemini CLI、Cursor 和 VS Code 的配置示例。仅在自动配置不可用时手工合并；如果客户端不会继承 Shell 的 `PATH`，请使用二进制文件的绝对路径。
 
 支持可复用 Skill 的客户端可以加载 `skills/aegis-ssh`。不支持 Skill 的客户端可以依靠 MCP 工具说明和本文流程使用。
 
 ## 故障排查
 
-- 找不到 MCP：检查 `codex mcp list` 或对应客户端配置，使用二进制绝对路径，然后重新启动客户端。
+- 找不到 MCP：运行 `aegis-ssh agent status`，再执行 `aegis-ssh agent configure <客户端>` 并重启客户端。
 - 提示 `daemon: unavailable`：运行 `aegis-ssh start`。
 - vault 未解锁：在本机终端运行 `aegis-ssh unlock`，绝不能在 Agent 对话中输入主密码。
 - 找不到别名：停止 daemon，在真实终端中运行 `aegis-ssh server add`，然后重新启动 daemon。

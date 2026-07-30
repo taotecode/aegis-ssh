@@ -13,7 +13,7 @@
 | Configuration | `config show`, `config set` |
 | Logs | `log path`, `log show`, `log follow` |
 | Recovery | `recovery enable`, `recovery restore`, `recovery reset` |
-| Distribution | `scripts/install.sh install\|update\|uninstall` |
+| Distribution | raw GitHub `install.sh` for install/update/uninstall |
 
 ## Broker lifecycle
 
@@ -87,18 +87,20 @@ This preserves configured servers and sets a new master password. If recovery wa
 ## Install, update, and uninstall
 
 ```bash
-scripts/install.sh install
-scripts/install.sh update
-scripts/install.sh uninstall
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- uninstall
 ```
 
-The installer atomically replaces `~/.local/bin/aegis-ssh` and installs the companion Codex Skill by default. Update stops the old broker; run `aegis-ssh start` afterward. Normal uninstall preserves encrypted user data.
+The installer downloads the matching checksum-verified Release, atomically replaces `~/.local/bin/aegis-ssh`, and configures every detected Agent. An update restores a previously running broker in locked state; run `aegis-ssh unlock` afterward. Normal uninstall removes managed Agent integrations and preserves encrypted user data.
 
 Permanent removal requires both `--purge` and interactive `PURGE` confirmation:
 
 ```bash
-scripts/install.sh uninstall --purge
+curl -fsSL https://raw.githubusercontent.com/taotecode/aegis-ssh/main/scripts/install.sh | sh -s -- uninstall --purge
 ```
+
+Use `scripts/install.sh --source` only from a source checkout with Go 1.25+, or `--binary PATH` for an already-built binary.
 
 ## Troubleshooting checklist
 

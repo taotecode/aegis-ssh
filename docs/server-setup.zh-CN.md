@@ -207,9 +207,9 @@ aegis-ssh server remove prod
 - 提示 `interactive terminal unavailable`：请在真实终端中运行管理命令，不要通过 MCP 工具或重定向的 stdin 执行。
 - 丢失主密码：若之前已启用恢复，使用 `recovery restore`；否则使用 `recovery reset` 归档无法解密的旧文件并初始化空 vault。
 
-## 本机 Codex 安装完成后
+## 本机 Agent 安装完成后
 
-重新启动 Codex，使其发现新安装的 Skill 和 MCP 配置。运行 `aegis-ssh start` 后即可关闭终端，然后通过别名让 Codex 操作服务器，例如：`使用 Aegis SSH 在 prod 上执行 uptime。` 完整配置和提示词示例见[让 Agent 使用 Aegis SSH](agent-usage.zh-CN.md)。
+运行 `aegis-ssh agent status`，并重启已配置的 Agent，使其发现 MCP 或 Skill 集成。运行 `aegis-ssh start` 后即可关闭终端，然后通过别名让 Agent 操作服务器，例如：`使用 Aegis SSH 在 prod 上执行 uptime。` 完整配置和提示词示例见[让 Agent 使用 Aegis SSH](agent-usage.zh-CN.md)。
 
 ---
 

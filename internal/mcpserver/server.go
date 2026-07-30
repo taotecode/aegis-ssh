@@ -10,7 +10,7 @@ import (
 	"github.com/taotecode/aegis-ssh/internal/model"
 )
 
-const implementationVersion = "0.3.0"
+const implementationVersion = "0.4.0"
 
 var ErrInvalidServer = errors.New("invalid MCP server configuration")
 
