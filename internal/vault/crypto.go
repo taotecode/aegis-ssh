@@ -81,7 +81,8 @@ func ZeroServerSecret(secret *ServerSecret) {
 }
 
 type Data struct {
-	Servers map[string]ServerSecret `json:"servers"`
+	Servers     map[string]ServerSecret `json:"servers"`
+	RecoveryKey []byte                  `json:"recovery_key,omitempty"`
 }
 
 type KDFParams struct {

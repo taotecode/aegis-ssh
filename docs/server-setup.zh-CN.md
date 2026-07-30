@@ -39,7 +39,7 @@ aegis-ssh server edit prod
 aegis-ssh init
 ```
 
-在两次提示中输入相同的主密码。该密码用于加密 `~/.aegis-ssh/` 下的本地 vault，丢失后无法恢复。如果 Aegis SSH 已经初始化，请跳过此步骤。
+在两次提示中输入相同的主密码。该密码用于加密 `~/.aegis-ssh/` 下的本地 vault。请在密码丢失前启用恢复并离线保存恢复码。如果 Aegis SSH 已经初始化，请跳过此步骤。
 
 ## 2. 添加服务器
 
@@ -190,7 +190,7 @@ aegis-ssh server remove prod
 - 执行时主机密钥校验失败：立即停止并调查。只有通过可信来源确认服务器发生了合法密钥轮换后，才能使用 `server edit` 更新。
 - SSH 认证失败：停止 daemon，使用 `server edit <alias>` 输入当前有效密码或导入当前私钥。
 - 提示 `interactive terminal unavailable`：请在真实终端中运行管理命令，不要通过 MCP 工具或重定向的 stdin 执行。
-- 丢失主密码：主密码无法恢复，现有 vault 将无法再解密。
+- 丢失主密码：若之前已启用恢复，使用 `recovery restore`；否则使用 `recovery reset` 归档无法解密的旧文件并初始化空 vault。
 
 ## 本机 Codex 安装完成后
 

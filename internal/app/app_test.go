@@ -18,6 +18,7 @@ import (
 	"github.com/taotecode/aegis-ssh/internal/broker"
 	"github.com/taotecode/aegis-ssh/internal/config"
 	"github.com/taotecode/aegis-ssh/internal/model"
+	"github.com/taotecode/aegis-ssh/internal/paths"
 	"github.com/taotecode/aegis-ssh/internal/testssh"
 	"github.com/taotecode/aegis-ssh/internal/vault"
 	"golang.org/x/crypto/ssh"
@@ -230,6 +231,78 @@ func TestAddServerConnectionFailureIsNotSaved(t *testing.T) {
 	}
 	if _, ok := cfg.Servers["prod"]; ok {
 		t.Fatal("server was saved after its connection test failed")
+	}
+}
+
+func TestRecoveryResetsMasterPasswordAndPreservesVault(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".aegis-ssh")
+	oldMaster, newMaster := "old master", "new master"
+	initTerminal := &fakeTerminal{secretAnswers: [][]byte{[]byte(oldMaster), []byte(oldMaster)}}
+	enableTerminal := &fakeTerminal{secretAnswers: [][]byte{[]byte(oldMaster)}}
+	queue := &terminalQueue{terminals: []*fakeTerminal{initTerminal, enableTerminal}}
+	application := app.New(app.Dependencies{Root: root, Stdout: ioDiscard{}, Stderr: ioDiscard{}, OpenTerminal: queue.open, BrokerClient: func(string) app.BrokerClient { return unavailableBroker{} }})
+	if err := application.Run(context.Background(), []string{"init"}); err != nil {
+		t.Fatal(err)
+	}
+	data := vault.Data{Servers: map[string]vault.ServerSecret{"prod": {AuthMethod: vault.AuthMethodPassword, Password: []byte("server password")}}}
+	if err := (vault.Store{Path: filepath.Join(root, "vault.enc")}).Save([]byte(oldMaster), data); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Run(context.Background(), []string{"recovery", "enable"}); err != nil {
+		t.Fatal(err)
+	}
+	line := enableTerminal.visible.String()
+	parts := strings.Split(strings.TrimSpace(line), "\n")
+	last := parts[len(parts)-1]
+	_, recoveryCode, found := strings.Cut(last, "：")
+	if !found {
+		_, recoveryCode, found = strings.Cut(last, ":")
+	}
+	if !found {
+		t.Fatalf("recovery output = %q", line)
+	}
+	recoveryCode = strings.TrimSpace(recoveryCode)
+	restoreTerminal := &fakeTerminal{secretAnswers: [][]byte{[]byte(recoveryCode), []byte(newMaster), []byte(newMaster)}}
+	queue.terminals = append(queue.terminals, restoreTerminal)
+	if err := application.Run(context.Background(), []string{"recovery", "restore"}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := (vault.Store{Path: filepath.Join(root, "vault.enc")}).Load([]byte(newMaster))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for alias, secret := range restored.Servers {
+			vault.ZeroServerSecret(&secret)
+			delete(restored.Servers, alias)
+		}
+		vault.Zero(restored.RecoveryKey)
+	}()
+	if string(restored.Servers["prod"].Password) != "server password" {
+		t.Fatal("recovery did not preserve the server password")
+	}
+}
+
+func TestServerPasswordRequiresMasterAndWritesOnlyToTerminal(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".aegis-ssh")
+	master := []byte("master")
+	if _, err := paths.EnsureLayout(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(filepath.Join(root, "config.yaml"), config.Config{Version: 2, Servers: map[string]config.ServerPublic{"prod": {AuthMethod: "password"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (vault.Store{Path: filepath.Join(root, "vault.enc")}).Save(master, vault.Data{Servers: map[string]vault.ServerSecret{"prod": {AuthMethod: vault.AuthMethodPassword, Password: []byte("server password")}}}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	terminal := &fakeTerminal{secretAnswers: [][]byte{append([]byte(nil), master...)}}
+	application := app.New(app.Dependencies{Root: root, Stdout: &stdout, Stderr: ioDiscard{}, OpenTerminal: func() (app.Terminal, error) { return terminal, nil }})
+	if err := application.Run(context.Background(), []string{"server", "password", "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), "server password") || !strings.Contains(terminal.visible.String(), "server password") {
+		t.Fatalf("stdout=%q terminal=%q", stdout.String(), terminal.visible.String())
 	}
 }
 

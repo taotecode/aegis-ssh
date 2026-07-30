@@ -42,24 +42,25 @@ const (
 )
 
 var (
-	ErrUsage              = errors.New("invalid command usage")
-	ErrSecretArgument     = errors.New("connection secrets must not be supplied in command arguments")
-	ErrSecretEnvironment  = errors.New("connection secrets must not be supplied through environment variables")
-	ErrAlreadyInitialized = errors.New("aegis-ssh is already initialized")
-	ErrNotInitialized     = errors.New("aegis-ssh is not initialized")
-	ErrDaemonRunning      = errors.New("stop the daemon before changing servers")
-	ErrDaemonUnavailable  = errors.New("broker daemon unavailable")
-	ErrInvalidAlias       = errors.New("invalid server alias")
-	ErrInvalidServer      = errors.New("invalid server details")
-	ErrInvalidAuthMethod  = errors.New("authentication method must be password or private-key")
-	ErrPrivateKey         = errors.New("unable to load SSH private key")
-	ErrServerExists       = errors.New("server alias already exists")
-	ErrServerNotFound     = errors.New("server alias not found")
-	ErrHostKeyProbe       = errors.New("unable to probe SSH host key")
-	ErrHostKeyUnconfirmed = errors.New("SSH host key was not confirmed")
-	ErrConnectionTest     = errors.New("SSH connection test failed")
-	ErrPasswordMismatch   = errors.New("master passwords do not match")
-	ErrStorage            = errors.New("secure local storage operation failed")
+	ErrUsage               = errors.New("invalid command usage")
+	ErrSecretArgument      = errors.New("connection secrets must not be supplied in command arguments")
+	ErrSecretEnvironment   = errors.New("connection secrets must not be supplied through environment variables")
+	ErrAlreadyInitialized  = errors.New("aegis-ssh is already initialized")
+	ErrNotInitialized      = errors.New("aegis-ssh is not initialized")
+	ErrDaemonRunning       = errors.New("stop the daemon before changing servers")
+	ErrDaemonUnavailable   = errors.New("broker daemon unavailable")
+	ErrInvalidAlias        = errors.New("invalid server alias")
+	ErrInvalidServer       = errors.New("invalid server details")
+	ErrInvalidAuthMethod   = errors.New("authentication method must be password or private-key")
+	ErrPrivateKey          = errors.New("unable to load SSH private key")
+	ErrServerExists        = errors.New("server alias already exists")
+	ErrServerNotFound      = errors.New("server alias not found")
+	ErrHostKeyProbe        = errors.New("unable to probe SSH host key")
+	ErrHostKeyUnconfirmed  = errors.New("SSH host key was not confirmed")
+	ErrConnectionTest      = errors.New("SSH connection test failed")
+	ErrRecoveryUnavailable = errors.New("recovery is not enabled")
+	ErrPasswordMismatch    = errors.New("master passwords do not match")
+	ErrStorage             = errors.New("secure local storage operation failed")
 )
 
 type BrokerClient interface {
@@ -176,6 +177,8 @@ func (application *App) Run(ctx context.Context, args []string) error {
 		return application.configCommand(ctx, args[1:])
 	case "approval":
 		return application.approvalCommand(ctx, args[1:])
+	case "recovery":
+		return application.recoveryCommand(ctx, args[1:])
 	case "log":
 		return application.logCommand(ctx, args[1:])
 	case "service":
@@ -277,6 +280,11 @@ func (application *App) server(ctx context.Context, args []string) error {
 			return ErrUsage
 		}
 		return application.testServer(ctx, args[1])
+	case "password":
+		if len(args) != 2 {
+			return ErrUsage
+		}
+		return application.showServerPassword(ctx, args[1])
 	default:
 		return ErrUsage
 	}
@@ -490,6 +498,11 @@ func (application *App) withUnlockedVault(ctx context.Context, mutate func(Termi
 	if err := saveVaultVerified(store, master, data); err != nil {
 		_ = saveConfigVerified(layout.ConfigFile, originalConfig)
 		return ErrStorage
+	}
+	if len(data.RecoveryKey) != 0 {
+		if err := saveVaultVerified(vault.Store{Path: layout.RecoveryFile}, data.RecoveryKey, data); err != nil {
+			return ErrStorage
+		}
 	}
 	return nil
 }
@@ -939,13 +952,15 @@ Commands:
   stop                         Stop the background broker
   status                       Show broker availability
   config show|set              Show or change safe settings
-  approval list|show|approve|deny  Manage local approvals
+	approval list|show|approve|deny  Manage local approvals
+	recovery enable|restore|reset Enable recovery, restore data, or start over
   server add                   Add a server interactively
   server edit <alias>          Replace a server interactively
   server remove <alias>        Remove a server
   server list                  List public aliases and descriptions
   server show <alias>          Show masked connection details
-  server test <alias>          Test SSH authentication
+	server test <alias>          Test SSH authentication
+	server password <alias>      Reveal a password after master-password verification
   exec <alias> -- '<command>'  Execute an exact remote shell string
   exec --servers a,b -- '<command>' Execute concurrently
   exec --all -- '<command>'    Execute on all configured aliases
@@ -962,9 +977,11 @@ Commands:
   unlock / lock                解锁 / 清除内存凭据
   status                       查看运行状态
   config show|set              查看或修改语言、风险和日志配置
-  approval list|show|approve|deny  在本机处理风险审批
+	approval list|show|approve|deny  在本机处理风险审批
+	recovery enable|restore|reset 启用恢复、保留数据恢复或归档重置
   server add|edit|remove       管理服务器
-  server list|show|test        列出、查看或测试服务器
+	server list|show|test        列出、查看或测试服务器
+	server password <别名>        验证主密码后查看服务器密码
   exec <别名> -- '<命令>'       执行远程命令
   exec --servers a,b -- '<命令>'  并发批量执行
   exec --all -- '<命令>'       在全部别名上并发执行
@@ -1204,7 +1221,7 @@ func publicServers(cfg config.Config, secrets *memorySecrets) []model.ServerSumm
 }
 
 func cloneVaultData(data vault.Data) vault.Data {
-	cloned := vault.Data{Servers: make(map[string]vault.ServerSecret, len(data.Servers))}
+	cloned := vault.Data{Servers: make(map[string]vault.ServerSecret, len(data.Servers)), RecoveryKey: append([]byte(nil), data.RecoveryKey...)}
 	for alias, secret := range data.Servers {
 		cloned.Servers[alias] = vault.CloneServerSecret(secret)
 	}
@@ -1266,6 +1283,8 @@ func zeroVaultData(data *vault.Data) {
 		vault.ZeroServerSecret(&secret)
 		delete(data.Servers, alias)
 	}
+	Zero(data.RecoveryKey)
+	data.RecoveryKey = nil
 }
 
 func validAlias(alias string) bool {

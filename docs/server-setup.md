@@ -39,7 +39,7 @@ Initialize once and choose a master password:
 aegis-ssh init
 ```
 
-Enter the same master password at both prompts. It encrypts the local vault under `~/.aegis-ssh/` and cannot be recovered if lost. Skip this step when Aegis SSH is already initialized.
+Enter the same master password at both prompts. It encrypts the local vault under `~/.aegis-ssh/`. Enable recovery and store its code offline before the password is lost. Skip this step when Aegis SSH is already initialized.
 
 ## 2. Add A Server
 
@@ -190,7 +190,7 @@ Type the exact alias when prompted. Removal deletes the alias from both public c
 - Host-key verification fails during execution: stop and investigate. Use `server edit` only after confirming a legitimate key rotation through a trusted source.
 - SSH authentication fails: stop the daemon and use `server edit <alias>` to enter the current password or import the current private key.
 - `interactive terminal unavailable`: run the management command in a real terminal rather than through an MCP tool or redirected stdin.
-- Lost master password: it cannot be recovered; the existing vault cannot be decrypted.
+- Lost master password: use `recovery restore` if recovery was previously enabled. Otherwise use `recovery reset` to archive the unreadable encrypted files and initialize an empty vault.
 
 ## After Local Codex Installation
 

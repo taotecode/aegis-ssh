@@ -34,13 +34,14 @@ func TestEnsureLayoutCreatesPrivateDirectories(t *testing.T) {
 	}
 
 	want := paths.Paths{
-		Root:       root,
-		ConfigFile: filepath.Join(root, "config.yaml"),
-		VaultFile:  filepath.Join(root, "vault.enc"),
-		AuditDir:   filepath.Join(root, "audit"),
-		LogsDir:    filepath.Join(root, "logs"),
-		RunDir:     filepath.Join(root, "run"),
-		SocketFile: filepath.Join(root, "run", "aegis.sock"),
+		Root:         root,
+		ConfigFile:   filepath.Join(root, "config.yaml"),
+		VaultFile:    filepath.Join(root, "vault.enc"),
+		RecoveryFile: filepath.Join(root, "recovery.enc"),
+		AuditDir:     filepath.Join(root, "audit"),
+		LogsDir:      filepath.Join(root, "logs"),
+		RunDir:       filepath.Join(root, "run"),
+		SocketFile:   filepath.Join(root, "run", "aegis.sock"),
 	}
 	if got != want {
 		t.Fatalf("EnsureLayout() = %#v, want %#v", got, want)

@@ -3,6 +3,9 @@ package app
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"html"
@@ -12,12 +15,156 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/taotecode/aegis-ssh/internal/config"
 	"github.com/taotecode/aegis-ssh/internal/model"
 	"github.com/taotecode/aegis-ssh/internal/sshclient"
 	"github.com/taotecode/aegis-ssh/internal/vault"
 )
+
+func (application *App) recoveryCommand(ctx context.Context, args []string) error {
+	if len(args) != 1 || (args[0] != "enable" && args[0] != "restore" && args[0] != "reset") {
+		return ErrUsage
+	}
+	layout, err := application.layout()
+	if err != nil {
+		return ErrStorage
+	}
+	if err := application.requireDaemonStopped(ctx, layout.SocketFile); err != nil {
+		return err
+	}
+	terminal, err := application.deps.OpenTerminal()
+	if err != nil {
+		return err
+	}
+	defer terminal.Close()
+	store := vault.Store{Path: layout.VaultFile}
+	if args[0] == "reset" {
+		confirmed, err := ConfirmExact(terminal, application.text("Type RESET to archive the old vault and start over: ", "输入 RESET 归档旧 vault 并重新开始："), "RESET")
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			return ErrUsage
+		}
+		newMaster, err := ReadSecret(terminal, application.text("New master password: ", "新主密码："))
+		if err != nil {
+			return err
+		}
+		defer Zero(newMaster)
+		confirmation, err := ReadSecret(terminal, application.text("Confirm new master password: ", "确认新主密码："))
+		if err != nil {
+			return err
+		}
+		defer Zero(confirmation)
+		if len(newMaster) != len(confirmation) || subtle.ConstantTimeCompare(newMaster, confirmation) != 1 {
+			return ErrPasswordMismatch
+		}
+		suffix := time.Now().UTC().Format("20060102T150405Z") + ".bak"
+		backups := [][2]string{{layout.ConfigFile, layout.ConfigFile + "." + suffix}, {layout.VaultFile, layout.VaultFile + "." + suffix}, {layout.RecoveryFile, layout.RecoveryFile + "." + suffix}}
+		for _, pair := range backups {
+			if exists(pair[0]) {
+				if err := os.Rename(pair[0], pair[1]); err != nil {
+					return ErrStorage
+				}
+			}
+		}
+		if err := store.Initialize(newMaster); err != nil {
+			return ErrStorage
+		}
+		if err := saveConfigVerified(layout.ConfigFile, defaultConfig()); err != nil {
+			return ErrStorage
+		}
+		_, _ = fmt.Fprintln(application.deps.Stdout, application.text("old encrypted files archived; new empty vault initialized", "旧加密文件已归档，新空 vault 已初始化"))
+		return nil
+	}
+	if args[0] == "enable" {
+		master, err := ReadSecret(terminal, application.text("Master password: ", "主密码："))
+		if err != nil {
+			return err
+		}
+		defer Zero(master)
+		data, err := store.Load(master)
+		if err != nil {
+			return ErrStorage
+		}
+		defer zeroVaultData(&data)
+		if len(data.RecoveryKey) != 0 {
+			return application.printRecoveryCode(terminal, data.RecoveryKey)
+		}
+		data.RecoveryKey = make([]byte, 32)
+		if _, err := rand.Read(data.RecoveryKey); err != nil {
+			return ErrStorage
+		}
+		if err := saveVaultVerified(store, master, data); err != nil {
+			return err
+		}
+		if err := saveVaultVerified(vault.Store{Path: layout.RecoveryFile}, data.RecoveryKey, data); err != nil {
+			return err
+		}
+		return application.printRecoveryCode(terminal, data.RecoveryKey)
+	}
+	if !exists(layout.RecoveryFile) {
+		return ErrRecoveryUnavailable
+	}
+	recoveryText, err := ReadSecret(terminal, application.text("Recovery code: ", "恢复码："))
+	if err != nil {
+		return err
+	}
+	defer Zero(recoveryText)
+	recoveryKey, err := base64.RawURLEncoding.DecodeString(string(recoveryText))
+	if err != nil {
+		return ErrStorage
+	}
+	defer Zero(recoveryKey)
+	data, err := (vault.Store{Path: layout.RecoveryFile}).Load(recoveryKey)
+	if err != nil || len(data.RecoveryKey) != len(recoveryKey) || subtle.ConstantTimeCompare(data.RecoveryKey, recoveryKey) != 1 {
+		zeroVaultData(&data)
+		return ErrStorage
+	}
+	defer zeroVaultData(&data)
+	newMaster, err := ReadSecret(terminal, application.text("New master password: ", "新主密码："))
+	if err != nil {
+		return err
+	}
+	defer Zero(newMaster)
+	confirmation, err := ReadSecret(terminal, application.text("Confirm new master password: ", "确认新主密码："))
+	if err != nil {
+		return err
+	}
+	defer Zero(confirmation)
+	if len(newMaster) != len(confirmation) || subtle.ConstantTimeCompare(newMaster, confirmation) != 1 {
+		return ErrPasswordMismatch
+	}
+	if err := saveVaultVerified(store, newMaster, data); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(application.deps.Stdout, application.text("master password reset", "主密码已重设"))
+	return nil
+}
+
+func (application *App) printRecoveryCode(terminal Terminal, key []byte) error {
+	_, err := fmt.Fprintf(terminal, application.text("Recovery code (store it offline): %s\n", "恢复码（请离线保存）：%s\n"), base64.RawURLEncoding.EncodeToString(key))
+	return err
+}
+
+func (application *App) showServerPassword(ctx context.Context, alias string) error {
+	if !validAlias(alias) {
+		return ErrInvalidAlias
+	}
+	return application.withReadOnlyVault(ctx, func(terminal Terminal, _ config.Config, data vault.Data) error {
+		secret, ok := data.Servers[alias]
+		if !ok {
+			return ErrServerNotFound
+		}
+		if secret.EffectiveAuthMethod() != vault.AuthMethodPassword || len(secret.Password) == 0 {
+			return ErrInvalidAuthMethod
+		}
+		_, err := fmt.Fprintf(terminal, application.text("Server %s password: %s\n", "服务器 %s 密码：%s\n"), alias, secret.Password)
+		return err
+	})
+}
 
 func (application *App) showServer(ctx context.Context, alias string, reveal bool) error {
 	if !validAlias(alias) {

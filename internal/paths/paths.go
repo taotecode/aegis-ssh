@@ -15,13 +15,14 @@ var (
 )
 
 type Paths struct {
-	Root       string
-	ConfigFile string
-	VaultFile  string
-	AuditDir   string
-	LogsDir    string
-	RunDir     string
-	SocketFile string
+	Root         string
+	ConfigFile   string
+	VaultFile    string
+	RecoveryFile string
+	AuditDir     string
+	LogsDir      string
+	RunDir       string
+	SocketFile   string
 }
 
 func DefaultRoot() (string, error) {
@@ -34,13 +35,14 @@ func DefaultRoot() (string, error) {
 
 func EnsureLayout(root string) (Paths, error) {
 	result := Paths{
-		Root:       root,
-		ConfigFile: filepath.Join(root, "config.yaml"),
-		VaultFile:  filepath.Join(root, "vault.enc"),
-		AuditDir:   filepath.Join(root, "audit"),
-		LogsDir:    filepath.Join(root, "logs"),
-		RunDir:     filepath.Join(root, "run"),
-		SocketFile: filepath.Join(root, "run", "aegis.sock"),
+		Root:         root,
+		ConfigFile:   filepath.Join(root, "config.yaml"),
+		VaultFile:    filepath.Join(root, "vault.enc"),
+		RecoveryFile: filepath.Join(root, "recovery.enc"),
+		AuditDir:     filepath.Join(root, "audit"),
+		LogsDir:      filepath.Join(root, "logs"),
+		RunDir:       filepath.Join(root, "run"),
+		SocketFile:   filepath.Join(root, "run", "aegis.sock"),
 	}
 
 	for _, dir := range []string{result.Root, result.AuditDir, result.LogsDir, result.RunDir} {

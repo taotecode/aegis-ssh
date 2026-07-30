@@ -53,6 +53,15 @@ aegis-ssh server add
 aegis-ssh server list
 ```
 
+在仍记得主密码时启用恢复，并将仅显示在终端的恢复码离线保存：
+
+```bash
+aegis-ssh recovery enable
+aegis-ssh recovery restore  # 忘记主密码后保留服务器数据重设
+```
+
+未提前启用恢复的旧 vault 在主密码丢失后无法解密。`aegis-ssh recovery reset` 会归档旧加密文件并创建新的空 vault。
+
 使用密码认证时，依次输入：
 
 ```text
@@ -96,6 +105,8 @@ aegis-ssh server remove prod
 ```bash
 aegis-ssh start
 ```
+
+需要在本机查看密码认证服务器的密码时，运行 `aegis-ssh server password <别名>` 并输入主密码。密码只显示在当前真实终端，不会进入 MCP 或重定向的 stdout。
 
 在另一个终端中执行：
 
@@ -169,7 +180,7 @@ Codex 配置、MCP 与 Skill 的关系、工具调用流程、提示词示例、
 - `audit/audit.jsonl`：保存有界的命令元数据、策略决策和脱敏计数
 - `run/aegis.sock`：daemon 运行时的本地用户私有 socket
 
-只能在 daemon 已停止时，将 `config.yaml` 和 `vault.enc` 作为同一组一起备份。备份也必须使用私有权限存储。主密码无法恢复；丢失主密码后，vault 将无法再解密。
+只能在 daemon 已停止时，将 `config.yaml` 和 `vault.enc` 作为同一组一起备份。备份也必须使用私有权限存储。请提前运行 `recovery enable` 并离线保存恢复码；否则丢失主密码后无法解密现有 vault。
 
 轮换服务器密码或替换私钥：
 

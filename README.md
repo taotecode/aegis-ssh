@@ -40,6 +40,15 @@ aegis-ssh server add
 aegis-ssh server list
 ```
 
+Enable recovery while you still know the master password, then store the one-time displayed recovery code offline:
+
+```bash
+aegis-ssh recovery enable
+aegis-ssh recovery restore  # reset a forgotten master password without losing servers
+```
+
+Vaults created before recovery was enabled cannot be decrypted after the master password is lost. `aegis-ssh recovery reset` archives the old encrypted files and creates a new empty vault.
+
 Password authentication prompts:
 
 ```text
@@ -164,6 +173,8 @@ State is stored under `~/.aegis-ssh/` with private permissions:
 Back up `config.yaml` and `vault.enc` together while the daemon is stopped. Keep the backup private. The master password is not recoverable; losing it makes the vault unusable.
 
 Rotate a server password or replace a private key with `aegis-ssh server edit <alias>`, then run `aegis-ssh start`. Reconfirm the host key only against a trusted source.
+
+To reveal a password-authenticated server's password locally, run `aegis-ssh server password <alias>` and enter the master password. The password is written only to the controlling terminal, never MCP or redirected stdout.
 
 ## Troubleshooting
 
