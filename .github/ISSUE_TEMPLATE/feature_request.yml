@@ -1,0 +1,58 @@
+name: Feature request / 功能建议
+description: Propose a concrete improvement or Agent integration.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first. A small, interoperable solution is preferred over Agent-specific duplication.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult or impossible today, and who is affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest behavior or interface that would solve the problem.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Related Agent
+      options:
+        - Agent-independent
+        - Codex
+        - Claude Code
+        - Gemini CLI
+        - Cursor
+        - VS Code
+        - OpenClaw
+        - Another Agent
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds or simpler options you evaluated.
+
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Scope check
+      options:
+        - label: This request does not require exposing SSH credentials to an Agent.
+          required: true
+        - label: I searched existing issues for the same request.
+          required: true
