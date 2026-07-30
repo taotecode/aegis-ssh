@@ -56,6 +56,21 @@ func (terminal *ttyTerminal) Close() error {
 }
 
 func ReadSecret(terminal Terminal, prompt string) ([]byte, error) {
+	secret, err := readSecretValue(terminal, prompt)
+	if err != nil {
+		return nil, err
+	}
+	if len(secret) == 0 {
+		return nil, ErrEmptySecret
+	}
+	return secret, nil
+}
+
+func ReadOptionalSecret(terminal Terminal, prompt string) ([]byte, error) {
+	return readSecretValue(terminal, prompt)
+}
+
+func readSecretValue(terminal Terminal, prompt string) ([]byte, error) {
 	if terminal == nil {
 		return nil, ErrNoTerminal
 	}
@@ -73,10 +88,6 @@ func ReadSecret(terminal Terminal, prompt string) ([]byte, error) {
 		return nil, fmt.Errorf("write prompt: %w", newlineErr)
 	}
 	secret = trimLineEnding(secret)
-	if len(secret) == 0 {
-		Zero(secret)
-		return nil, ErrEmptySecret
-	}
 	return secret, nil
 }
 
@@ -92,6 +103,21 @@ func ReadText(terminal Terminal, prompt string) (string, error) {
 		return "", fmt.Errorf("read input: %w", err)
 	}
 	return strings.TrimSpace(value), nil
+}
+
+func ReadTextDefault(terminal Terminal, prompt, defaultValue string) (string, error) {
+	label := prompt
+	if defaultValue != "" {
+		label = strings.TrimSuffix(prompt, ": ") + " [" + defaultValue + "]: "
+	}
+	value, err := ReadText(terminal, label)
+	if err != nil {
+		return "", err
+	}
+	if value == "" {
+		return defaultValue, nil
+	}
+	return value, nil
 }
 
 func ConfirmExact(terminal Terminal, prompt, expected string) (bool, error) {

@@ -68,20 +68,16 @@ func TestToolsExposeOnlyPublicSchemas(t *testing.T) {
 	}
 	names := make([]string, 0, len(listed.Tools))
 	properties := make(map[string]bool)
-	var approvedProperties []string
 	for _, tool := range listed.Tools {
 		names = append(names, tool.Name)
 		collectSchemaProperties(t, tool.InputSchema, properties)
 		collectSchemaProperties(t, tool.OutputSchema, properties)
-		if tool.Name == "ssh_execute_approved" {
-			approvedProperties = directSchemaProperties(t, tool.InputSchema)
-		}
 		if tool.Description == "" || !strings.Contains(strings.ToLower(tool.Description), "credential") {
 			t.Fatalf("tool %q lacks credential boundary description: %q", tool.Name, tool.Description)
 		}
 	}
 	sort.Strings(names)
-	wantNames := []string{"get_ssh_broker_status", "list_ssh_servers", "ssh_execute", "ssh_execute_approved"}
+	wantNames := []string{"get_ssh_broker_status", "list_ssh_servers", "ssh_execute", "ssh_execute_batch"}
 	if !slices.Equal(names, wantNames) {
 		t.Fatalf("tool names = %v, want %v", names, wantNames)
 	}
@@ -89,9 +85,6 @@ func TestToolsExposeOnlyPublicSchemas(t *testing.T) {
 		if properties[forbidden] {
 			t.Fatalf("tool schema exposed property %q", forbidden)
 		}
-	}
-	if want := []string{"approval_code", "approval_id"}; !slices.Equal(approvedProperties, want) {
-		t.Fatalf("approved input properties = %v, want %v", approvedProperties, want)
 	}
 }
 
@@ -112,9 +105,6 @@ func TestToolsForwardOnlyTypedPublicInputs(t *testing.T) {
 		{Name: "ssh_execute", Arguments: map[string]any{
 			"server_alias": "prod", "command": "uptime", "timeout_seconds": 9, "max_output_bytes": 4096,
 		}},
-		{Name: "ssh_execute_approved", Arguments: map[string]any{
-			"approval_id": "approval-id", "approval_code": "ABCD",
-		}},
 	} {
 		result, err := session.CallTool(ctx, call)
 		if err != nil || result.IsError || result.StructuredContent == nil || len(result.Content) == 0 {
@@ -123,15 +113,12 @@ func TestToolsForwardOnlyTypedPublicInputs(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if client.statusCalls != 1 || client.listCalls != 1 || len(client.executes) != 1 || len(client.approved) != 1 {
+	if client.statusCalls != 1 || client.listCalls != 1 || len(client.executes) != 1 || len(client.approved) != 0 {
 		t.Fatalf("calls: status=%d list=%d execute=%d approved=%d", client.statusCalls, client.listCalls, len(client.executes), len(client.approved))
 	}
 	wantExecute := model.ExecuteRequest{ServerAlias: "prod", Command: "uptime", TimeoutSeconds: 9, MaxOutputBytes: 4096}
 	if client.executes[0] != wantExecute {
 		t.Fatalf("Execute request = %+v, want %+v", client.executes[0], wantExecute)
-	}
-	if wantApproved := (model.ApprovedRequest{ApprovalID: "approval-id", ApprovalCode: "ABCD"}); client.approved[0] != wantApproved {
-		t.Fatalf("ExecuteApproved request = %+v, want %+v", client.approved[0], wantApproved)
 	}
 }
 
@@ -247,7 +234,7 @@ func TestNilClientAndUnknownDependencyErrorsStaySanitized(t *testing.T) {
 	}
 }
 
-func TestApprovedToolRejectsCommandReplacementBeforeBrokerCall(t *testing.T) {
+func TestApprovedToolIsNotExposed(t *testing.T) {
 	client := &fakeBrokerClient{}
 	session := connectMCP(t, mcpserver.New(client))
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
@@ -255,11 +242,8 @@ func TestApprovedToolRejectsCommandReplacementBeforeBrokerCall(t *testing.T) {
 			"approval_id": "approval-id", "approval_code": "ABCD", "command": "replacement",
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.IsError {
-		t.Fatalf("result = %+v, want schema error", result)
+	if err == nil || result != nil {
+		t.Fatalf("removed tool result = %+v, %v", result, err)
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()

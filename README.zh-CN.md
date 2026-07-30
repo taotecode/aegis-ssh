@@ -2,9 +2,24 @@
 
 [简体中文] | [English](README.md)
 
-Aegis SSH 是一个轻量级本地 SSH 代理，让 AI Agent 能够操作使用密码或私钥认证的 SSH 服务器，同时避免将服务器连接信息和凭据放入 Agent 提示词、MCP 参数、日志、环境变量或进程参数中。
+> **让 AI Agent 操作 SSH 服务器，但绝不把 SSH 凭据交给 Agent。**
 
-项目是一个同时支持 macOS 和 Linux 的 Go 单二进制文件。Agent 通过标准 MCP 使用公开别名访问服务器；前台 daemon 负责持有解密后的凭据，并通过 Go SSH 库执行 SSH 认证。
+Aegis SSH 是 AI Agent 与服务器之间的本机隐私防火墙。Agent 只看到 `prod` 这样的公开别名；密码、导入的私钥、地址、用户名、主机指纹和主密码材料不会进入提示词、MCP 参数、环境变量、进程参数或运维日志。
+
+项目是一个同时支持 macOS 和 Linux 的 Go 单二进制文件，提供加密存储、固定主机身份、三档风险策略、本机审批、输出脱敏、有界审计和多服务器并发执行。
+
+## v0.3 快速开始
+
+```bash
+scripts/install.sh
+aegis-ssh init
+aegis-ssh server add
+aegis-ssh start
+```
+
+启动后可以关闭终端。`lock` 只清除内存凭据，`unlock` 重新解锁，`stop` 停止后台进程；`service install` 可安装登录时自动启动但保持锁定的 launchd/systemd 用户服务。
+
+风险命令通过 `approval list/show/approve/deny` 在本机审批，不再污染 Agent 对话。可使用 `config set risk-policy enforce|warn|off` 切换策略，并使用 `exec --servers prod,staging` 或 `exec --all` 并发执行。
 
 ## 安装
 
@@ -74,12 +89,12 @@ aegis-ssh server edit prod
 aegis-ssh server remove prod
 ```
 
-## 运行
+## 后台运行
 
-在终端中解锁 broker，并保持 daemon 在前台运行：
+启动并解锁 broker，随后即可关闭终端：
 
 ```bash
-aegis-ssh daemon
+aegis-ssh start
 ```
 
 在另一个终端中执行：
@@ -90,12 +105,14 @@ aegis-ssh exec prod -- 'uptime'
 aegis-ssh exec prod -- 'cd /srv/app && git status --short'
 ```
 
-`--` 后的整条远程命令必须使用引号包裹，以保持命令原始字节。可能暴露服务器敏感信息的命令会要求输入精确的交互式批准码。
+`--` 后的整条远程命令必须使用引号包裹。默认 `enforce` 策略下，风险命令会等待本机审批中心处理，不会要求在 Agent 对话中回复批准码。
 
-停止 daemon 并清除内存中的凭据：
+按需锁定、重新解锁或停止：
 
 ```bash
 aegis-ssh lock
+aegis-ssh unlock
+aegis-ssh stop
 ```
 
 ## MCP
@@ -127,13 +144,13 @@ MCP 提供以下工具：
 - `get_ssh_broker_status`：查询 broker 和 vault 状态
 - `list_ssh_servers`：列出公开别名和描述
 - `ssh_execute`：通过别名执行精确的非交互式 Shell 命令
-- `ssh_execute_approved`：在用户明确确认后执行已存储的待批准命令
+- `ssh_execute_batch`：在多个公开别名上并发执行相同命令
 
 这些工具只会返回别名和经过过滤的命令结果，不会返回服务器连接字段。
 
 将 `skills/aegis-ssh` 安装到 Agent 的 Skill 目录，或让客户端直接加载该目录。Skill 会要求 Agent 优先使用 MCP、等待用户真实批准，并保留所有脱敏标记。
 
-启动 `aegis-ssh daemon` 后，可以直接通过别名要求 Agent 操作：
+启动 `aegis-ssh start` 后，可以直接通过别名要求 Agent 操作：
 
 ```text
 使用 Aegis SSH 列出已经配置的服务器。
@@ -157,20 +174,20 @@ Codex 配置、MCP 与 Skill 的关系、工具调用流程、提示词示例、
 轮换服务器密码或替换私钥：
 
 ```bash
-aegis-ssh lock
+aegis-ssh stop
 aegis-ssh server edit <alias>
-aegis-ssh daemon
+aegis-ssh start
 ```
 
 仅能根据可信源重新确认主机密钥指纹。
 
 ## 故障排查
 
-- `daemon: unavailable`：在单独终端中运行 `aegis-ssh daemon`。
+- `daemon: unavailable`：运行 `aegis-ssh start`。
 - daemon 启动时提示 vault 锁定或存储失败：检查主密码，以及 `~/.aegis-ssh` 的归属和权限。
 - 主机密钥校验失败：立即停止操作并调查服务器身份，不得绕过指纹固定。
 - SSH 认证失败：停止 daemon，执行 `server edit`，然后输入当前有效密码或导入当前私钥。
-- 服务器修改被拒绝：先执行 `aegis-ssh lock`，再重试管理命令。
+- 服务器修改被拒绝：先执行 `aegis-ssh stop`，再重试管理命令。
 - 输出中出现 `[REDACTED:...]`：broker 有意隐藏了敏感数据，不得尝试还原。
 
 ## 安全边界

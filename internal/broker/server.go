@@ -26,6 +26,17 @@ type BrokerService interface {
 type lockService interface {
 	Lock(context.Context)
 }
+type stopService interface{ Stop(context.Context) }
+type unlockService interface {
+	Unlock(context.Context, []byte) error
+}
+type approvalService interface {
+	ListApprovalSummaries(bool) []model.ApprovalSummary
+	DecideApproval(string, bool) error
+}
+type configureService interface {
+	Configure(context.Context, string, string) error
+}
 
 type Server struct {
 	path    string
@@ -164,6 +175,9 @@ func (server *Server) handle(parent context.Context, connection net.Conn) {
 	if request.Method == "lock" && response.Error == nil {
 		server.service.(lockService).Lock(parent)
 	}
+	if request.Method == "stop" && response.Error == nil {
+		server.service.(stopService).Stop(parent)
+	}
 }
 
 func (server *Server) dispatch(ctx context.Context, request Request) Response {
@@ -202,12 +216,48 @@ func (server *Server) dispatch(ctx context.Context, request Request) Response {
 			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid execute params")
 		}
 		return marshalResult(request.RequestID, server.service.Execute(ctx, execute))
+	case "execute_wait":
+		waiting, ok := server.service.(interface {
+			ExecuteWait(context.Context, model.ExecuteRequest) model.ExecuteResult
+		})
+		if !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		var execute model.ExecuteRequest
+		if decodeStrictJSON(params, &execute) != nil {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid execute params")
+		}
+		return marshalResult(request.RequestID, waiting.ExecuteWait(ctx, execute))
 	case "execute_approved":
 		var approved model.ApprovedRequest
 		if decodeStrictJSON(params, &approved) != nil {
 			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid approved params")
 		}
 		return marshalResult(request.RequestID, server.service.ExecuteApproved(ctx, approved))
+	case "execute_batch":
+		batchService, ok := server.service.(interface {
+			ExecuteBatch(context.Context, model.BatchExecuteRequest) model.BatchExecuteResult
+		})
+		if !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		var batch model.BatchExecuteRequest
+		if decodeStrictJSON(params, &batch) != nil {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid batch params")
+		}
+		return marshalResult(request.RequestID, batchService.ExecuteBatch(ctx, batch))
+	case "execute_batch_wait":
+		waiting, ok := server.service.(interface {
+			ExecuteBatchWait(context.Context, model.BatchExecuteRequest) model.BatchExecuteResult
+		})
+		if !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		var batch model.BatchExecuteRequest
+		if decodeStrictJSON(params, &batch) != nil {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid batch params")
+		}
+		return marshalResult(request.RequestID, waiting.ExecuteBatchWait(ctx, batch))
 	case "lock":
 		if len(request.Params) != 0 {
 			return protocolError(request.RequestID, ErrorInvalidRequest, "lock params must be empty")
@@ -218,6 +268,83 @@ func (server *Server) dispatch(ctx context.Context, request Request) Response {
 		return marshalResult(request.RequestID, struct {
 			Accepted bool `json:"accepted"`
 		}{Accepted: true})
+	case "stop":
+		if len(request.Params) != 0 {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "stop params must be empty")
+		}
+		if _, ok := server.service.(stopService); !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		return marshalResult(request.RequestID, struct {
+			Accepted bool `json:"accepted"`
+		}{Accepted: true})
+	case "unlock":
+		service, ok := server.service.(unlockService)
+		if !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		var input struct {
+			Master []byte `json:"master"`
+		}
+		if decodeStrictJSON(params, &input) != nil || len(input.Master) == 0 {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid unlock params")
+		}
+		err := service.Unlock(ctx, input.Master)
+		clear(input.Master)
+		if err != nil {
+			return protocolServiceError(request.RequestID, err)
+		}
+		return marshalResult(request.RequestID, struct {
+			Accepted bool `json:"accepted"`
+		}{true})
+	case "approval_list":
+		service, ok := server.service.(approvalService)
+		if !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		var input struct {
+			IncludeCommand bool `json:"include_command"`
+		}
+		if decodeStrictJSON(params, &input) != nil {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid approval params")
+		}
+		return marshalResult(request.RequestID, service.ListApprovalSummaries(input.IncludeCommand))
+	case "approval_decide":
+		service, ok := server.service.(approvalService)
+		if !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		var input struct {
+			ID    string `json:"id"`
+			Allow bool   `json:"allow"`
+		}
+		if decodeStrictJSON(params, &input) != nil || input.ID == "" {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid approval params")
+		}
+		if err := service.DecideApproval(input.ID, input.Allow); err != nil {
+			return protocolServiceError(request.RequestID, model.ErrApproval)
+		}
+		return marshalResult(request.RequestID, struct {
+			Accepted bool `json:"accepted"`
+		}{true})
+	case "configure":
+		service, ok := server.service.(configureService)
+		if !ok {
+			return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
+		}
+		var input struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		if decodeStrictJSON(params, &input) != nil || input.Key == "" {
+			return protocolError(request.RequestID, ErrorInvalidRequest, "invalid configuration params")
+		}
+		if err := service.Configure(ctx, input.Key, input.Value); err != nil {
+			return protocolServiceError(request.RequestID, model.ErrValidation)
+		}
+		return marshalResult(request.RequestID, struct {
+			Accepted bool `json:"accepted"`
+		}{true})
 	default:
 		return protocolError(request.RequestID, ErrorMethodNotFound, "unknown method")
 	}
@@ -248,7 +375,7 @@ func writeResponse(connection net.Conn, response Response) {
 		data, err = json.Marshal(protocolError(requestID, ErrorInternal, "response unavailable"))
 	}
 	if err != nil || len(data) > MaxFrameBytes {
-		data = []byte(`{"version":"1","request_id":"","error":{"code":"internal_error","message":"response unavailable"}}`)
+		data = []byte(`{"version":"2","request_id":"","error":{"code":"internal_error","message":"response unavailable"}}`)
 	}
 	data = append(data, '\n')
 	_ = connection.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
@@ -264,12 +391,84 @@ func marshalResult(requestID string, value any) Response {
 			return protocolError(requestID, ErrorInternal, "response unavailable")
 		}
 		return marshalExecuteResult(requestID, *result)
+	case model.BatchExecuteResult:
+		return marshalBatchExecuteResult(requestID, result)
+	case *model.BatchExecuteResult:
+		if result == nil {
+			return protocolError(requestID, ErrorInternal, "response unavailable")
+		}
+		return marshalBatchExecuteResult(requestID, *result)
 	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return protocolError(requestID, ErrorInternal, "response unavailable")
 	}
 	return Response{Version: ProtocolVersion, RequestID: requestID, Result: data}
+}
+
+func marshalBatchExecuteResult(requestID string, result model.BatchExecuteResult) Response {
+	for index := range result.Results {
+		normalizedOut := normalizeUTF8(result.Results[index].Stdout)
+		normalizedErr := normalizeUTF8(result.Results[index].Stderr)
+		if normalizedOut != result.Results[index].Stdout || normalizedErr != result.Results[index].Stderr {
+			result.Results[index].Truncated = true
+		}
+		result.Results[index].Stdout = normalizedOut
+		result.Results[index].Stderr = normalizedErr
+	}
+	if response, size, ok := encodedGenericResponse(requestID, result); ok && size <= MaxFrameBytes {
+		return response
+	}
+	original := append([]model.ServerExecuteResult(nil), result.Results...)
+	for index := range result.Results {
+		result.Results[index].Stdout = ""
+		result.Results[index].Stderr = ""
+		if original[index].Stdout != "" || original[index].Stderr != "" {
+			result.Results[index].Truncated = true
+		}
+	}
+	base, baseSize, ok := encodedGenericResponse(requestID, result)
+	if !ok || baseSize > MaxFrameBytes {
+		return protocolError(requestID, ErrorInternal, "response unavailable")
+	}
+	if len(result.Results) == 0 {
+		return base
+	}
+	perResult := (MaxFrameBytes - baseSize) / len(result.Results)
+	if perResult <= 0 {
+		return base
+	}
+	for index := range result.Results {
+		stdout, stderr := fitExecuteOutput(original[index].Stdout, original[index].Stderr, perResult)
+		result.Results[index].Stdout = stdout
+		result.Results[index].Stderr = stderr
+	}
+	for attempts := 0; attempts < 8; attempts++ {
+		response, size, encoded := encodedGenericResponse(requestID, result)
+		if encoded && size <= MaxFrameBytes {
+			return response
+		}
+		perResult = perResult * 3 / 4
+		for index := range result.Results {
+			stdout, stderr := fitExecuteOutput(original[index].Stdout, original[index].Stderr, perResult)
+			result.Results[index].Stdout = stdout
+			result.Results[index].Stderr = stderr
+		}
+	}
+	return base
+}
+
+func encodedGenericResponse(requestID string, value any) (Response, int, bool) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return Response{}, 0, false
+	}
+	response := Response{Version: ProtocolVersion, RequestID: requestID, Result: data}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return Response{}, 0, false
+	}
+	return response, len(encoded), true
 }
 
 func marshalExecuteResult(requestID string, result model.ExecuteResult) Response {

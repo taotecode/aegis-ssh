@@ -38,6 +38,7 @@ func TestEnsureLayoutCreatesPrivateDirectories(t *testing.T) {
 		ConfigFile: filepath.Join(root, "config.yaml"),
 		VaultFile:  filepath.Join(root, "vault.enc"),
 		AuditDir:   filepath.Join(root, "audit"),
+		LogsDir:    filepath.Join(root, "logs"),
 		RunDir:     filepath.Join(root, "run"),
 		SocketFile: filepath.Join(root, "run", "aegis.sock"),
 	}
@@ -45,7 +46,7 @@ func TestEnsureLayoutCreatesPrivateDirectories(t *testing.T) {
 		t.Fatalf("EnsureLayout() = %#v, want %#v", got, want)
 	}
 
-	for _, dir := range []string{got.Root, got.AuditDir, got.RunDir} {
+	for _, dir := range []string{got.Root, got.AuditDir, got.LogsDir, got.RunDir} {
 		info, statErr := os.Lstat(dir)
 		if statErr != nil {
 			t.Fatalf("Lstat(%q): %v", dir, statErr)
@@ -67,7 +68,7 @@ func TestEnsureLayoutCreatesPrivateDirectoriesWithRestrictiveUmask(t *testing.T)
 		t.Fatalf("EnsureLayout() error = %v", err)
 	}
 
-	for _, dir := range []string{got.Root, got.AuditDir, got.RunDir} {
+	for _, dir := range []string{got.Root, got.AuditDir, got.LogsDir, got.RunDir} {
 		info, statErr := os.Lstat(dir)
 		if statErr != nil {
 			t.Fatalf("Lstat(%q): %v", dir, statErr)

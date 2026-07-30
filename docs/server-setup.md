@@ -1,5 +1,19 @@
 # Add And Manage SSH Servers
 
+## v0.3 management commands
+
+`server add` is a six-step wizard. Press Enter to accept port `22` and the detected secure private key. The key contents are imported into the encrypted vault; the source path is never stored.
+
+```bash
+aegis-ssh server list
+aegis-ssh server show prod   # masked connection hints only
+aegis-ssh server show prod --reveal  # unlock and show non-credential fields
+aegis-ssh server test prod   # SSH handshake, pinned host key, and authentication
+aegis-ssh server edit prod
+```
+
+Stop the broker before changing server storage. `lock` intentionally keeps the broker process alive, so use `aegis-ssh stop` before add/edit/remove.
+
 English | [简体中文](server-setup.zh-CN.md)
 
 This guide covers initial vault setup, multiple servers, password and private-key authentication, host-key verification, connection testing, credential rotation, and server removal.
@@ -128,16 +142,17 @@ Confirm the public alias was saved:
 aegis-ssh server list
 ```
 
-Start the broker in a dedicated terminal and leave it running:
+Start the background broker and close the terminal after unlock:
 
 ```bash
-aegis-ssh daemon
+aegis-ssh start
 ```
 
-Enter the master password when prompted. In another terminal, run a low-risk test command:
+Enter the master password when prompted, then run the explicit connection test or a low-risk command:
 
 ```bash
 aegis-ssh status
+aegis-ssh server test prod
 aegis-ssh exec prod -- 'uptime'
 ```
 
@@ -170,7 +185,7 @@ Type the exact alias when prompted. Removal deletes the alias from both public c
 ## Troubleshooting
 
 - `aegis-ssh is not initialized`: run `aegis-ssh init` in a terminal.
-- Server changes are refused: run `aegis-ssh lock` and retry.
+- Server changes are refused: run `aegis-ssh stop` and retry.
 - `unable to probe SSH host key`: confirm the host and port, network reachability, firewall rules, and that an SSH service is listening.
 - Host-key verification fails during execution: stop and investigate. Use `server edit` only after confirming a legitimate key rotation through a trusted source.
 - SSH authentication fails: stop the daemon and use `server edit <alias>` to enter the current password or import the current private key.
@@ -179,4 +194,4 @@ Type the exact alias when prompted. Removal deletes the alias from both public c
 
 ## After Local Codex Installation
 
-Restart Codex so it discovers the newly installed Skill and MCP configuration. Keep `aegis-ssh daemon` running in a terminal, then ask Codex to operate a server by alias, for example: `Use Aegis SSH to run uptime on prod.` See [Use Aegis SSH With Agents](agent-usage.md) for complete setup and prompt examples.
+Restart Codex so it discovers the newly installed Skill and MCP configuration. Run `aegis-ssh start`, then ask Codex to operate a server by alias, for example: `Use Aegis SSH to run uptime on prod.` See [Use Aegis SSH With Agents](agent-usage.md) for complete setup and prompt examples.

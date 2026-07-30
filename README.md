@@ -2,9 +2,11 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Aegis SSH is a lightweight local broker for AI agents that operate password- or private-key-authenticated SSH servers without putting connection details or credentials in prompts, MCP parameters, logs, environment variables, or process arguments.
+> **Give AI agents SSH access without giving them your SSH secrets.**
 
-It is one Go binary for macOS and Linux. Agents use public aliases through standard MCP; the foreground daemon owns the decrypted vault and performs SSH authentication with the Go SSH library.
+Aegis SSH is a local privacy firewall between AI agents and your servers. Agents see aliases such as `prod`; passwords, imported private keys, hosts, usernames, fingerprints, and master-password material stay outside prompts, MCP parameters, logs, environment variables, and process arguments.
+
+It is one Go binary for macOS and Linux. Agents use public aliases through standard MCP; the background broker owns the decrypted vault and performs SSH authentication with the Go SSH library.
 
 ## Install
 
@@ -74,12 +76,12 @@ aegis-ssh server edit prod
 aegis-ssh server remove prod
 ```
 
-## Run
+## Background operation
 
-Unlock the broker in a terminal and leave it in the foreground:
+Start the broker, unlock it, and then close the terminal:
 
 ```bash
-aegis-ssh daemon
+aegis-ssh start
 ```
 
 From another terminal:
@@ -90,11 +92,27 @@ aegis-ssh exec prod -- 'uptime'
 aegis-ssh exec prod -- 'cd /srv/app && git status --short'
 ```
 
-Quote the complete command after `--`. A command that may reveal sensitive server data requires an exact interactive approval code. Stop the daemon and clear in-memory credentials with:
+Quote the complete command after `--`. Commands selected by the default `enforce` risk policy wait for approval in the local approval center; approval codes no longer enter agent chat.
 
 ```bash
 aegis-ssh lock
+aegis-ssh unlock
+aegis-ssh stop
 ```
+
+Use `aegis-ssh service install` for an optional launchd/systemd user service. It starts locked and never stores the master password.
+
+## Risk policy, batching, and logs
+
+```bash
+aegis-ssh config set risk-policy enforce  # enforce | warn | off
+aegis-ssh config set log-level debug      # debug | info | warn | error | off
+aegis-ssh approval list
+aegis-ssh exec --servers prod,staging -- 'uptime'
+aegis-ssh exec --all -- 'df -h'
+```
+
+Credential isolation, host-key verification, audit logging, and output redaction remain active in every risk mode. Operational logs are available with `aegis-ssh log path`, `aegis-ssh log show`, and `aegis-ssh log follow`.
 
 ## MCP
 
@@ -120,11 +138,11 @@ Copy the matching example from `examples/mcp/` into the client's MCP configurati
 - `cursor.json`
 - `openclaw.json`
 
-The tools are `get_ssh_broker_status`, `list_ssh_servers`, `ssh_execute`, and `ssh_execute_approved`. They expose aliases and filtered command results, never connection fields.
+The tools are `get_ssh_broker_status`, `list_ssh_servers`, `ssh_execute`, and `ssh_execute_batch`. They expose aliases and filtered command results, never connection fields.
 
 Install `skills/aegis-ssh` into the agent's Skill directory or point the client at that directory. The Skill tells agents to prefer MCP, wait for real user approval, and preserve redaction markers.
 
-After starting `aegis-ssh daemon`, ask the Agent by alias:
+After running `aegis-ssh start`, ask the Agent by alias:
 
 ```text
 Use Aegis SSH to list the configured servers.
@@ -145,15 +163,15 @@ State is stored under `~/.aegis-ssh/` with private permissions:
 
 Back up `config.yaml` and `vault.enc` together while the daemon is stopped. Keep the backup private. The master password is not recoverable; losing it makes the vault unusable.
 
-Rotate a server password or replace a private key with `aegis-ssh server edit <alias>`, then restart `aegis-ssh daemon`. Reconfirm the host key only against a trusted source.
+Rotate a server password or replace a private key with `aegis-ssh server edit <alias>`, then run `aegis-ssh start`. Reconfirm the host key only against a trusted source.
 
 ## Troubleshooting
 
-- `daemon: unavailable`: run `aegis-ssh daemon` in a separate terminal.
+- `daemon: unavailable`: run `aegis-ssh start`.
 - `credential vault is locked` or storage failure at startup: verify the master password and private ownership/modes under `~/.aegis-ssh`.
 - Host-key verification failure: stop and investigate the server identity; do not bypass pinning.
 - Authentication failure: stop the daemon, run `server edit`, and enter the current password or import the current private key.
-- Server changes are refused: run `aegis-ssh lock`, then retry the management command.
+- Server changes are refused: run `aegis-ssh stop`, then retry the management command.
 - Output contains `[REDACTED:...]`: the broker intentionally withheld sensitive data. Do not attempt to reconstruct it.
 
 ## Releases

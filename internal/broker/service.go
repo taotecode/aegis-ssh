@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,6 +43,15 @@ type ApprovalStore interface {
 	Revoke(id string) error
 }
 
+type BatchApprovalStore interface {
+	CreateBatch([]string, []byte, []policy.Category, approval.ExecutionLimits) (approval.Approval, error)
+	List(bool) []approval.Approval
+	Decide(string, bool) error
+}
+type WaitingApprovalStore interface {
+	Wait(context.Context, string) (approval.Approval, bool, error)
+}
+
 type SSHExecutor interface {
 	Execute(context.Context, vault.ServerSecret, string, sshclient.Limits) (sshclient.Result, error)
 }
@@ -67,9 +79,14 @@ type ServiceOptions struct {
 	VaultLocked        bool
 	Version            string
 	PolicyVersion      string
+	RiskPolicy         string
+	LogLevel           string
+	BatchConcurrency   int
+	NotifyApproval     func()
 }
 
 type Service struct {
+	mu               sync.RWMutex
 	secrets          SecretLookup
 	analyzer         CommandAnalyzer
 	approvals        ApprovalStore
@@ -84,7 +101,12 @@ type Service struct {
 	vaultLocked      bool
 	version          string
 	policyVersion    string
+	riskPolicy       string
+	logLevel         string
+	batchConcurrency int
 	requestSequence  atomic.Uint64
+	startedAt        time.Time
+	notifyApproval   func()
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -109,6 +131,11 @@ func NewService(options ServiceOptions) (*Service, error) {
 		vaultLocked:      options.VaultLocked,
 		version:          options.Version,
 		policyVersion:    options.PolicyVersion,
+		riskPolicy:       normalizeRiskPolicy(options.RiskPolicy),
+		logLevel:         options.LogLevel,
+		batchConcurrency: normalizeConcurrency(options.BatchConcurrency),
+		startedAt:        options.Now(),
+		notifyApproval:   options.NotifyApproval,
 	}, nil
 }
 
@@ -119,12 +146,17 @@ func (service *Service) Status(ctx context.Context) (model.BrokerStatus, error) 
 	if err := ctx.Err(); err != nil {
 		return model.BrokerStatus{}, model.ErrTimeout
 	}
+	service.mu.RLock()
+	defer service.mu.RUnlock()
 	return model.BrokerStatus{
 		DaemonReachable: true,
 		VaultLocked:     service.vaultLocked,
 		Version:         service.version,
 		PolicyVersion:   service.policyVersion,
 		AuditFailClosed: service.auditFailClosed,
+		RiskPolicy:      service.riskPolicy, LogLevel: service.logLevel,
+		BatchConcurrency: service.batchConcurrency, ServerCount: len(service.servers),
+		PID: os.Getpid(), StartedAt: service.startedAt.UTC().Format(time.RFC3339),
 	}, nil
 }
 
@@ -135,7 +167,52 @@ func (service *Service) ListServers(ctx context.Context) ([]model.ServerSummary,
 	if err := ctx.Err(); err != nil {
 		return nil, model.ErrTimeout
 	}
+	service.mu.RLock()
+	defer service.mu.RUnlock()
 	return cloneServers(service.servers), nil
+}
+
+func (service *Service) SetVaultState(locked bool, servers []model.ServerSummary) {
+	if service == nil {
+		return
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.vaultLocked = locked
+	service.servers = cloneServers(servers)
+}
+
+func (service *Service) UpdateSettings(riskPolicy, logLevel string, batchConcurrency int) {
+	if service == nil {
+		return
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.riskPolicy = normalizeRiskPolicy(riskPolicy)
+	service.logLevel = logLevel
+	service.batchConcurrency = normalizeConcurrency(batchConcurrency)
+}
+
+func (service *Service) settings() (string, int) {
+	service.mu.RLock()
+	defer service.mu.RUnlock()
+	return service.riskPolicy, service.batchConcurrency
+}
+
+func (service *Service) ListApprovals(includeCommand bool) []approval.Approval {
+	store, ok := service.approvals.(BatchApprovalStore)
+	if !ok {
+		return nil
+	}
+	return store.List(includeCommand)
+}
+
+func (service *Service) DecideApproval(id string, allow bool) error {
+	store, ok := service.approvals.(BatchApprovalStore)
+	if !ok {
+		return model.ErrApproval
+	}
+	return store.Decide(id, allow)
 }
 
 func (service *Service) Execute(ctx context.Context, request model.ExecuteRequest) model.ExecuteResult {
@@ -148,11 +225,19 @@ func (service *Service) Execute(ctx context.Context, request model.ExecuteReques
 	}
 	defer vault.ZeroServerSecret(&secret)
 
-	analysis, err := service.analyzer.Analyze(request.Command)
-	if err != nil {
-		return failed(model.ErrValidation)
+	riskPolicy, _ := service.settings()
+	analysis := policy.Analysis{}
+	if riskPolicy != "off" {
+		var err error
+		analysis, err = service.analyzer.Analyze(request.Command)
+		if err != nil {
+			return failed(model.ErrValidation)
+		}
 	}
 	limits := requestLimits(request, service)
+	if riskPolicy == "warn" {
+		return service.executeRemote(ctx, service.nextRequestID(), request.ServerAlias, request.Command, limits, analysis.Categories, false, secret)
+	}
 	if len(analysis.Categories) != 0 {
 		created, err := service.approvals.Create(
 			request.ServerAlias,
@@ -177,13 +262,120 @@ func (service *Service) Execute(ctx context.Context, request model.ExecuteReques
 			Approval: &model.ApprovalInfo{
 				ID:        created.ID,
 				Code:      created.Code,
-				Message:   fmt.Sprintf("检测到风险类别：%s。请由用户确认后回复：允许 %s", categoryList(analysis.Categories), created.Code),
+				Message:   fmt.Sprintf("local approval required for risk categories: %s", categoryList(analysis.Categories)),
 				ExpiresAt: created.ExpiresAt.UTC().Format(time.RFC3339),
 			},
 		}
 	}
 
 	return service.executeRemote(ctx, service.nextRequestID(), request.ServerAlias, request.Command, limits, nil, false, secret)
+}
+
+func (service *Service) ExecuteBatch(ctx context.Context, request model.BatchExecuteRequest) model.BatchExecuteResult {
+	if service == nil || ctx == nil || ctx.Err() != nil || strings.TrimSpace(request.Command) == "" {
+		return model.BatchExecuteResult{Status: model.StatusFailed, Error: model.ErrValidation}
+	}
+	aliases := append([]string(nil), request.ServerAliases...)
+	if request.All {
+		aliases = aliases[:0]
+		for _, server := range service.servers {
+			aliases = append(aliases, server.Alias)
+		}
+	}
+	if request.All {
+		sort.Strings(aliases)
+	}
+	if len(aliases) == 0 || len(aliases) > 256 {
+		return model.BatchExecuteResult{Status: model.StatusFailed, Error: model.ErrValidation}
+	}
+	seen := make(map[string]struct{}, len(aliases))
+	unique := aliases[:0]
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		unique = append(unique, alias)
+	}
+	aliases = unique
+	analysis := policy.Analysis{}
+	if service.riskPolicy != "off" {
+		var err error
+		analysis, err = service.analyzer.Analyze(request.Command)
+		if err != nil {
+			return model.BatchExecuteResult{Status: model.StatusFailed, Error: model.ErrValidation}
+		}
+	}
+	riskPolicy, defaultConcurrency := service.settings()
+	if riskPolicy == "enforce" && len(analysis.Categories) != 0 {
+		store, ok := service.approvals.(BatchApprovalStore)
+		if !ok {
+			return model.BatchExecuteResult{Status: model.StatusFailed, Error: model.ErrApproval}
+		}
+		limits := requestLimits(model.ExecuteRequest{TimeoutSeconds: request.TimeoutSeconds, MaxOutputBytes: request.MaxOutputBytes}, service)
+		created, err := store.CreateBatch(aliases, []byte(request.Command), analysis.Categories, approval.ExecutionLimits{Timeout: limits.Timeout, MaxOutputBytes: limits.MaxOutputBytes})
+		if err != nil {
+			return model.BatchExecuteResult{Status: model.StatusFailed, Error: model.ErrApproval}
+		}
+		return model.BatchExecuteResult{Status: model.StatusRequiresApproval, Approval: &model.ApprovalInfo{ID: created.ID, Message: fmt.Sprintf("local approval required for %d servers; risk categories: %s", len(aliases), categoryList(analysis.Categories)), ExpiresAt: created.ExpiresAt.UTC().Format(time.RFC3339)}}
+	}
+	concurrency := request.Concurrency
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+	if concurrency > 32 {
+		concurrency = 32
+	}
+	results := make([]model.ServerExecuteResult, len(aliases))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for n := 0; n < concurrency; n++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				secret, ok := service.secrets.Lookup(aliases[index])
+				if !ok {
+					results[index] = model.ServerExecuteResult{ServerAlias: aliases[index], ExecuteResult: failed(model.ErrValidation)}
+					continue
+				}
+				limits := requestLimits(model.ExecuteRequest{TimeoutSeconds: request.TimeoutSeconds, MaxOutputBytes: request.MaxOutputBytes}, service)
+				one := service.executeRemote(ctx, service.nextRequestID(), aliases[index], request.Command, limits, analysis.Categories, false, secret)
+				vault.ZeroServerSecret(&secret)
+				results[index] = model.ServerExecuteResult{ServerAlias: aliases[index], ExecuteResult: one}
+			}
+		}()
+	}
+	for i := range aliases {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	status := model.StatusCompleted
+	for _, result := range results {
+		if result.Status != model.StatusCompleted {
+			status = model.StatusFailed
+			break
+		}
+	}
+	return model.BatchExecuteResult{Status: status, Results: results}
+}
+
+func normalizeRiskPolicy(value string) string {
+	if value == "warn" || value == "off" {
+		return value
+	}
+	return "enforce"
+}
+func normalizeConcurrency(value int) int {
+	if value < 1 || value > 32 {
+		return 8
+	}
+	return value
 }
 
 func (service *Service) ExecuteApproved(ctx context.Context, request model.ApprovedRequest) model.ExecuteResult {
@@ -210,6 +402,90 @@ func (service *Service) ExecuteApproved(ctx context.Context, request model.Appro
 		true,
 		secret,
 	)
+}
+
+func (service *Service) ExecuteWait(ctx context.Context, request model.ExecuteRequest) model.ExecuteResult {
+	result := service.Execute(ctx, request)
+	if result.Status != model.StatusRequiresApproval || result.Approval == nil {
+		return result
+	}
+	if service.notifyApproval != nil {
+		service.notifyApproval()
+	}
+	store, ok := service.approvals.(WaitingApprovalStore)
+	if !ok {
+		return failed(model.ErrApproval)
+	}
+	approved, allowed, err := store.Wait(ctx, result.Approval.ID)
+	if err != nil || !allowed {
+		return model.ExecuteResult{Status: model.StatusDenied, Error: model.ErrApproval}
+	}
+	defer vault.Zero(approved.Command)
+	secret, ok := service.secrets.Lookup(approved.ServerAlias)
+	if !ok {
+		return failed(model.ErrValidation)
+	}
+	defer vault.ZeroServerSecret(&secret)
+	return service.executeRemote(ctx, approvalRequestID(approved.ID), approved.ServerAlias, string(approved.Command), sshclient.Limits{Timeout: approved.Limits.Timeout, MaxOutputBytes: approved.Limits.MaxOutputBytes}, approved.Categories, true, secret)
+}
+
+func (service *Service) ExecuteBatchWait(ctx context.Context, request model.BatchExecuteRequest) model.BatchExecuteResult {
+	result := service.ExecuteBatch(ctx, request)
+	if result.Status != model.StatusRequiresApproval || result.Approval == nil {
+		return result
+	}
+	if service.notifyApproval != nil {
+		service.notifyApproval()
+	}
+	store, ok := service.approvals.(WaitingApprovalStore)
+	if !ok {
+		return model.BatchExecuteResult{Status: model.StatusFailed, Error: model.ErrApproval}
+	}
+	approved, allowed, err := store.Wait(ctx, result.Approval.ID)
+	if err != nil || !allowed {
+		return model.BatchExecuteResult{Status: model.StatusDenied, Error: model.ErrApproval}
+	}
+	aliases := approved.ServerAliases
+	concurrency := request.Concurrency
+	if concurrency <= 0 {
+		_, concurrency = service.settings()
+	}
+	if concurrency > 32 {
+		concurrency = 32
+	}
+	results := make([]model.ServerExecuteResult, len(aliases))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for n := 0; n < concurrency; n++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				secret, ok := service.secrets.Lookup(aliases[index])
+				if !ok {
+					results[index] = model.ServerExecuteResult{ServerAlias: aliases[index], ExecuteResult: failed(model.ErrValidation)}
+					continue
+				}
+				one := service.executeRemote(ctx, approvalRequestID(approved.ID), aliases[index], string(approved.Command), sshclient.Limits{Timeout: approved.Limits.Timeout, MaxOutputBytes: approved.Limits.MaxOutputBytes}, approved.Categories, true, secret)
+				vault.ZeroServerSecret(&secret)
+				results[index] = model.ServerExecuteResult{ServerAlias: aliases[index], ExecuteResult: one}
+			}
+		}()
+	}
+	for i := range aliases {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	vault.Zero(approved.Command)
+	status := model.StatusCompleted
+	for _, one := range results {
+		if one.Status != model.StatusCompleted {
+			status = model.StatusFailed
+			break
+		}
+	}
+	return model.BatchExecuteResult{Status: status, Results: results}
 }
 
 func (service *Service) executeRemote(

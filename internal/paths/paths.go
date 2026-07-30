@@ -19,6 +19,7 @@ type Paths struct {
 	ConfigFile string
 	VaultFile  string
 	AuditDir   string
+	LogsDir    string
 	RunDir     string
 	SocketFile string
 }
@@ -37,11 +38,12 @@ func EnsureLayout(root string) (Paths, error) {
 		ConfigFile: filepath.Join(root, "config.yaml"),
 		VaultFile:  filepath.Join(root, "vault.enc"),
 		AuditDir:   filepath.Join(root, "audit"),
+		LogsDir:    filepath.Join(root, "logs"),
 		RunDir:     filepath.Join(root, "run"),
 		SocketFile: filepath.Join(root, "run", "aegis.sock"),
 	}
 
-	for _, dir := range []string{result.Root, result.AuditDir, result.RunDir} {
+	for _, dir := range []string{result.Root, result.AuditDir, result.LogsDir, result.RunDir} {
 		if err := ensurePrivateDir(dir); err != nil {
 			return Paths{}, err
 		}

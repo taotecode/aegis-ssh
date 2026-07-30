@@ -136,6 +136,15 @@ type ExecuteRequest struct {
 	MaxOutputBytes int64  `json:"max_output_bytes,omitempty"`
 }
 
+type BatchExecuteRequest struct {
+	ServerAliases  []string `json:"server_aliases,omitempty"`
+	All            bool     `json:"all,omitempty"`
+	Command        string   `json:"command"`
+	Concurrency    int      `json:"concurrency,omitempty"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty"`
+	MaxOutputBytes int64    `json:"max_output_bytes,omitempty"`
+}
+
 type ApprovedRequest struct {
 	ApprovalID   string `json:"approval_id"`
 	ApprovalCode string `json:"approval_code"`
@@ -154,11 +163,34 @@ type ExecuteResult struct {
 	Redactions RedactionSummary `json:"redactions"`
 }
 
+type ServerExecuteResult struct {
+	ServerAlias string `json:"server_alias"`
+	ExecuteResult
+}
+
+type BatchExecuteResult struct {
+	Status     Status                `json:"status"`
+	Results    []ServerExecuteResult `json:"results,omitempty"`
+	DurationMS int64                 `json:"duration_ms,omitempty"`
+	Approval   *ApprovalInfo         `json:"approval,omitempty"`
+	Error      *CodedError           `json:"error,omitempty"`
+}
+
 type ApprovalInfo struct {
 	ID        string `json:"id"`
-	Code      string `json:"code"`
+	Code      string `json:"code,omitempty"`
 	Message   string `json:"message,omitempty"`
 	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
+type ApprovalSummary struct {
+	ID            string   `json:"id"`
+	ServerAliases []string `json:"server_aliases"`
+	Categories    []string `json:"categories"`
+	Command       string   `json:"command,omitempty"`
+	CreatedAt     string   `json:"created_at"`
+	ExpiresAt     string   `json:"expires_at"`
+	State         string   `json:"state"`
 }
 
 type RedactionSummary struct {
@@ -173,9 +205,15 @@ type ServerSummary struct {
 }
 
 type BrokerStatus struct {
-	DaemonReachable bool   `json:"daemon_reachable"`
-	VaultLocked     bool   `json:"vault_locked"`
-	Version         string `json:"version"`
-	PolicyVersion   string `json:"policy_version"`
-	AuditFailClosed bool   `json:"audit_fail_closed"`
+	DaemonReachable  bool   `json:"daemon_reachable"`
+	VaultLocked      bool   `json:"vault_locked"`
+	Version          string `json:"version"`
+	PolicyVersion    string `json:"policy_version"`
+	AuditFailClosed  bool   `json:"audit_fail_closed"`
+	RiskPolicy       string `json:"risk_policy,omitempty"`
+	LogLevel         string `json:"log_level,omitempty"`
+	BatchConcurrency int    `json:"batch_concurrency,omitempty"`
+	PID              int    `json:"pid,omitempty"`
+	StartedAt        string `json:"started_at,omitempty"`
+	ServerCount      int    `json:"server_count,omitempty"`
 }

@@ -1,5 +1,17 @@
 # 让 Agent 使用 Aegis SSH
 
+## v0.3 本机审批和批量执行
+
+使用 `aegis-ssh start` 启动后台 broker；登录服务启动后处于锁定状态时，运行 `aegis-ssh unlock`。默认 `enforce` 模式下，敏感 MCP 调用会等待用户在另一个本机终端处理：
+
+```bash
+aegis-ssh approval list
+aegis-ssh approval show <id>
+aegis-ssh approval approve <id>   # 或 approval deny <id>
+```
+
+Agent 不再转述或确认批准码。相同命令要在多台服务器执行时使用 `ssh_execute_batch`；有风险的批量请求会固定目标别名快照，并只需一次本机审批。
+
 [English](agent-usage.md) | 简体中文
 
 本文介绍添加一台或多台服务器后，如何让 AI Agent 使用 Aegis SSH。Agent 只能看到 `prod` 之类的公开别名；密码认证和私钥认证都由本地 broker 处理，对 Agent 的使用方式完全相同。
@@ -40,18 +52,19 @@ codex mcp list
 
 ## 启动 Broker
 
-要求 Agent 连接前，在单独终端中启动并解锁前台 daemon：
+要求 Agent 连接前，启动并解锁后台 broker：
 
 ```bash
-aegis-ssh daemon
+aegis-ssh start
 ```
 
-在隐藏提示中输入本地主密码，并保持该终端运行。MCP 进程本身不会解锁 vault，而是与这个本地 daemon 通信。
+在隐藏提示中输入本地主密码。启动后可以关闭终端；MCP 进程只与本机 broker 通信，不会收到主密码。
 
 使用结束后，停止 daemon 并清除内存中的凭据：
 
 ```bash
 aegis-ssh lock
+aegis-ssh stop
 ```
 
 ## 向 Agent 下达任务
@@ -92,10 +105,7 @@ ssh_execute
         |
         +--> completed：返回过滤后的输出
         |
-        +--> requires_approval：显示批准消息并等待用户
-                                      |
-                                      v
-                              ssh_execute_approved
+        +--> 本机审批：工具等待用户在本地允许或拒绝
 ```
 
 四个 MCP 工具分别是：
@@ -105,23 +115,19 @@ ssh_execute
 | `get_ssh_broker_status` | 检查 daemon 是否可访问、vault 是否已经解锁。 |
 | `list_ssh_servers` | 列出公开别名、描述和可用状态。 |
 | `ssh_execute` | 通过别名执行一条完整、非交互式命令。 |
-| `ssh_execute_approved` | 在用户精确确认后，执行已经保存的原命令；不能传入替换命令。 |
+| `ssh_execute_batch` | 在显式别名或全部别名上并发执行同一命令。 |
 
 ## 批准流程
 
-有些命令可能暴露服务器敏感信息。第一次调用会返回 `requires_approval` 和类似以下内容的消息：
+有些命令可能暴露服务器敏感信息。MCP 调用会等待，桌面通知提示用户在本机审批中心处理：
 
 ```text
-检测到风险类别：network。请由用户确认后回复：允许 ABCD
+aegis-ssh approval list
+aegis-ssh approval show <id>
+aegis-ssh approval approve <id>  # 或 deny
 ```
 
-Agent 必须原样显示该消息并停止。用户决定允许时，需要精确回复：
-
-```text
-允许 ABCD
-```
-
-收到完全一致的用户回复后，Agent 才能使用返回的一次性批准 ID 和代码调用 `ssh_execute_approved`。Agent 不得代替用户批准。批准有效期为五分钟、只能使用一次，并与原始别名、命令和执行限制绑定；修改命令后必须重新申请批准。
+审批信息不会进入 Agent 对话。审批五分钟过期、只能使用一次，并绑定原始别名快照、命令和执行限制；Agent 不能代替用户批准。
 
 批准后，命令输出仍会经过过滤。必须原样保留所有 `[REDACTED:...]` 标记和截断警告，不得要求 Agent 还原隐藏内容。
 
@@ -140,9 +146,9 @@ $HOME/.local/bin/aegis-ssh mcp
 ## 故障排查
 
 - 找不到 MCP：检查 `codex mcp list` 或对应客户端配置，使用二进制绝对路径，然后重新启动客户端。
-- 提示 `daemon: unavailable`：在单独终端中运行 `aegis-ssh daemon` 并保持运行。
-- vault 未解锁：在 daemon 所在终端输入主密码，绝不能在 Agent 对话中输入。
+- 提示 `daemon: unavailable`：运行 `aegis-ssh start`。
+- vault 未解锁：在本机终端运行 `aegis-ssh unlock`，绝不能在 Agent 对话中输入主密码。
 - 找不到别名：停止 daemon，在真实终端中运行 `aegis-ssh server add`，然后重新启动 daemon。
 - 认证失败：停止 daemon，运行 `aegis-ssh server edit <alias>` 替换密码或私钥。
-- 批准失败：重新提出原始请求，并在新代码过期前精确回复。
+- 审批失败：使用 `aegis-ssh approval list` 检查待办；过期后重新提出原始请求。
 - 输出被脱敏或截断：这是主动设置的数据披露边界，不是 MCP 传输故障。

@@ -23,19 +23,28 @@ var (
 
 type Config struct {
 	Version  int                     `yaml:"version"`
+	Language string                  `yaml:"language,omitempty"`
 	Defaults Defaults                `yaml:"defaults"`
 	Servers  map[string]ServerPublic `yaml:"servers"`
 }
 
 type Defaults struct {
-	ConnectTimeout  string `yaml:"connect_timeout,omitempty"`
-	CommandTimeout  string `yaml:"command_timeout,omitempty"`
-	MaxOutputBytes  int64  `yaml:"max_output_bytes,omitempty"`
-	AuditFailClosed bool   `yaml:"audit_fail_closed"`
+	ConnectTimeout   string `yaml:"connect_timeout,omitempty"`
+	CommandTimeout   string `yaml:"command_timeout,omitempty"`
+	MaxOutputBytes   int64  `yaml:"max_output_bytes,omitempty"`
+	AuditFailClosed  bool   `yaml:"audit_fail_closed"`
+	RiskPolicy       string `yaml:"risk_policy,omitempty"`
+	LogLevel         string `yaml:"log_level,omitempty"`
+	BatchConcurrency int    `yaml:"batch_concurrency,omitempty"`
 }
 
 type ServerPublic struct {
-	Description string `yaml:"description,omitempty"`
+	Description     string `yaml:"description,omitempty"`
+	HostHint        string `yaml:"host_hint,omitempty"`
+	Port            uint16 `yaml:"port,omitempty"`
+	UserHint        string `yaml:"user_hint,omitempty"`
+	AuthMethod      string `yaml:"auth_method,omitempty"`
+	FingerprintHint string `yaml:"fingerprint_hint,omitempty"`
 }
 
 func Parse(data []byte) (Config, error) {

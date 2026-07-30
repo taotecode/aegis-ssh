@@ -8,11 +8,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/taotecode/aegis-ssh/internal/approval"
@@ -21,6 +25,7 @@ import (
 	"github.com/taotecode/aegis-ssh/internal/config"
 	"github.com/taotecode/aegis-ssh/internal/mcpserver"
 	"github.com/taotecode/aegis-ssh/internal/model"
+	"github.com/taotecode/aegis-ssh/internal/opslog"
 	"github.com/taotecode/aegis-ssh/internal/paths"
 	"github.com/taotecode/aegis-ssh/internal/policy"
 	"github.com/taotecode/aegis-ssh/internal/sshclient"
@@ -28,8 +33,8 @@ import (
 )
 
 const (
-	Version       = "0.2.0"
-	PolicyVersion = "1"
+	Version       = "0.3.0"
+	PolicyVersion = "2"
 
 	defaultConnectTimeout = 10 * time.Second
 	defaultCommandTimeout = 30 * time.Second
@@ -52,6 +57,7 @@ var (
 	ErrServerNotFound     = errors.New("server alias not found")
 	ErrHostKeyProbe       = errors.New("unable to probe SSH host key")
 	ErrHostKeyUnconfirmed = errors.New("SSH host key was not confirmed")
+	ErrConnectionTest     = errors.New("SSH connection test failed")
 	ErrPasswordMismatch   = errors.New("master passwords do not match")
 	ErrStorage            = errors.New("secure local storage operation failed")
 )
@@ -71,6 +77,7 @@ type Dependencies struct {
 	OpenTerminal   func() (Terminal, error)
 	HostKeyProbe   HostKeyProbe
 	ReadPrivateKey func(string) ([]byte, error)
+	TestConnection func(context.Context, vault.ServerSecret) error
 	BrokerClient   func(string) BrokerClient
 }
 
@@ -93,6 +100,9 @@ func New(deps Dependencies) *App {
 	}
 	if deps.ReadPrivateKey == nil {
 		deps.ReadPrivateKey = readPrivateKeyFile
+	}
+	if deps.TestConnection == nil {
+		deps.TestConnection = testSSHConnection
 	}
 	if deps.BrokerClient == nil {
 		deps.BrokerClient = func(path string) BrokerClient { return broker.NewClient(path) }
@@ -131,7 +141,27 @@ func (application *App) Run(ctx context.Context, args []string) error {
 		if len(args) != 1 {
 			return ErrUsage
 		}
-		return application.daemon(ctx)
+		return application.daemon(ctx, true)
+	case "daemon-locked":
+		if len(args) != 1 {
+			return ErrUsage
+		}
+		return application.daemon(ctx, false)
+	case "start":
+		if len(args) != 1 {
+			return ErrUsage
+		}
+		return application.start(ctx)
+	case "stop":
+		if len(args) != 1 {
+			return ErrUsage
+		}
+		return application.stop(ctx)
+	case "unlock":
+		if len(args) != 1 {
+			return ErrUsage
+		}
+		return application.unlock(ctx)
 	case "lock":
 		if len(args) != 1 {
 			return ErrUsage
@@ -142,6 +172,14 @@ func (application *App) Run(ctx context.Context, args []string) error {
 			return ErrUsage
 		}
 		return application.status(ctx)
+	case "config":
+		return application.configCommand(ctx, args[1:])
+	case "approval":
+		return application.approvalCommand(ctx, args[1:])
+	case "log":
+		return application.logCommand(ctx, args[1:])
+	case "service":
+		return application.serviceCommand(ctx, args[1:])
 	case "server":
 		return application.server(ctx, args[1:])
 	case "exec":
@@ -177,12 +215,12 @@ func (application *App) initialize() error {
 		return err
 	}
 	defer terminal.Close()
-	master, err := ReadSecret(terminal, "Master password: ")
+	master, err := ReadSecret(terminal, application.text("Master password: ", "主密码："))
 	if err != nil {
 		return err
 	}
 	defer Zero(master)
-	confirmation, err := ReadSecret(terminal, "Confirm master password: ")
+	confirmation, err := ReadSecret(terminal, application.text("Confirm master password: ", "确认主密码："))
 	if err != nil {
 		return err
 	}
@@ -200,7 +238,7 @@ func (application *App) initialize() error {
 		_ = os.Remove(layout.ConfigFile)
 		return ErrStorage
 	}
-	_, _ = fmt.Fprintln(application.deps.Stdout, "aegis-ssh initialized")
+	_, _ = fmt.Fprintln(application.deps.Stdout, application.text("aegis-ssh initialized", "aegis-ssh 初始化完成"))
 	return nil
 }
 
@@ -229,6 +267,16 @@ func (application *App) server(ctx context.Context, args []string) error {
 			return ErrUsage
 		}
 		return application.listServers()
+	case "show":
+		if len(args) != 2 && (len(args) != 3 || args[2] != "--reveal") {
+			return ErrUsage
+		}
+		return application.showServer(ctx, args[1], len(args) == 3)
+	case "test":
+		if len(args) != 2 {
+			return ErrUsage
+		}
+		return application.testServer(ctx, args[1])
 	default:
 		return ErrUsage
 	}
@@ -237,24 +285,24 @@ func (application *App) server(ctx context.Context, args []string) error {
 func (application *App) addServer(ctx context.Context) error {
 	var addedAlias string
 	err := application.withUnlockedVault(ctx, func(terminal Terminal, cfg *config.Config, data *vault.Data) error {
-		alias, err := ReadText(terminal, "Alias: ")
+		alias, err := ReadText(terminal, application.text("Alias: ", "别名："))
 		if err != nil || !validAlias(alias) {
 			return ErrInvalidAlias
 		}
 		if _, ok := cfg.Servers[alias]; ok {
 			return ErrServerExists
 		}
-		description, secret, err := application.readServer(ctx, terminal)
+		description, secret, err := application.readServer(ctx, terminal, "", nil)
 		if err != nil {
 			return err
 		}
-		cfg.Servers[alias] = config.ServerPublic{Description: description}
+		cfg.Servers[alias] = publicServerConfig(description, secret)
 		data.Servers[alias] = secret
 		addedAlias = alias
 		return nil
 	})
 	if err == nil {
-		_, _ = fmt.Fprintf(application.deps.Stdout, "server %s added\n", addedAlias)
+		_, _ = fmt.Fprintf(application.deps.Stdout, application.text("server %s added\n", "服务器 %s 添加成功\n"), addedAlias)
 	}
 	return err
 }
@@ -267,18 +315,22 @@ func (application *App) editServer(ctx context.Context, alias string) error {
 		if _, ok := cfg.Servers[alias]; !ok {
 			return ErrServerNotFound
 		}
-		description, secret, err := application.readServer(ctx, terminal)
+		oldSecret, ok := data.Servers[alias]
+		if !ok {
+			return ErrServerNotFound
+		}
+		description, secret, err := application.readServer(ctx, terminal, cfg.Servers[alias].Description, &oldSecret)
 		if err != nil {
 			return err
 		}
 		old := data.Servers[alias]
 		vault.ZeroServerSecret(&old)
-		cfg.Servers[alias] = config.ServerPublic{Description: description}
+		cfg.Servers[alias] = publicServerConfig(description, secret)
 		data.Servers[alias] = secret
 		return nil
 	})
 	if err == nil {
-		_, _ = fmt.Fprintf(application.deps.Stdout, "server %s updated\n", alias)
+		_, _ = fmt.Fprintf(application.deps.Stdout, application.text("server %s updated\n", "服务器 %s 更新成功\n"), alias)
 	}
 	return err
 }
@@ -291,7 +343,7 @@ func (application *App) removeServer(ctx context.Context, alias string) error {
 		if _, ok := cfg.Servers[alias]; !ok {
 			return ErrServerNotFound
 		}
-		confirmed, err := ConfirmExact(terminal, "Type the alias to remove: ", alias)
+		confirmed, err := ConfirmExact(terminal, application.text("Type the alias to remove: ", "输入要删除的服务器别名："), alias)
 		if err != nil {
 			return err
 		}
@@ -305,21 +357,31 @@ func (application *App) removeServer(ctx context.Context, alias string) error {
 		return nil
 	})
 	if err == nil {
-		_, _ = fmt.Fprintf(application.deps.Stdout, "server %s removed\n", alias)
+		_, _ = fmt.Fprintf(application.deps.Stdout, application.text("server %s removed\n", "服务器 %s 删除成功\n"), alias)
 	}
 	return err
 }
 
-func (application *App) readServer(ctx context.Context, terminal Terminal) (string, vault.ServerSecret, error) {
-	description, err := ReadText(terminal, "Description: ")
+func (application *App) readServer(ctx context.Context, terminal Terminal, existingDescription string, existing *vault.ServerSecret) (string, vault.ServerSecret, error) {
+	lang := application.language()
+	_, _ = fmt.Fprintln(terminal, localize(lang, "[1/6] Public description (optional)", "[1/6] 公开描述（可选）"))
+	description, err := ReadTextDefault(terminal, localize(lang, "Description: ", "描述："), existingDescription)
 	if err != nil {
 		return "", vault.ServerSecret{}, err
 	}
-	host, err := ReadText(terminal, "Host: ")
+	_, _ = fmt.Fprintln(terminal, localize(lang, "[2/6] SSH network endpoint", "[2/6] SSH 网络端点"))
+	hostDefault, userDefault, portDefault, authDefault := "", "", "22", "private-key"
+	if existing != nil {
+		hostDefault = existing.Host
+		userDefault = existing.User
+		portDefault = strconv.FormatUint(uint64(existing.Port), 10)
+		authDefault = string(existing.EffectiveAuthMethod())
+	}
+	host, err := ReadTextDefault(terminal, localize(lang, "Host: ", "主机："), hostDefault)
 	if err != nil || host == "" {
 		return "", vault.ServerSecret{}, ErrInvalidServer
 	}
-	portText, err := ReadText(terminal, "Port: ")
+	portText, err := ReadTextDefault(terminal, localize(lang, "Port: ", "端口："), portDefault)
 	if err != nil {
 		return "", vault.ServerSecret{}, ErrInvalidServer
 	}
@@ -327,30 +389,39 @@ func (application *App) readServer(ctx context.Context, terminal Terminal) (stri
 	if err != nil || portValue == 0 {
 		return "", vault.ServerSecret{}, ErrInvalidServer
 	}
-	user, err := ReadText(terminal, "User: ")
+	_, _ = fmt.Fprintln(terminal, localize(lang, "[3/6] SSH login user", "[3/6] SSH 登录用户"))
+	user, err := ReadTextDefault(terminal, localize(lang, "User: ", "用户名："), userDefault)
 	if err != nil || user == "" {
 		return "", vault.ServerSecret{}, ErrInvalidServer
 	}
-	authText, err := ReadText(terminal, "Authentication method (password/private-key): ")
+	_, _ = fmt.Fprintln(terminal, localize(lang, "[4/6] Authentication method", "[4/6] 认证方式"))
+	authText, err := ReadTextDefault(terminal, localize(lang, "Authentication method (password/private-key): ", "认证方式（password/private-key）："), authDefault)
 	method := vault.AuthMethod(authText)
 	if err != nil || !validAuthMethod(method) {
 		return "", vault.ServerSecret{}, ErrInvalidAuthMethod
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, defaultConnectTimeout)
-	fingerprint, err := application.deps.HostKeyProbe.Probe(probeCtx, host, uint16(portValue))
-	cancel()
-	if err != nil || fingerprint == "" {
-		return "", vault.ServerSecret{}, ErrHostKeyProbe
+	fingerprint := ""
+	if existing != nil && host == existing.Host && uint16(portValue) == existing.Port {
+		fingerprint = existing.HostFingerprint
+		_, _ = fmt.Fprintln(terminal, localize(lang, "[5/6] Host endpoint unchanged; preserving the pinned host key", "[5/6] 主机端点未变化，保留已固定的主机密钥"))
+	} else {
+		probeCtx, cancel := context.WithTimeout(ctx, defaultConnectTimeout)
+		fingerprint, err = application.deps.HostKeyProbe.Probe(probeCtx, host, uint16(portValue))
+		cancel()
+		if err != nil || fingerprint == "" {
+			return "", vault.ServerSecret{}, ErrHostKeyProbe
+		}
+		_, _ = fmt.Fprintf(terminal, localize(lang, "[5/6] Verify host identity through a trusted channel\nHost key fingerprint: %s\n", "[5/6] 请通过可信渠道核对主机身份\n主机密钥指纹：%s\n"), fingerprint)
+		confirmed, confirmErr := ConfirmExact(terminal, localize(lang, "Type TRUST to pin this host key: ", "确认无误后输入 TRUST 固定主机密钥："), "TRUST")
+		if confirmErr != nil {
+			return "", vault.ServerSecret{}, confirmErr
+		}
+		if !confirmed {
+			return "", vault.ServerSecret{}, ErrHostKeyUnconfirmed
+		}
 	}
-	_, _ = fmt.Fprintf(terminal, "Host key fingerprint: %s\n", fingerprint)
-	confirmed, err := ConfirmExact(terminal, "Type TRUST to pin this host key: ", "TRUST")
-	if err != nil {
-		return "", vault.ServerSecret{}, err
-	}
-	if !confirmed {
-		return "", vault.ServerSecret{}, ErrHostKeyUnconfirmed
-	}
-	secret, err := application.readAuthentication(terminal, method)
+	_, _ = fmt.Fprintln(terminal, localize(lang, "[6/6] Enter credentials securely; they will be imported into the encrypted vault", "[6/6] 安全输入凭据；凭据将导入加密 vault"))
+	secret, err := application.readAuthenticationExisting(terminal, method, existing)
 	if err != nil {
 		return "", vault.ServerSecret{}, err
 	}
@@ -358,6 +429,11 @@ func (application *App) readServer(ctx context.Context, terminal Terminal) (stri
 	secret.Port = uint16(portValue)
 	secret.User = user
 	secret.HostFingerprint = fingerprint
+	_, _ = fmt.Fprintln(terminal, localize(lang, "Testing SSH authentication before saving...", "保存前正在测试 SSH 认证……"))
+	if err := application.deps.TestConnection(ctx, secret); err != nil {
+		vault.ZeroServerSecret(&secret)
+		return "", vault.ServerSecret{}, ErrConnectionTest
+	}
 	return description, secret, nil
 }
 
@@ -378,6 +454,7 @@ func (application *App) withUnlockedVault(ctx context.Context, mutate func(Termi
 	if err != nil {
 		return ErrNotInitialized
 	}
+	cfg = normalizedConfig(cfg, nil)
 	if cfg.Servers == nil {
 		cfg.Servers = make(map[string]config.ServerPublic)
 	}
@@ -386,7 +463,7 @@ func (application *App) withUnlockedVault(ctx context.Context, mutate func(Termi
 		return err
 	}
 	defer terminal.Close()
-	master, err := ReadSecret(terminal, "Master password: ")
+	master, err := ReadSecret(terminal, application.text("Master password: ", "主密码："))
 	if err != nil {
 		return err
 	}
@@ -406,6 +483,7 @@ func (application *App) withUnlockedVault(ctx context.Context, mutate func(Termi
 	if err := mutate(terminal, &cfg, &data); err != nil {
 		return err
 	}
+	cfg = normalizedConfig(cfg, &data)
 	if err := saveConfigVerified(layout.ConfigFile, cfg); err != nil {
 		return ErrStorage
 	}
@@ -441,7 +519,7 @@ func (application *App) listServers() error {
 	return nil
 }
 
-func (application *App) daemon(ctx context.Context) error {
+func (application *App) daemon(ctx context.Context, unlockAtStart bool) error {
 	layout, err := application.layout()
 	if err != nil {
 		return ErrStorage
@@ -458,26 +536,7 @@ func (application *App) daemon(ctx context.Context) error {
 	if err != nil {
 		return ErrNotInitialized
 	}
-	terminal, err := application.deps.OpenTerminal()
-	if err != nil {
-		return err
-	}
-	master, err := ReadSecret(terminal, "Master password: ")
-	_ = terminal.Close()
-	if err != nil {
-		return err
-	}
-	defer Zero(master)
-	data, err := (vault.Store{Path: layout.VaultFile}).Load(master)
-	if err != nil {
-		return ErrStorage
-	}
-	if !consistentAliases(cfg, data) {
-		zeroVaultData(&data)
-		return ErrStorage
-	}
-	secrets := newMemorySecrets(data)
-	zeroVaultData(&data)
+	secrets := newMemorySecrets(vault.Data{Servers: make(map[string]vault.ServerSecret)})
 	defer secrets.Lock()
 
 	connectTimeout, commandTimeout, maxOutput, err := validateDefaults(cfg.Defaults)
@@ -488,24 +547,195 @@ func (application *App) daemon(ctx context.Context) error {
 	if err != nil {
 		return ErrStorage
 	}
+	operations, err := opslog.New(layout.LogsDir, cfg.Defaults.LogLevel)
+	if err != nil {
+		return ErrStorage
+	}
+	operations.Write(opslog.Info, "daemon", "started", "", "", "", 0)
 	redactor := outputRedactor{}
+	sshExecutor := sshclient.NewWithConnectTimeout(connectTimeout)
 	service, err := broker.NewService(broker.ServiceOptions{
 		Secrets: secrets, Analyzer: policy.NewAnalyzer(),
-		Approvals: approval.NewStore(time.Now, rand.Reader), Executor: sshclient.NewWithConnectTimeout(connectTimeout),
+		Approvals: approval.NewStore(time.Now, rand.Reader), Executor: sshExecutor,
 		Redactor: redactor, Auditor: logger, Now: time.Now,
 		AllowAuditFailOpen: !cfg.Defaults.AuditFailClosed,
 		DefaultTimeout:     commandTimeout, DefaultMaxOutput: maxOutput,
-		Servers: publicServers(cfg, secrets), Version: Version, PolicyVersion: PolicyVersion,
+		Servers: publicServers(cfg, secrets), VaultLocked: true, Version: Version, PolicyVersion: PolicyVersion,
+		RiskPolicy: cfg.Defaults.RiskPolicy, LogLevel: cfg.Defaults.LogLevel, BatchConcurrency: cfg.Defaults.BatchConcurrency,
+		NotifyApproval: notifyLocalApproval,
 	})
 	if err != nil {
 		return ErrStorage
 	}
 	daemonCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	wrapped := &daemonService{Service: service, secrets: secrets, cancel: cancel}
+	wrapped := &daemonService{Service: service, secrets: secrets, cancel: cancel, operations: operations, connections: sshExecutor, lockedServers: publicServers(cfg, secrets)}
+	wrapped.configure = func(key, value string) error {
+		latest, loadErr := config.Load(layout.ConfigFile)
+		if loadErr != nil {
+			return model.ErrValidation
+		}
+		switch key {
+		case "language":
+			if value != "auto" && value != "en" && value != "zh-CN" {
+				return model.ErrValidation
+			}
+			latest.Language = value
+		case "risk-policy":
+			if value != "enforce" && value != "warn" && value != "off" {
+				return model.ErrValidation
+			}
+			latest.Defaults.RiskPolicy = value
+		case "log-level":
+			if _, ok := opslog.ParseLevel(value); !ok {
+				return model.ErrValidation
+			}
+			latest.Defaults.LogLevel = value
+		case "batch-concurrency":
+			number, parseErr := strconv.Atoi(value)
+			if parseErr != nil || number < 1 || number > 32 {
+				return model.ErrValidation
+			}
+			latest.Defaults.BatchConcurrency = number
+		default:
+			return model.ErrValidation
+		}
+		if saveErr := saveConfigVerified(layout.ConfigFile, latest); saveErr != nil {
+			return model.ErrAudit
+		}
+		if key == "log-level" {
+			operations.SetLevel(value)
+		}
+		service.UpdateSettings(latest.Defaults.RiskPolicy, latest.Defaults.LogLevel, latest.Defaults.BatchConcurrency)
+		operations.Write(opslog.Info, "config", "updated", "", "", "", 0)
+		return nil
+	}
+	wrapped.unlock = func(master []byte) error {
+		data, loadErr := (vault.Store{Path: layout.VaultFile}).Load(master)
+		if loadErr != nil {
+			return model.ErrLockedVault
+		}
+		defer zeroVaultData(&data)
+		latest, configErr := config.Load(layout.ConfigFile)
+		if configErr != nil || !consistentAliases(latest, data) {
+			return model.ErrLockedVault
+		}
+		latest = normalizedConfig(latest, &data)
+		if saveErr := saveConfigVerified(layout.ConfigFile, latest); saveErr != nil {
+			return model.ErrAudit
+		}
+		wrapped.mu.Lock()
+		wrapped.lockedServers = publicServers(latest, &memorySecrets{servers: map[string]vault.ServerSecret{}})
+		wrapped.mu.Unlock()
+		secrets.Replace(data)
+		service.SetVaultState(false, publicServers(latest, secrets))
+		operations.Write(opslog.Info, "vault", "unlocked", "", "", "", 0)
+		return nil
+	}
+	if unlockAtStart {
+		terminal, openErr := application.deps.OpenTerminal()
+		if openErr != nil {
+			return openErr
+		}
+		master, readErr := ReadSecret(terminal, application.text("Master password: ", "主密码："))
+		_ = terminal.Close()
+		if readErr != nil {
+			return readErr
+		}
+		defer Zero(master)
+		if unlockErr := wrapped.Unlock(ctx, master); unlockErr != nil {
+			return ErrStorage
+		}
+	}
 	if err := broker.NewServer(layout.SocketFile, wrapped).Serve(daemonCtx); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (application *App) start(ctx context.Context) error {
+	layout, err := application.layout()
+	if err != nil {
+		return ErrStorage
+	}
+	if running, _ := application.daemonReachable(ctx, layout.SocketFile); running {
+		_, _ = fmt.Fprintln(application.deps.Stdout, application.text("aegis-ssh daemon already running", "aegis-ssh 后台服务已在运行"))
+		return nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return ErrStorage
+	}
+	logPath := filepath.Join(layout.RunDir, "daemon.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return ErrStorage
+	}
+	command := exec.Command(executable, "daemon-locked")
+	command.Stdin = nil
+	command.Stdout = logFile
+	command.Stderr = logFile
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		_ = logFile.Close()
+		return err
+	}
+	_ = logFile.Close()
+	_ = command.Process.Release()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if running, _ := application.daemonReachable(ctx, layout.SocketFile); running {
+			_, _ = fmt.Fprintln(application.deps.Stdout, application.text("aegis-ssh daemon started (locked)", "aegis-ssh 后台服务已启动（锁定状态）"))
+			return application.unlock(ctx)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return ErrDaemonUnavailable
+}
+
+func (application *App) stop(ctx context.Context) error {
+	layout, err := application.layout()
+	if err != nil {
+		return ErrStorage
+	}
+	client := application.deps.BrokerClient(layout.SocketFile)
+	stopper, ok := client.(interface{ Stop(context.Context) error })
+	if !ok {
+		return ErrDaemonUnavailable
+	}
+	if err := stopper.Stop(ctx); err != nil {
+		return ErrDaemonUnavailable
+	}
+	_, _ = fmt.Fprintln(application.deps.Stdout, application.text("aegis-ssh daemon stopped", "aegis-ssh 后台服务已停止"))
+	return nil
+}
+
+func (application *App) unlock(ctx context.Context) error {
+	layout, err := application.layout()
+	if err != nil {
+		return ErrStorage
+	}
+	terminal, err := application.deps.OpenTerminal()
+	if err != nil {
+		return err
+	}
+	defer terminal.Close()
+	master, err := ReadSecret(terminal, application.text("Master password: ", "主密码："))
+	if err != nil {
+		return err
+	}
+	defer Zero(master)
+	client := application.deps.BrokerClient(layout.SocketFile)
+	unlocker, ok := client.(interface {
+		Unlock(context.Context, []byte) error
+	})
+	if !ok {
+		return ErrDaemonUnavailable
+	}
+	if err := unlocker.Unlock(ctx, master); err != nil {
+		return ErrStorage
+	}
+	_, _ = fmt.Fprintln(application.deps.Stdout, application.text("aegis-ssh daemon unlocked", "aegis-ssh 后台服务已解锁"))
 	return nil
 }
 
@@ -517,7 +747,7 @@ func (application *App) lock(ctx context.Context) error {
 	if err := application.deps.BrokerClient(layout.SocketFile).Lock(ctx); err != nil {
 		return ErrDaemonUnavailable
 	}
-	_, _ = fmt.Fprintln(application.deps.Stdout, "aegis-ssh daemon locked")
+	_, _ = fmt.Fprintln(application.deps.Stdout, application.text("aegis-ssh daemon locked and credentials cleared", "aegis-ssh 已锁定并清除内存凭据"))
 	return nil
 }
 
@@ -528,18 +758,27 @@ func (application *App) status(ctx context.Context) error {
 	}
 	status, err := application.deps.BrokerClient(layout.SocketFile).Status(ctx)
 	if err != nil {
-		_, _ = fmt.Fprintln(application.deps.Stdout, "daemon: unavailable")
+		_, _ = fmt.Fprintln(application.deps.Stdout, application.text("daemon: unavailable", "后台服务：未运行"))
+		application.printServiceStatus()
 		return nil
 	}
-	state := "ready"
+	state := application.text("ready", "就绪")
 	if status.VaultLocked {
-		state = "locked"
+		state = application.text("locked", "已锁定")
 	}
-	_, _ = fmt.Fprintf(application.deps.Stdout, "daemon: %s\nversion: %s\npolicy: %s\n", state, status.Version, status.PolicyVersion)
+	format := application.text("daemon: %s\npid: %d\nstarted: %s\nversion: %s\npolicy: %s\nrisk policy: %s\nlog level: %s\nbatch concurrency: %d\nservers: %d\n", "后台服务：%s\n进程 ID：%d\n启动时间：%s\n版本：%s\n策略版本：%s\n风险策略：%s\n日志级别：%s\n批量并发：%d\n服务器数量：%d\n")
+	_, _ = fmt.Fprintf(application.deps.Stdout, format, state, status.PID, status.StartedAt, status.Version, status.PolicyVersion, defaultString(status.RiskPolicy, "enforce"), defaultString(status.LogLevel, "info"), defaultInt(status.BatchConcurrency, 8), status.ServerCount)
+	application.printServiceStatus()
 	return nil
 }
 
 func (application *App) execute(ctx context.Context, args []string) error {
+	if len(args) < 3 {
+		return ErrUsage
+	}
+	if args[0] == "--servers" || args[0] == "--all" {
+		return application.executeBatch(ctx, args)
+	}
 	if len(args) != 3 || !validAlias(args[0]) || args[1] != "--" {
 		return ErrUsage
 	}
@@ -565,7 +804,7 @@ func (application *App) execute(ctx context.Context, args []string) error {
 		if openErr != nil {
 			return openErr
 		}
-		confirmed, confirmErr := ConfirmExact(terminal, "Type the approval code to continue: ", result.Approval.Code)
+		confirmed, confirmErr := ConfirmExact(terminal, application.text("Type the approval code to continue: ", "输入批准码继续："), result.Approval.Code)
 		_ = terminal.Close()
 		if confirmErr != nil {
 			return confirmErr
@@ -579,6 +818,55 @@ func (application *App) execute(ctx context.Context, args []string) error {
 		}
 	}
 	return application.printExecuteResult(result)
+}
+
+func (application *App) executeBatch(ctx context.Context, args []string) error {
+	request := model.BatchExecuteRequest{}
+	switch {
+	case len(args) == 4 && args[0] == "--servers" && args[2] == "--":
+		request.ServerAliases = strings.Split(args[1], ",")
+		request.Command = args[3]
+	case len(args) == 3 && args[0] == "--all" && args[1] == "--":
+		request.All = true
+		request.Command = args[2]
+	default:
+		return ErrUsage
+	}
+	for _, alias := range request.ServerAliases {
+		if !validAlias(strings.TrimSpace(alias)) {
+			return ErrInvalidAlias
+		}
+	}
+	layout, err := application.layout()
+	if err != nil {
+		return ErrStorage
+	}
+	client := application.deps.BrokerClient(layout.SocketFile)
+	batch, ok := client.(interface {
+		ExecuteBatch(context.Context, model.BatchExecuteRequest) (model.BatchExecuteResult, error)
+	})
+	if !ok {
+		return ErrDaemonUnavailable
+	}
+	result, err := batch.ExecuteBatch(ctx, request)
+	if err != nil {
+		return ErrDaemonUnavailable
+	}
+	if result.Status == model.StatusRequiresApproval {
+		return model.ErrApproval
+	}
+	failed := false
+	for _, one := range result.Results {
+		_, _ = fmt.Fprintf(application.deps.Stdout, "== %s ==\n", one.ServerAlias)
+		if err := application.printExecuteResult(one.ExecuteResult); err != nil {
+			failed = true
+			_, _ = fmt.Fprintf(application.deps.Stderr, "[%s] %v\n", one.ServerAlias, err)
+		}
+	}
+	if failed {
+		return model.ErrConnection
+	}
+	return nil
 }
 
 func (application *App) printExecuteResult(result model.ExecuteResult) error {
@@ -639,20 +927,52 @@ func (application *App) layout() (paths.Paths, error) {
 }
 
 func (application *App) printHelp() {
-	_, _ = io.WriteString(application.deps.Stdout, `Usage: aegis-ssh <command>
+	lang := application.language()
+	english := `Usage: aegis-ssh <command>
 
 Commands:
   init                         Initialize encrypted local storage
   daemon                       Unlock and run the SSH broker
-  lock                         Clear daemon credentials and stop it
+  start                        Start the broker in the background and unlock it
+  unlock                       Unlock a running broker
+  lock                         Clear in-memory credentials but keep broker running
+  stop                         Stop the background broker
   status                       Show broker availability
+  config show|set              Show or change safe settings
+  approval list|show|approve|deny  Manage local approvals
   server add                   Add a server interactively
   server edit <alias>          Replace a server interactively
   server remove <alias>        Remove a server
   server list                  List public aliases and descriptions
+  server show <alias>          Show masked connection details
+  server test <alias>          Test SSH authentication
   exec <alias> -- '<command>'  Execute an exact remote shell string
+  exec --servers a,b -- '<command>' Execute concurrently
+  exec --all -- '<command>'    Execute on all configured aliases
+	service install|uninstall    Manage the login service
+	log path|show|follow         Inspect operational logs
   mcp                          Run the standard stdio MCP server
-`)
+`
+	chinese := `用法：aegis-ssh <命令>
+
+命令：
+  init                         初始化加密存储
+  daemon                       前台解锁并运行 SSH broker
+  start / stop                 后台启动 / 停止 broker
+  unlock / lock                解锁 / 清除内存凭据
+  status                       查看运行状态
+  config show|set              查看或修改语言、风险和日志配置
+  approval list|show|approve|deny  在本机处理风险审批
+  server add|edit|remove       管理服务器
+  server list|show|test        列出、查看或测试服务器
+  exec <别名> -- '<命令>'       执行远程命令
+  exec --servers a,b -- '<命令>'  并发批量执行
+  exec --all -- '<命令>'       在全部别名上并发执行
+  service install|uninstall    管理登录自启服务
+  log path|show|follow         查看或持续跟踪运维日志
+  mcp                          启动标准 MCP 服务
+`
+	_, _ = io.WriteString(application.deps.Stdout, localize(lang, english, chinese))
 }
 
 type ExitCodeError struct {
@@ -666,6 +986,18 @@ func (err *ExitCodeError) Error() string {
 type memorySecrets struct {
 	mu      sync.RWMutex
 	servers map[string]vault.ServerSecret
+}
+
+func (secrets *memorySecrets) Replace(data vault.Data) {
+	secrets.mu.Lock()
+	defer secrets.mu.Unlock()
+	for alias, secret := range secrets.servers {
+		vault.ZeroServerSecret(&secret)
+		delete(secrets.servers, alias)
+	}
+	for alias, secret := range data.Servers {
+		secrets.servers[alias] = vault.CloneServerSecret(secret)
+	}
 }
 
 func newMemorySecrets(data vault.Data) *memorySecrets {
@@ -697,16 +1029,66 @@ func (secrets *memorySecrets) Lock() {
 
 type daemonService struct {
 	*broker.Service
-	secrets *memorySecrets
-	cancel  context.CancelFunc
-	once    sync.Once
+	secrets       *memorySecrets
+	cancel        context.CancelFunc
+	once          sync.Once
+	unlock        func([]byte) error
+	operations    *opslog.Logger
+	connections   *sshclient.Client
+	configure     func(string, string) error
+	lockedServers []model.ServerSummary
+	mu            sync.Mutex
 }
 
 func (service *daemonService) Lock(context.Context) {
+	service.secrets.Lock()
+	service.connections.Close()
+	service.mu.Lock()
+	locked := append([]model.ServerSummary(nil), service.lockedServers...)
+	service.mu.Unlock()
+	service.Service.SetVaultState(true, locked)
+	service.operations.Write(opslog.Info, "vault", "locked", "", "", "", 0)
+}
+
+func (service *daemonService) Stop(context.Context) {
 	service.once.Do(func() {
 		service.secrets.Lock()
+		service.connections.Close()
+		service.operations.Write(opslog.Info, "daemon", "stopped", "", "", "", 0)
 		service.cancel()
 	})
+}
+func (service *daemonService) Unlock(_ context.Context, master []byte) error {
+	if service.unlock == nil {
+		return model.ErrValidation
+	}
+	return service.unlock(master)
+}
+
+func (service *daemonService) ListApprovalSummaries(includeCommand bool) []model.ApprovalSummary {
+	items := service.Service.ListApprovals(includeCommand)
+	result := make([]model.ApprovalSummary, 0, len(items))
+	for _, item := range items {
+		aliases := item.ServerAliases
+		if len(aliases) == 0 && item.ServerAlias != "" {
+			aliases = []string{item.ServerAlias}
+		}
+		categories := make([]string, len(item.Categories))
+		for index, category := range item.Categories {
+			categories[index] = string(category)
+		}
+		result = append(result, model.ApprovalSummary{ID: item.ID, ServerAliases: aliases, Categories: categories, Command: string(item.Command), CreatedAt: item.CreatedAt.UTC().Format(time.RFC3339), ExpiresAt: item.ExpiresAt.UTC().Format(time.RFC3339), State: "pending"})
+	}
+	return result
+}
+func (service *daemonService) DecideApproval(id string, allow bool) error {
+	return service.Service.DecideApproval(id, allow)
+}
+func (service *daemonService) Configure(_ context.Context, key, value string) error {
+	if service.configure == nil {
+		return model.ErrValidation
+	}
+	return service.configure(key, value)
 }
 
 type outputRedactor struct{}
@@ -717,12 +1099,71 @@ func (outputRedactor) Redact(input string, allowed map[policy.RedactionCategory]
 
 func defaultConfig() config.Config {
 	return config.Config{
-		Version: 1,
+		Version: 2, Language: "auto",
 		Defaults: config.Defaults{
 			ConnectTimeout: defaultConnectTimeout.String(), CommandTimeout: defaultCommandTimeout.String(),
-			MaxOutputBytes: defaultMaxOutput, AuditFailClosed: true,
+			MaxOutputBytes: defaultMaxOutput, AuditFailClosed: true, RiskPolicy: "enforce", LogLevel: "info", BatchConcurrency: 8,
 		},
 		Servers: make(map[string]config.ServerPublic),
+	}
+}
+
+func normalizedConfig(cfg config.Config, data *vault.Data) config.Config {
+	cfg.Version = 2
+	if cfg.Language == "" {
+		cfg.Language = "auto"
+	}
+	if cfg.Defaults.RiskPolicy == "" {
+		cfg.Defaults.RiskPolicy = "enforce"
+	}
+	if cfg.Defaults.LogLevel == "" {
+		cfg.Defaults.LogLevel = "info"
+	}
+	if cfg.Defaults.BatchConcurrency == 0 {
+		cfg.Defaults.BatchConcurrency = 8
+	}
+	if cfg.Servers == nil {
+		cfg.Servers = make(map[string]config.ServerPublic)
+	}
+	if data != nil {
+		for alias, secret := range data.Servers {
+			public := cfg.Servers[alias]
+			cfg.Servers[alias] = publicServerConfig(public.Description, secret)
+		}
+	}
+	return cfg
+}
+
+func publicServerConfig(description string, secret vault.ServerSecret) config.ServerPublic {
+	return config.ServerPublic{Description: description, HostHint: maskValue(secret.Host), Port: secret.Port, UserHint: maskValue(secret.User), AuthMethod: string(secret.EffectiveAuthMethod()), FingerprintHint: maskFingerprint(secret.HostFingerprint)}
+}
+func maskValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 2 {
+		return strings.Repeat("*", len(value))
+	}
+	return value[:1] + strings.Repeat("*", min(8, len(value)-2)) + value[len(value)-1:]
+}
+func maskFingerprint(value string) string {
+	if len(value) <= 12 {
+		return maskValue(value)
+	}
+	return value[:7] + "..." + value[len(value)-5:]
+}
+
+func notifyLocalApproval() {
+	message := "A command is waiting. Run: aegis-ssh approval list"
+	var command *exec.Cmd
+	if runtime.GOOS == "darwin" {
+		command = exec.Command("osascript", "-e", `display notification "`+message+`" with title "Aegis SSH approval"`)
+	}
+	if runtime.GOOS == "linux" {
+		command = exec.Command("notify-send", "Aegis SSH approval", message)
+	}
+	if command != nil {
+		if err := command.Start(); err == nil {
+			go func() { _ = command.Wait() }()
+		}
 	}
 }
 

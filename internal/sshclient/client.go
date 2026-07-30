@@ -3,6 +3,7 @@ package sshclient
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"net"
@@ -37,14 +38,24 @@ type Result struct {
 
 type Client struct {
 	connectTimeout time.Duration
+	mu             sync.Mutex
+	connections    map[[32]byte]cachedConnection
+	generation     uint64
 }
 
+type cachedConnection struct {
+	client   *ssh.Client
+	lastUsed time.Time
+}
+
+const connectionIdleTimeout = 60 * time.Second
+
 func New() *Client {
-	return &Client{}
+	return &Client{connections: make(map[[32]byte]cachedConnection)}
 }
 
 func NewWithConnectTimeout(timeout time.Duration) *Client {
-	return &Client{connectTimeout: timeout}
+	return &Client{connectTimeout: timeout, connections: make(map[[32]byte]cachedConnection)}
 }
 
 func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command string, limits Limits) (Result, error) {
@@ -56,47 +67,11 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 		return Result{}, err
 	}
 
-	var connectTimeout time.Duration
-	if c != nil {
-		connectTimeout = c.connectTimeout
-	}
-	if connectTimeout <= 0 {
-		connectTimeout = limits.Timeout
-	}
-	connectCtx, cancelConnect := context.WithTimeout(ctx, connectTimeout)
-
-	address := net.JoinHostPort(secret.Host, strconv.FormatUint(uint64(secret.Port), 10))
-	conn, err := (&net.Dialer{}).DialContext(connectCtx, "tcp", address)
+	key := connectionKey(secret)
+	client, err := c.getClient(ctx, secret, auth, limits.Timeout, key)
 	if err != nil {
-		result := connectionError(connectCtx)
-		cancelConnect()
-		return Result{}, result
+		return Result{}, err
 	}
-
-	hostKeyRejected := false
-	config := &ssh.ClientConfig{
-		User: secret.User,
-		Auth: []ssh.AuthMethod{auth},
-		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
-			actual := ssh.FingerprintSHA256(key)
-			if subtle.ConstantTimeCompare([]byte(actual), []byte(secret.HostFingerprint)) != 1 {
-				hostKeyRejected = true
-				return model.ErrHostKey
-			}
-			return nil
-		},
-	}
-
-	sshConn, channels, requests, err := handshake(connectCtx, conn, address, config)
-	if err != nil {
-		_ = conn.Close()
-		result := handshakeError(connectCtx, err, hostKeyRejected)
-		cancelConnect()
-		return Result{}, result
-	}
-	cancelConnect()
-	client := ssh.NewClient(sshConn, channels, requests)
-	defer client.Close()
 	opCtx, cancel := context.WithTimeout(ctx, limits.Timeout)
 	defer cancel()
 
@@ -108,12 +83,15 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 		select {
 		case <-opCtx.Done():
 			_ = client.Close()
+			c.evict(key, client)
 		case <-stopContextWatch:
 		}
 	}()
 
 	session, err := client.NewSession()
 	if err != nil {
+		_ = client.Close()
+		c.evict(key, client)
 		return Result{}, connectionError(opCtx)
 	}
 	defer session.Close()
@@ -139,13 +117,117 @@ func (c *Client) Execute(ctx context.Context, secret vault.ServerSecret, command
 			result.ExitCode = exitError.ExitStatus()
 			return result, nil
 		}
+		_ = client.Close()
+		c.evict(key, client)
 		return result, connectionError(opCtx)
 	case <-opCtx.Done():
 		_ = session.Close()
 		_ = client.Close()
+		c.evict(key, client)
 		<-runResult
 		return collectResult(stdout, stderr, budget), model.ErrTimeout
 	}
+}
+
+func (c *Client) getClient(ctx context.Context, secret vault.ServerSecret, auth ssh.AuthMethod, timeout time.Duration, key [32]byte) (*ssh.Client, error) {
+	if c == nil {
+		return nil, model.ErrValidation
+	}
+	now := time.Now()
+	c.mu.Lock()
+	generation := c.generation
+	for cachedKey, item := range c.connections {
+		if now.Sub(item.lastUsed) > connectionIdleTimeout {
+			_ = item.client.Close()
+			delete(c.connections, cachedKey)
+		}
+	}
+	if item, ok := c.connections[key]; ok {
+		item.lastUsed = now
+		c.connections[key] = item
+		c.mu.Unlock()
+		return item.client, nil
+	}
+	c.mu.Unlock()
+	connectTimeout := c.connectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = timeout
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+	defer cancel()
+	address := net.JoinHostPort(secret.Host, strconv.FormatUint(uint64(secret.Port), 10))
+	conn, err := (&net.Dialer{}).DialContext(connectCtx, "tcp", address)
+	if err != nil {
+		return nil, connectionError(connectCtx)
+	}
+	hostKeyRejected := false
+	config := &ssh.ClientConfig{User: secret.User, Auth: []ssh.AuthMethod{auth}, HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+		actual := ssh.FingerprintSHA256(key)
+		if subtle.ConstantTimeCompare([]byte(actual), []byte(secret.HostFingerprint)) != 1 {
+			hostKeyRejected = true
+			return model.ErrHostKey
+		}
+		return nil
+	}}
+	sshConn, channels, requests, err := handshake(connectCtx, conn, address, config)
+	if err != nil {
+		_ = conn.Close()
+		return nil, handshakeError(connectCtx, err, hostKeyRejected)
+	}
+	newClient := ssh.NewClient(sshConn, channels, requests)
+	c.mu.Lock()
+	if generation != c.generation {
+		c.mu.Unlock()
+		_ = newClient.Close()
+		return nil, model.ErrConnection
+	}
+	if item, ok := c.connections[key]; ok {
+		c.mu.Unlock()
+		_ = newClient.Close()
+		return item.client, nil
+	}
+	c.connections[key] = cachedConnection{client: newClient, lastUsed: time.Now()}
+	c.mu.Unlock()
+	return newClient, nil
+}
+
+func (c *Client) evict(key [32]byte, client *ssh.Client) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if item, ok := c.connections[key]; ok && item.client == client {
+		delete(c.connections, key)
+	}
+	c.mu.Unlock()
+}
+func (c *Client) Close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.generation++
+	for key, item := range c.connections {
+		_ = item.client.Close()
+		delete(c.connections, key)
+	}
+}
+func connectionKey(secret vault.ServerSecret) [32]byte {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(secret.Host))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(strconv.FormatUint(uint64(secret.Port), 10)))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(secret.User))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(secret.HostFingerprint))
+	_, _ = hash.Write(secret.Password)
+	_, _ = hash.Write(secret.PrivateKey)
+	_, _ = hash.Write(secret.PrivateKeyPassphrase)
+	var result [32]byte
+	copy(result[:], hash.Sum(nil))
+	return result
 }
 
 func valid(ctx context.Context, secret vault.ServerSecret, command string, limits Limits) bool {

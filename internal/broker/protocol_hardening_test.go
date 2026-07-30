@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -501,6 +502,33 @@ func TestFitExecuteOutputPreservesSingleStream(t *testing.T) {
 	stdout, stderr = fitExecuteOutput("", strings.Repeat("err", 100), available)
 	if stdout != "" || stderr == "" {
 		t.Fatalf("stderr-only fit = (%q, %q)", stdout, stderr)
+	}
+}
+
+func TestProtocolFitsLargeBatchResult(t *testing.T) {
+	result := model.BatchExecuteResult{Status: model.StatusCompleted, Results: make([]model.ServerExecuteResult, 16)}
+	for index := range result.Results {
+		result.Results[index] = model.ServerExecuteResult{ServerAlias: fmt.Sprintf("server-%d", index), ExecuteResult: model.ExecuteResult{Status: model.StatusCompleted, Stdout: strings.Repeat("x", 1<<20), Stderr: strings.Repeat("界", 1<<19)}}
+	}
+	response := marshalResult("batch-large", result)
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > MaxFrameBytes || response.Error != nil {
+		t.Fatalf("batch response size=%d response=%+v", len(encoded), response.Error)
+	}
+	var got model.BatchExecuteResult
+	if err := json.Unmarshal(response.Result, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, one := range got.Results {
+		if !one.Truncated {
+			t.Fatal("large batch result was not marked truncated")
+		}
+		if !utf8.ValidString(one.Stdout) || !utf8.ValidString(one.Stderr) {
+			t.Fatal("invalid UTF-8")
+		}
 	}
 }
 

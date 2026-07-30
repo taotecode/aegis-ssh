@@ -52,6 +52,23 @@ func (client *Client) ExecuteApproved(ctx context.Context, request model.Approve
 	return result, err
 }
 
+func (client *Client) ExecuteBatch(ctx context.Context, request model.BatchExecuteRequest) (model.BatchExecuteResult, error) {
+	var result model.BatchExecuteResult
+	err := client.call(ctx, "execute_batch", request, &result)
+	return result, err
+}
+
+func (client *Client) ExecuteWait(ctx context.Context, request model.ExecuteRequest) (model.ExecuteResult, error) {
+	var result model.ExecuteResult
+	err := client.call(ctx, "execute_wait", request, &result)
+	return result, err
+}
+func (client *Client) ExecuteBatchWait(ctx context.Context, request model.BatchExecuteRequest) (model.BatchExecuteResult, error) {
+	var result model.BatchExecuteResult
+	err := client.call(ctx, "execute_batch_wait", request, &result)
+	return result, err
+}
+
 // Lock asks the local daemon to clear its in-memory credentials and stop. It
 // is intentionally not part of the public MCP surface.
 func (client *Client) Lock(ctx context.Context) error {
@@ -59,6 +76,73 @@ func (client *Client) Lock(ctx context.Context) error {
 		Accepted bool `json:"accepted"`
 	}
 	if err := client.call(ctx, "lock", nil, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return ErrInvalidProtocol
+	}
+	return nil
+}
+
+func (client *Client) Stop(ctx context.Context) error {
+	var result struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := client.call(ctx, "stop", nil, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return ErrInvalidProtocol
+	}
+	return nil
+}
+
+func (client *Client) Unlock(ctx context.Context, master []byte) error {
+	var result struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := client.call(ctx, "unlock", struct {
+		Master []byte `json:"master"`
+	}{master}, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return ErrInvalidProtocol
+	}
+	return nil
+}
+
+func (client *Client) ListApprovals(ctx context.Context, includeCommand bool) ([]model.ApprovalSummary, error) {
+	var result []model.ApprovalSummary
+	err := client.call(ctx, "approval_list", struct {
+		IncludeCommand bool `json:"include_command"`
+	}{includeCommand}, &result)
+	return result, err
+}
+
+func (client *Client) DecideApproval(ctx context.Context, id string, allow bool) error {
+	var result struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := client.call(ctx, "approval_decide", struct {
+		ID    string `json:"id"`
+		Allow bool   `json:"allow"`
+	}{id, allow}, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return ErrInvalidProtocol
+	}
+	return nil
+}
+func (client *Client) Configure(ctx context.Context, key, value string) error {
+	var result struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := client.call(ctx, "configure", struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}{key, value}, &result); err != nil {
 		return err
 	}
 	if !result.Accepted {

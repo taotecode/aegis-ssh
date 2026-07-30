@@ -10,7 +10,7 @@ import (
 	"github.com/taotecode/aegis-ssh/internal/model"
 )
 
-const implementationVersion = "0.2.0"
+const implementationVersion = "0.3.0"
 
 var ErrInvalidServer = errors.New("invalid MCP server configuration")
 
@@ -30,7 +30,7 @@ func New(client BrokerClient) *Server {
 	registerStatusTool(inner, client)
 	registerListTool(inner, client)
 	registerExecuteTool(inner, client)
-	registerApprovedTool(inner, client)
+	registerBatchTool(inner, client)
 	return &Server{inner: inner}
 }
 
@@ -54,9 +54,13 @@ type executeInput struct {
 	MaxOutputBytes int64  `json:"max_output_bytes,omitempty" jsonschema:"optional bounded stdout and stderr limit in bytes"`
 }
 
-type approvedInput struct {
-	ApprovalID   string `json:"approval_id" jsonschema:"single-use approval identifier returned by ssh_execute"`
-	ApprovalCode string `json:"approval_code" jsonschema:"four-character code explicitly confirmed by the user"`
+type batchInput struct {
+	ServerAliases  []string `json:"server_aliases,omitempty" jsonschema:"explicit public aliases; omit when all is true"`
+	All            bool     `json:"all,omitempty"`
+	Command        string   `json:"command"`
+	Concurrency    int      `json:"concurrency,omitempty"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty"`
+	MaxOutputBytes int64    `json:"max_output_bytes,omitempty"`
 }
 
 type statusOutput struct {
@@ -167,10 +171,19 @@ func registerExecuteTool(server *mcp.Server, client BrokerClient) {
 		if client == nil {
 			return nil, executeOutput{}, safeBrokerError(broker.ErrUnavailable)
 		}
-		result, err := client.Execute(ctx, model.ExecuteRequest{
+		request := model.ExecuteRequest{
 			ServerAlias: input.ServerAlias, Command: input.Command,
 			TimeoutSeconds: input.TimeoutSeconds, MaxOutputBytes: input.MaxOutputBytes,
-		})
+		}
+		var result model.ExecuteResult
+		var err error
+		if waiting, ok := client.(interface {
+			ExecuteWait(context.Context, model.ExecuteRequest) (model.ExecuteResult, error)
+		}); ok {
+			result, err = waiting.ExecuteWait(ctx, request)
+		} else {
+			result, err = client.Execute(ctx, request)
+		}
 		if err != nil {
 			return nil, executeOutput{}, safeBrokerError(err)
 		}
@@ -178,22 +191,39 @@ func registerExecuteTool(server *mcp.Server, client BrokerClient) {
 	})
 }
 
-func registerApprovedTool(server *mcp.Server, client BrokerClient) {
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "ssh_execute_approved",
-		Description: "Execute the stored command for a user-confirmed, single-use approval. " +
-			"Accepts no replacement command and never exposes SSH credentials or connection details.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, input approvedInput) (*mcp.CallToolResult, executeOutput, error) {
+func registerBatchTool(server *mcp.Server, client BrokerClient) {
+	mcp.AddTool(server, &mcp.Tool{Name: "ssh_execute_batch", Description: "Execute one exact command concurrently on multiple public aliases without exposing SSH credentials or connection details. Enforce-mode approvals are completed through the local Aegis SSH approval center."}, func(ctx context.Context, _ *mcp.CallToolRequest, input batchInput) (*mcp.CallToolResult, model.BatchExecuteResult, error) {
 		if client == nil {
-			return nil, executeOutput{}, safeBrokerError(broker.ErrUnavailable)
+			return nil, model.BatchExecuteResult{}, safeBrokerError(broker.ErrUnavailable)
 		}
-		result, err := client.ExecuteApproved(ctx, model.ApprovedRequest{
-			ApprovalID: input.ApprovalID, ApprovalCode: input.ApprovalCode,
+		batchClient, ok := client.(interface {
+			ExecuteBatch(context.Context, model.BatchExecuteRequest) (model.BatchExecuteResult, error)
 		})
-		if err != nil {
-			return nil, executeOutput{}, safeBrokerError(err)
+		if !ok {
+			return nil, model.BatchExecuteResult{}, safeBrokerError(broker.ErrUnavailable)
 		}
-		return executeToolResult(result)
+		request := model.BatchExecuteRequest{ServerAliases: input.ServerAliases, All: input.All, Command: input.Command, Concurrency: input.Concurrency, TimeoutSeconds: input.TimeoutSeconds, MaxOutputBytes: input.MaxOutputBytes}
+		var result model.BatchExecuteResult
+		var err error
+		if waiting, ok := client.(interface {
+			ExecuteBatchWait(context.Context, model.BatchExecuteRequest) (model.BatchExecuteResult, error)
+		}); ok {
+			result, err = waiting.ExecuteBatchWait(ctx, request)
+		} else {
+			result, err = batchClient.ExecuteBatch(ctx, request)
+		}
+		if err != nil {
+			return nil, model.BatchExecuteResult{}, safeBrokerError(err)
+		}
+		message := "Batch SSH command completed."
+		isError := false
+		if result.Status == model.StatusRequiresApproval {
+			message = "Batch SSH command is waiting for local approval."
+		} else if result.Status != model.StatusCompleted {
+			message = "Batch SSH command failed."
+			isError = true
+		}
+		return textResult(message, isError), result, nil
 	})
 }
 
@@ -244,7 +274,7 @@ func publicExecuteOutput(result model.ExecuteResult) executeOutput {
 	}
 	if result.Approval != nil {
 		output.Approval = &approvalOutput{
-			ID: result.Approval.ID, Code: result.Approval.Code,
+			ID:      result.Approval.ID,
 			Message: result.Approval.Message, ExpiresAt: result.Approval.ExpiresAt,
 		}
 	}

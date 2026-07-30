@@ -1,5 +1,17 @@
 # Use Aegis SSH With Agents
 
+## v0.3 local approval and batching
+
+Start the broker with `aegis-ssh start`; if a login service started it in locked state, run `aegis-ssh unlock`. In the default `enforce` mode a sensitive MCP call waits while the user handles the request in another local terminal:
+
+```bash
+aegis-ssh approval list
+aegis-ssh approval show <id>
+aegis-ssh approval approve <id>   # or: approval deny <id>
+```
+
+The agent is never asked to relay or confirm an approval code. Use `ssh_execute_batch` for one command across explicit aliases or all aliases; a risky batch is bound to one immutable target snapshot and needs one local approval.
+
 English | [简体中文](agent-usage.zh-CN.md)
 
 This guide explains how an AI Agent uses Aegis SSH after one or more servers have been enrolled. Agents see only public aliases such as `prod`; password and private-key authentication are handled locally by the broker and are identical from the Agent's perspective.
@@ -40,18 +52,19 @@ Restart Codex after installing or updating the Skill or MCP configuration. A run
 
 ## Start The Broker
 
-Start and unlock the foreground daemon in a separate terminal before asking an Agent to connect:
+Start and unlock the background broker before asking an Agent to connect:
 
 ```bash
-aegis-ssh daemon
+aegis-ssh start
 ```
 
-Enter the local master password at the hidden prompt and leave this terminal open. The MCP process does not unlock the vault itself; it communicates with this local daemon.
+Enter the local master password at the hidden prompt. After startup the terminal can be closed. The MCP process communicates with this local broker and never receives the password.
 
-Stop the daemon and clear in-memory credentials when finished:
+Lock or stop the broker when finished:
 
 ```bash
 aegis-ssh lock
+aegis-ssh stop
 ```
 
 ## Ask The Agent
@@ -92,10 +105,7 @@ ssh_execute
         |
         +--> completed: return filtered output
         |
-        +--> requires_approval: show the message and wait for the user
-                                      |
-                                      v
-                              ssh_execute_approved
+        +--> local approval: the call waits while the user approves or denies locally
 ```
 
 The four MCP tools are:
@@ -105,23 +115,19 @@ The four MCP tools are:
 | `get_ssh_broker_status` | Check whether the daemon is reachable and the vault is unlocked. |
 | `list_ssh_servers` | List public aliases, descriptions, and availability. |
 | `ssh_execute` | Execute one exact non-interactive command through an alias. |
-| `ssh_execute_approved` | Execute the already stored command after exact user confirmation. It cannot accept a replacement command. |
+| `ssh_execute_batch` | Execute one command concurrently across explicit aliases or all aliases. |
 
 ## Approval Flow
 
-Some commands can expose sensitive server information. The first call then returns `requires_approval` and a message similar to:
+Some commands can expose sensitive server information. The MCP call waits while a desktop notification directs the user to the local approval center:
 
 ```text
-检测到风险类别：network。请由用户确认后回复：允许 ABCD
+aegis-ssh approval list
+aegis-ssh approval show <id>
+aegis-ssh approval approve <id>  # or deny
 ```
 
-The Agent must show that message verbatim and stop. To approve, reply with exactly:
-
-```text
-允许 ABCD
-```
-
-The Agent may then call `ssh_execute_approved` using the returned single-use approval ID and code. The Agent must not approve on your behalf. Approvals expire after five minutes, are consumed once, and are bound to the original alias, command, and execution limits. A changed command requires a new approval.
+No approval code is added to agent chat. Approvals expire after five minutes, are consumed once, and are bound to the original aliases, command, and execution limits. The Agent cannot approve on your behalf.
 
 Command output is filtered even after approval. Keep every `[REDACTED:...]` marker and truncation warning as returned; do not ask the Agent to reconstruct hidden data.
 
@@ -140,9 +146,9 @@ Clients that support reusable Skills can load `skills/aegis-ssh`. Clients withou
 ## Troubleshooting
 
 - MCP server is missing: verify `codex mcp list` or the equivalent client configuration, use the absolute binary path, and restart the client.
-- `daemon: unavailable`: run `aegis-ssh daemon` in a separate terminal and leave it running.
-- Vault is locked: enter the master password in the daemon terminal, never in the Agent conversation.
+- `daemon: unavailable`: run `aegis-ssh start`.
+- Vault is locked: run `aegis-ssh unlock` in a local terminal, never enter the master password in Agent conversation.
 - Alias is missing: stop the daemon, run `aegis-ssh server add` in a real terminal, then restart the daemon.
 - Authentication fails: stop the daemon and run `aegis-ssh server edit <alias>` to replace the password or private key.
-- Approval fails: repeat the original request and reply with the new exact code before it expires.
+- Approval fails: inspect pending requests with `aegis-ssh approval list` and retry the original request after an expiry.
 - Output is redacted or truncated: this is an intentional disclosure boundary, not an MCP transport failure.

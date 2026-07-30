@@ -1,5 +1,19 @@
 # 添加和管理 SSH 服务器
 
+## v0.3 管理命令
+
+`server add` 现在是六步交互向导。SSH 端口直接回车使用默认值 `22`；程序会自动发现权限安全的 `~/.ssh/id_ed25519`、`id_ecdsa` 或 `id_rsa`。私钥内容导入加密 vault，源路径不会保存。
+
+```bash
+aegis-ssh server list
+aegis-ssh server show prod   # 只显示脱敏连接提示
+aegis-ssh server show prod --reveal  # 解锁后显示非凭据连接字段
+aegis-ssh server test prod   # 测试握手、固定主机密钥和认证
+aegis-ssh server edit prod
+```
+
+修改本地服务器存储前运行 `aegis-ssh stop`。`lock` 现在只清除内存凭据并保持 broker 运行。
+
 [English](server-setup.md) | 简体中文
 
 本文介绍首次初始化 vault、添加多台服务器、密码和私钥认证、校验主机密钥、测试连接、轮换凭据和删除服务器的完整流程。
@@ -128,16 +142,17 @@ Aegis SSH 显示的指纹必须与服务器当前启用的某个主机密钥完�
 aegis-ssh server list
 ```
 
-在一个独立终端中启动 broker，并保持它在前台运行：
+启动并解锁后台 broker，随后可以关闭终端：
 
 ```bash
-aegis-ssh daemon
+aegis-ssh start
 ```
 
 根据提示输入主密码，然后在另一个终端执行低风险测试命令：
 
 ```bash
 aegis-ssh status
+aegis-ssh server test prod
 aegis-ssh exec prod -- 'uptime'
 ```
 
@@ -170,7 +185,7 @@ aegis-ssh server remove prod
 ## 故障排查
 
 - 提示 `aegis-ssh is not initialized`：在终端中运行 `aegis-ssh init`。
-- 拒绝修改服务器：运行 `aegis-ssh lock` 后重试。
+- 拒绝修改服务器：运行 `aegis-ssh stop` 后重试。
 - 提示 `unable to probe SSH host key`：检查地址和端口、网络连通性、防火墙规则，以及目标端口是否有 SSH 服务监听。
 - 执行时主机密钥校验失败：立即停止并调查。只有通过可信来源确认服务器发生了合法密钥轮换后，才能使用 `server edit` 更新。
 - SSH 认证失败：停止 daemon，使用 `server edit <alias>` 输入当前有效密码或导入当前私钥。
@@ -179,4 +194,4 @@ aegis-ssh server remove prod
 
 ## 本机 Codex 安装完成后
 
-重新启动 Codex，使其发现新安装的 Skill 和 MCP 配置。在终端中保持 `aegis-ssh daemon` 运行，然后通过别名让 Codex 操作服务器，例如：`使用 Aegis SSH 在 prod 上执行 uptime。` 完整配置和提示词示例见[让 Agent 使用 Aegis SSH](agent-usage.zh-CN.md)。
+重新启动 Codex，使其发现新安装的 Skill 和 MCP 配置。运行 `aegis-ssh start` 后即可关闭终端，然后通过别名让 Codex 操作服务器，例如：`使用 Aegis SSH 在 prod 上执行 uptime。` 完整配置和提示词示例见[让 Agent 使用 Aegis SSH](agent-usage.zh-CN.md)。

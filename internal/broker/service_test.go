@@ -27,6 +27,39 @@ type fakeExecutor struct {
 	err         error
 }
 
+type countingAnalyzer struct {
+	mu       sync.Mutex
+	calls    int
+	analysis policy.Analysis
+}
+
+func (analyzer *countingAnalyzer) Analyze(string) (policy.Analysis, error) {
+	analyzer.mu.Lock()
+	defer analyzer.mu.Unlock()
+	analyzer.calls++
+	return analyzer.analysis, nil
+}
+
+type concurrentExecutor struct {
+	mu                       sync.Mutex
+	active, maxActive, calls int
+}
+
+func (executor *concurrentExecutor) Execute(_ context.Context, _ vault.ServerSecret, _ string, _ sshclient.Limits) (sshclient.Result, error) {
+	executor.mu.Lock()
+	executor.active++
+	executor.calls++
+	if executor.active > executor.maxActive {
+		executor.maxActive = executor.active
+	}
+	executor.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	executor.mu.Lock()
+	executor.active--
+	executor.mu.Unlock()
+	return sshclient.Result{Stdout: "ok"}, nil
+}
+
 func (executor *fakeExecutor) Execute(_ context.Context, _ vault.ServerSecret, command string, limits sshclient.Limits) (sshclient.Result, error) {
 	executor.calls++
 	executor.lastCommand = command
@@ -133,6 +166,58 @@ func newTestServiceWithDependencies(executor SSHExecutor, auditor Auditor, appro
 	return service
 }
 
+func TestBatchExecutesConcurrentlyAndAnalyzesOnce(t *testing.T) {
+	now := func() time.Time { return time.Now() }
+	analyzer := &countingAnalyzer{}
+	executor := &concurrentExecutor{}
+	secrets := memorySecrets{servers: map[string]vault.ServerSecret{}}
+	aliases := []string{"c", "a", "b"}
+	for _, alias := range aliases {
+		secrets.servers[alias] = vault.ServerSecret{Host: "hidden", Port: 22, User: "hidden", Password: []byte("secret"), HostFingerprint: "SHA256:test"}
+	}
+	service, err := NewService(ServiceOptions{Secrets: secrets, Analyzer: analyzer, Approvals: approval.NewStore(now, rand.Reader), Executor: executor, Redactor: realOutputRedactor{}, Auditor: &fakeAudit{}, Now: now, DefaultTimeout: time.Second, DefaultMaxOutput: 4096, BatchConcurrency: 2, RiskPolicy: "enforce"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := service.ExecuteBatch(context.Background(), model.BatchExecuteRequest{ServerAliases: aliases, Command: "uptime"})
+	if result.Status != model.StatusCompleted || len(result.Results) != 3 {
+		t.Fatalf("result=%#v", result)
+	}
+	for index, alias := range aliases {
+		if result.Results[index].ServerAlias != alias {
+			t.Fatalf("order=%v", result.Results)
+		}
+	}
+	if analyzer.calls != 1 || executor.calls != 3 || executor.maxActive != 2 {
+		t.Fatalf("analysis=%d calls=%d max=%d", analyzer.calls, executor.calls, executor.maxActive)
+	}
+}
+
+func TestRiskPolicyWarnAndOffDoNotRequireApproval(t *testing.T) {
+	for _, mode := range []string{"warn", "off"} {
+		t.Run(mode, func(t *testing.T) {
+			now := func() time.Time { return time.Now() }
+			analyzer := &countingAnalyzer{analysis: policy.Analysis{Categories: []policy.Category{policy.NetworkIdentity}}}
+			executor := &concurrentExecutor{}
+			service, err := NewService(ServiceOptions{Secrets: memorySecrets{servers: map[string]vault.ServerSecret{"prod": {Host: "hidden", Port: 22, User: "hidden", Password: []byte("secret"), HostFingerprint: "SHA256:test"}}}, Analyzer: analyzer, Approvals: approval.NewStore(now, rand.Reader), Executor: executor, Redactor: realOutputRedactor{}, Auditor: &fakeAudit{}, Now: now, DefaultTimeout: time.Second, DefaultMaxOutput: 4096, RiskPolicy: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := service.Execute(context.Background(), model.ExecuteRequest{ServerAlias: "prod", Command: "ip route"})
+			if result.Status != model.StatusCompleted {
+				t.Fatalf("result=%#v", result)
+			}
+			wantCalls := 1
+			if mode == "off" {
+				wantCalls = 0
+			}
+			if analyzer.calls != wantCalls {
+				t.Fatalf("analyzer calls=%d want=%d", analyzer.calls, wantCalls)
+			}
+		})
+	}
+}
+
 type observingApprovalStore struct {
 	inner           *approval.Store
 	revokeErr       error
@@ -221,10 +306,9 @@ func TestServiceExecuteSensitiveCommandCreatesApprovalWithoutSSH(t *testing.T) {
 	if got.Status != model.StatusRequiresApproval || executor.calls != 0 || got.Approval == nil {
 		t.Fatal(got)
 	}
-	wantConfirmation := "允许 " + got.Approval.Code
-	if !strings.Contains(got.Approval.Message, wantConfirmation) ||
+	if !strings.Contains(got.Approval.Message, "local approval") ||
 		!strings.Contains(got.Approval.Message, string(policy.NetworkIdentity)) {
-		t.Fatalf("approval message = %q, want confirmation %q and risk category", got.Approval.Message, wantConfirmation)
+		t.Fatalf("approval = %#v, want local approval metadata", got.Approval)
 	}
 	for _, sensitive := range []string{"secret-host", "root", "password-value", "SHA256:fixture", "ip route"} {
 		if strings.Contains(got.Approval.Message, sensitive) {

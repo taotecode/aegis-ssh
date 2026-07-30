@@ -1,6 +1,7 @@
 package approval
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -40,20 +41,23 @@ type ExecutionLimits struct {
 // Approval is a snapshot of an approval request. Command and Categories are
 // copied on input and output, so callers cannot mutate store-owned state.
 type Approval struct {
-	ID          string
-	Code        string
-	ServerAlias string
-	Command     []byte
-	Categories  []policy.Category
-	Limits      ExecutionLimits
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
-	Used        bool
+	ID            string
+	Code          string
+	ServerAlias   string
+	ServerAliases []string
+	Command       []byte
+	Categories    []policy.Category
+	Limits        ExecutionLimits
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	Used          bool
 }
 
 type storedApproval struct {
 	Approval
-	used bool
+	used     bool
+	decision string
+	done     chan struct{}
 }
 
 type Store struct {
@@ -71,7 +75,12 @@ func NewStore(now func() time.Time, random io.Reader) *Store {
 
 // Create records a single-use approval with the default five-minute TTL.
 func (s *Store) Create(serverAlias string, command []byte, categories []policy.Category, limits ExecutionLimits) (Approval, error) {
-	if s == nil || s.now == nil || s.random == nil || serverAlias == "" || len(command) == 0 || len(command) > maxCommandBytes ||
+	return s.CreateBatch([]string{serverAlias}, command, categories, limits)
+}
+
+func (s *Store) CreateBatch(serverAliases []string, command []byte, categories []policy.Category, limits ExecutionLimits) (Approval, error) {
+	serverAliases = normalizeAliases(serverAliases)
+	if s == nil || s.now == nil || s.random == nil || len(serverAliases) == 0 || len(command) == 0 || len(command) > maxCommandBytes ||
 		limits.Timeout <= 0 || limits.Timeout > maxTimeout || limits.MaxOutputBytes <= 0 || limits.MaxOutputBytes > maxOutputBytes {
 		return Approval{}, ErrInvalidInput
 	}
@@ -97,17 +106,129 @@ func (s *Store) Create(serverAlias string, command []byte, categories []policy.C
 	}
 	createdAt := s.now()
 	approval := Approval{
-		ID:          id,
-		Code:        code,
-		ServerAlias: serverAlias,
-		Command:     append([]byte(nil), command...),
-		Categories:  normalizeCategories(categories),
-		Limits:      limits,
-		CreatedAt:   createdAt,
-		ExpiresAt:   createdAt.Add(defaultTTL),
+		ID:            id,
+		Code:          code,
+		ServerAlias:   serverAliases[0],
+		ServerAliases: append([]string(nil), serverAliases...),
+		Command:       append([]byte(nil), command...),
+		Categories:    normalizeCategories(categories),
+		Limits:        limits,
+		CreatedAt:     createdAt,
+		ExpiresAt:     createdAt.Add(defaultTTL),
 	}
-	s.items[id] = storedApproval{Approval: cloneApproval(approval)}
+	s.items[id] = storedApproval{Approval: cloneApproval(approval), done: make(chan struct{})}
 	return cloneApproval(approval), nil
+}
+
+func (s *Store) List(includeCommand bool) []Approval {
+	if s == nil || s.now == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(s.now(), "")
+	result := make([]Approval, 0, len(s.items))
+	for _, item := range s.items {
+		if item.used {
+			continue
+		}
+		copy := cloneApproval(item.Approval)
+		if !includeCommand {
+			zeroBytes(copy.Command)
+			copy.Command = nil
+		}
+		copy.Used = item.decision != ""
+		result = append(result, copy)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
+	return result
+}
+
+func (s *Store) Get(id string) (Approval, string, error) {
+	if s == nil || id == "" {
+		return Approval{}, "", ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.items[id]
+	if !ok {
+		return Approval{}, "", ErrNotFound
+	}
+	return cloneApproval(item.Approval), item.decision, nil
+}
+
+func (s *Store) Decide(id string, allow bool) error {
+	if s == nil || id == "" {
+		return ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.items[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if !s.now().Before(item.ExpiresAt) {
+		zeroBytes(item.Command)
+		delete(s.items, id)
+		return ErrExpired
+	}
+	if item.decision != "" || item.used {
+		return ErrUsed
+	}
+	if allow {
+		item.decision = "approved"
+	} else {
+		item.decision = "denied"
+	}
+	close(item.done)
+	s.items[id] = item
+	return nil
+}
+
+func (s *Store) Wait(ctx context.Context, id string) (Approval, bool, error) {
+	s.mu.Lock()
+	item, ok := s.items[id]
+	if !ok {
+		s.mu.Unlock()
+		return Approval{}, false, ErrNotFound
+	}
+	done := item.done
+	expiresAt := item.ExpiresAt
+	s.mu.Unlock()
+	timer := time.NewTimer(time.Until(expiresAt))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return Approval{}, false, ctx.Err()
+	case <-done:
+	case <-timer.C:
+		s.mu.Lock()
+		if expired, exists := s.items[id]; exists {
+			zeroBytes(expired.Command)
+			delete(s.items, id)
+		}
+		s.mu.Unlock()
+		return Approval{}, false, ErrExpired
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok = s.items[id]
+	if !ok {
+		return Approval{}, false, ErrNotFound
+	}
+	if item.decision == "denied" {
+		zeroBytes(item.Command)
+		delete(s.items, id)
+		return Approval{}, false, nil
+	}
+	if item.decision != "approved" {
+		return Approval{}, false, ErrNotFound
+	}
+	approved := cloneApproval(item.Approval)
+	approved.Used = true
+	zeroBytes(item.Command)
+	delete(s.items, id)
+	return approved, true, nil
 }
 
 // Consume validates and atomically marks an approval as used.
@@ -219,7 +340,24 @@ func normalizeCategories(categories []policy.Category) []policy.Category {
 func cloneApproval(approval Approval) Approval {
 	approval.Command = append([]byte(nil), approval.Command...)
 	approval.Categories = append([]policy.Category(nil), approval.Categories...)
+	approval.ServerAliases = append([]string(nil), approval.ServerAliases...)
 	return approval
+}
+
+func normalizeAliases(aliases []string) []string {
+	seen := make(map[string]struct{}, len(aliases))
+	result := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		if alias == "" {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		result = append(result, alias)
+	}
+	return result
 }
 
 func zeroBytes(data []byte) {

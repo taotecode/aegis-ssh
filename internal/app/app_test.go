@@ -116,7 +116,8 @@ func TestServerLifecycleDoesNotExposeConnectionValues(t *testing.T) {
 			}
 			return append([]byte(nil), privateKey...), nil
 		},
-		BrokerClient: func(string) app.BrokerClient { return unavailableBroker{} },
+		TestConnection: func(context.Context, vault.ServerSecret) error { return nil },
+		BrokerClient:   func(string) app.BrokerClient { return unavailableBroker{} },
 	})
 
 	commands := [][]string{
@@ -180,6 +181,7 @@ func TestAddEncryptedPrivateKeyServerPromptsForPassphrase(t *testing.T) {
 		Root: root, Stdout: ioDiscard{}, Stderr: ioDiscard{}, OpenTerminal: queue.open,
 		HostKeyProbe:   fakeProbe{fingerprint: "SHA256:fixture"},
 		ReadPrivateKey: func(string) ([]byte, error) { return append([]byte(nil), privateKey...), nil },
+		TestConnection: func(context.Context, vault.ServerSecret) error { return nil },
 	})
 	if err := application.Run(context.Background(), []string{"init"}); err != nil {
 		t.Fatal(err)
@@ -198,7 +200,43 @@ func TestAddEncryptedPrivateKeyServerPromptsForPassphrase(t *testing.T) {
 	}
 }
 
+func TestAddServerConnectionFailureIsNotSaved(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".aegis-ssh")
+	master := "master fixture"
+	queue := &terminalQueue{terminals: []*fakeTerminal{
+		{secretAnswers: [][]byte{[]byte(master), []byte(master)}},
+		{
+			secretAnswers: [][]byte{[]byte(master), []byte("ssh-password")},
+			lineAnswers:   []string{"prod", "Production", "secret-host", "22", "root", "password", "TRUST"},
+		},
+	}}
+	application := app.New(app.Dependencies{
+		Root: root, Stdout: ioDiscard{}, Stderr: ioDiscard{}, OpenTerminal: queue.open,
+		HostKeyProbe: fakeProbe{fingerprint: "SHA256:fixture"},
+		TestConnection: func(context.Context, vault.ServerSecret) error {
+			return errors.New("authentication failed")
+		},
+		BrokerClient: func(string) app.BrokerClient { return unavailableBroker{} },
+	})
+	if err := application.Run(context.Background(), []string{"init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Run(context.Background(), []string{"server", "add"}); !errors.Is(err, app.ErrConnectionTest) {
+		t.Fatalf("server add error = %v", err)
+	}
+	cfg, err := config.Load(filepath.Join(root, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Servers["prod"]; ok {
+		t.Fatal("server was saved after its connection test failed")
+	}
+}
+
 func TestHelpAndUnavailableStatus(t *testing.T) {
+	t.Setenv("LC_ALL", "en_US.UTF-8")
+	t.Setenv("LC_MESSAGES", "")
+	t.Setenv("LANG", "en_US.UTF-8")
 	var output bytes.Buffer
 	application := app.New(app.Dependencies{
 		Root: filepath.Join(t.TempDir(), ".aegis-ssh"), Stdout: &output, Stderr: ioDiscard{},
@@ -247,6 +285,13 @@ func TestDaemonLockAndContextCancellation(t *testing.T) {
 				controller := app.New(app.Dependencies{Root: root, Stdout: ioDiscard{}, Stderr: ioDiscard{}})
 				if err := controller.Run(context.Background(), []string{"lock"}); err != nil {
 					t.Fatalf("lock = %v", err)
+				}
+				status, err := client.Status(context.Background())
+				if err != nil || !status.VaultLocked {
+					t.Fatalf("locked daemon status = %#v, %v", status, err)
+				}
+				if err := controller.Run(context.Background(), []string{"stop"}); err != nil {
+					t.Fatalf("stop = %v", err)
 				}
 			} else {
 				cancel()

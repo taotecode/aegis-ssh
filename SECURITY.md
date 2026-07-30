@@ -19,7 +19,7 @@ The broker cannot cryptographically prove that an approval reply came from a hum
 ## Operational Rules
 
 - Keep `~/.aegis-ssh`, backups, and the local user account private.
-- Stop the daemon with `aegis-ssh lock` when it is not needed.
+- Clear in-memory credentials with `aegis-ssh lock`; stop the process with `aegis-ssh stop` when it is not needed.
 - Verify host-key fingerprints through a trusted channel before enrollment.
 - Do not pass passwords, private keys, private-key paths, or passphrases through flags, environment variables, prompts, or MCP configuration.
 - Treat redaction markers as final; do not ask an agent to bypass them.
