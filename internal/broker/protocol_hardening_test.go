@@ -11,6 +11,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1018,7 +1019,7 @@ func closeUnixWrite(t *testing.T, connection net.Conn) {
 	if !ok {
 		t.Fatalf("connection type = %T, want *net.UnixConn", connection)
 	}
-	if err := unixConnection.CloseWrite(); err != nil {
+	if err := unixConnection.CloseWrite(); err != nil && !errors.Is(err, syscall.ENOTCONN) {
 		t.Fatal(err)
 	}
 }
