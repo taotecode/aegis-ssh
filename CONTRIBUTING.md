@@ -2,6 +2,8 @@
 
 Contributions are welcome when they keep credentials local, preserve the standard MCP boundary, and solve a concrete user workflow.
 
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Before opening an issue
 
 - Search existing issues first.
