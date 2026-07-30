@@ -1,6 +1,21 @@
 # 让 Agent 使用 Aegis SSH
 
-## v0.3 本机审批和批量执行
+> 使用公开服务器别名连接 Codex、Claude Code、Cursor、OpenClaw 和其他 MCP 客户端。
+
+[项目首页](../README.zh-CN.md) · [服务器配置](server-setup.zh-CN.md) · **Agent 使用** · [运维](operations.zh-CN.md) · [安全](../SECURITY.zh-CN.md) · [English](agent-usage.md)
+
+## 连接前检查
+
+| 检查项 | 命令 |
+| --- | --- |
+| Broker 已运行并解锁 | `aegis-ssh status` |
+| 公开别名已存在 | `aegis-ssh server list` |
+| Codex 已注册 MCP | `codex mcp list` |
+
+> [!CAUTION]
+> Agent 提示词中只能出现别名和命令。不得包含连接信息、凭据、主密码或恢复码。
+
+## 本机审批和批量执行
 
 使用 `aegis-ssh start` 启动后台 broker；登录服务启动后处于锁定状态时，运行 `aegis-ssh unlock`。默认 `enforce` 模式下，敏感 MCP 调用会等待用户在另一个本机终端处理：
 
@@ -12,15 +27,13 @@ aegis-ssh approval approve <id>   # 或 approval deny <id>
 
 Agent 不再转述或确认批准码。相同命令要在多台服务器执行时使用 `ssh_execute_batch`；有风险的批量请求会固定目标别名快照，并只需一次本机审批。
 
-[English](agent-usage.md) | 简体中文
-
 本文介绍添加一台或多台服务器后，如何让 AI Agent 使用 Aegis SSH。Agent 只能看到 `prod` 之类的公开别名；密码认证和私钥认证都由本地 broker 处理，对 Agent 的使用方式完全相同。
 
 ## MCP 与 Skill 的关系
 
 Aegis SSH 提供两种互补的 Agent 集成：
 
-- **MCP 是实际的工具传输层。** Agent 通过四个 MCP 工具查询 broker、列出别名、执行命令，以及完成已经由用户批准的命令。
+- **MCP 是实际的工具传输层。** Agent 通过四个 MCP 工具查询 broker、列出别名，以及对单个或多个别名执行命令。
 - **Skill 是行为说明。** 它指导支持 Skill 的 Agent 优先使用 MCP、只通过别名访问服务器、等待用户真实批准，并保留脱敏标记。
 
 Agent 要直接调用工具，必须配置 MCP。Skill 推荐安装，但不能替代 MCP。不支持 Skill 的客户端也可以只通过 MCP 使用 Aegis SSH。
@@ -94,18 +107,16 @@ Use Aegis SSH to run `cd /srv/app && git status --short` on staging.
 
 正常请求应使用以下流程：
 
-```text
-get_ssh_broker_status
-        |
-        v
-list_ssh_servers        （别名未知或需要确认时）
-        |
-        v
-ssh_execute
-        |
-        +--> completed：返回过滤后的输出
-        |
-        +--> 本机审批：工具等待用户在本地允许或拒绝
+```mermaid
+flowchart TD
+    A[get_ssh_broker_status] --> B{已知别名？}
+    B -- 否 --> C[list_ssh_servers]
+    B -- 是 --> D[ssh_execute / ssh_execute_batch]
+    C --> D
+    D --> E{需要审批？}
+    E -- 否 --> F[返回过滤后结果]
+    E -- 是 --> G[等待本机批准 / 拒绝]
+    G --> F
 ```
 
 四个 MCP 工具分别是：
@@ -152,3 +163,7 @@ $HOME/.local/bin/aegis-ssh mcp
 - 认证失败：停止 daemon，运行 `aegis-ssh server edit <alias>` 替换密码或私钥。
 - 审批失败：使用 `aegis-ssh approval list` 检查待办；过期后重新提出原始请求。
 - 输出被脱敏或截断：这是主动设置的数据披露边界，不是 MCP 传输故障。
+
+---
+
+[返回项目首页](../README.zh-CN.md) · [服务器配置](server-setup.zh-CN.md) · [运维参考](operations.zh-CN.md)

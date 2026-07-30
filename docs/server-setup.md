@@ -1,6 +1,23 @@
 # Add And Manage SSH Servers
 
-## v0.3 management commands
+> Enroll password or private-key servers without exposing connection details to an Agent.
+
+[README](../README.md) · **Server setup** · [Agent usage](agent-usage.md) · [Operations](operations.md) · [Security](../SECURITY.md) · [简体中文](server-setup.zh-CN.md)
+
+## At a glance
+
+| Goal | Command | Broker state |
+| --- | --- | --- |
+| Add a server | `aegis-ssh server add` | Stopped |
+| Inspect masked details | `aegis-ssh server show <alias>` | Any |
+| Test authentication | `aegis-ssh server test <alias>` | Any |
+| Edit or remove | `aegis-ssh server edit\|remove <alias>` | Stopped |
+| Reveal a stored password | `aegis-ssh server password <alias>` | Master password required |
+
+> [!IMPORTANT]
+> Run enrollment in a real terminal. Never place connection fields or credentials in command arguments, environment variables, MCP configuration, or Agent prompts.
+
+## Management commands
 
 `server add` is a six-step wizard. Press Enter to accept port `22` and the detected secure private key. The key contents are imported into the encrypted vault; the source path is never stored.
 
@@ -13,8 +30,6 @@ aegis-ssh server edit prod
 ```
 
 Stop the broker before changing server storage. `lock` intentionally keeps the broker process alive, so use `aegis-ssh stop` before add/edit/remove.
-
-English | [简体中文](server-setup.zh-CN.md)
 
 This guide covers initial vault setup, multiple servers, password and private-key authentication, host-key verification, connection testing, credential rotation, and server removal.
 
@@ -103,7 +118,7 @@ server key-prod added
 
 The private key file is read, parsed, and imported into the encrypted vault. The source path is not stored, and later SSH connections do not depend on the original file remaining present. A symlink, non-regular file, key with group/other permissions, invalid key, or file larger than 1 MiB is rejected.
 
-The command does not authenticate during enrollment. It first connects only far enough to discover the host key, asks you to verify and pin that key, and then stores the selected credential.
+The wizard first discovers the host key, asks you to verify and pin it, then tests SSH authentication with the supplied credential. The server is saved only when that test succeeds.
 
 ## 3. Add Multiple Servers
 
@@ -163,7 +178,7 @@ Codex can use the same alias after its MCP configuration is loaded. Refer only t
 Stop the daemon before making changes:
 
 ```bash
-aegis-ssh lock
+aegis-ssh stop
 ```
 
 Replace a server's description and all connection fields, including its authentication method, credential, and pinned host key:
@@ -195,3 +210,7 @@ Type the exact alias when prompted. Removal deletes the alias from both public c
 ## After Local Codex Installation
 
 Restart Codex so it discovers the newly installed Skill and MCP configuration. Run `aegis-ssh start`, then ask Codex to operate a server by alias, for example: `Use Aegis SSH to run uptime on prod.` See [Use Aegis SSH With Agents](agent-usage.md) for complete setup and prompt examples.
+
+---
+
+[Back to README](../README.md) · [Next: connect an Agent](agent-usage.md) · [Operations reference](operations.md)

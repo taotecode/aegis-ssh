@@ -1,6 +1,21 @@
 # Use Aegis SSH With Agents
 
-## v0.3 local approval and batching
+> Connect Codex, Claude Code, Cursor, OpenClaw, and other MCP clients using public server aliases only.
+
+[README](../README.md) · [Server setup](server-setup.md) · **Agent usage** · [Operations](operations.md) · [Security](../SECURITY.md) · [简体中文](agent-usage.zh-CN.md)
+
+## Before you connect
+
+| Check | Command |
+| --- | --- |
+| Broker is running and unlocked | `aegis-ssh status` |
+| Public alias exists | `aegis-ssh server list` |
+| MCP is registered in Codex | `codex mcp list` |
+
+> [!CAUTION]
+> Put only aliases and commands in Agent prompts. Never include connection fields, credentials, a master password, or a recovery code.
+
+## Local approval and batching
 
 Start the broker with `aegis-ssh start`; if a login service started it in locked state, run `aegis-ssh unlock`. In the default `enforce` mode a sensitive MCP call waits while the user handles the request in another local terminal:
 
@@ -12,15 +27,13 @@ aegis-ssh approval approve <id>   # or: approval deny <id>
 
 The agent is never asked to relay or confirm an approval code. Use `ssh_execute_batch` for one command across explicit aliases or all aliases; a risky batch is bound to one immutable target snapshot and needs one local approval.
 
-English | [简体中文](agent-usage.zh-CN.md)
-
 This guide explains how an AI Agent uses Aegis SSH after one or more servers have been enrolled. Agents see only public aliases such as `prod`; password and private-key authentication are handled locally by the broker and are identical from the Agent's perspective.
 
 ## MCP And Skill
 
 Aegis SSH provides two complementary integrations:
 
-- **MCP is the tool transport.** It gives the Agent four callable tools for checking the broker, listing aliases, executing a command, and completing a user-approved command.
+- **MCP is the tool transport.** It gives the Agent four callable tools for checking the broker, listing aliases, and executing commands on one or many aliases.
 - **The Skill is behavioral guidance.** It tells a compatible Agent to use those MCP tools safely, address servers only by alias, wait for real user approval, and preserve redaction markers.
 
 MCP is required for direct tool calls. The Skill is recommended but does not replace MCP. Clients without Skill support can still use Aegis SSH through MCP.
@@ -94,18 +107,16 @@ Password and private-key servers are used in exactly the same way. The Agent doe
 
 For a normal request, the Agent should use this flow:
 
-```text
-get_ssh_broker_status
-        |
-        v
-list_ssh_servers        (when the alias is unknown or must be checked)
-        |
-        v
-ssh_execute
-        |
-        +--> completed: return filtered output
-        |
-        +--> local approval: the call waits while the user approves or denies locally
+```mermaid
+flowchart TD
+    A[get_ssh_broker_status] --> B{Alias known?}
+    B -- No --> C[list_ssh_servers]
+    B -- Yes --> D[ssh_execute / ssh_execute_batch]
+    C --> D
+    D --> E{Approval required?}
+    E -- No --> F[Return filtered result]
+    E -- Yes --> G[Wait for local approve / deny]
+    G --> F
 ```
 
 The four MCP tools are:
@@ -152,3 +163,7 @@ Clients that support reusable Skills can load `skills/aegis-ssh`. Clients withou
 - Authentication fails: stop the daemon and run `aegis-ssh server edit <alias>` to replace the password or private key.
 - Approval fails: inspect pending requests with `aegis-ssh approval list` and retry the original request after an expiry.
 - Output is redacted or truncated: this is an intentional disclosure boundary, not an MCP transport failure.
+
+---
+
+[Back to README](../README.md) · [Server setup](server-setup.md) · [Operations reference](operations.md)

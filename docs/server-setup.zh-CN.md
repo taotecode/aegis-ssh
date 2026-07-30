@@ -1,6 +1,23 @@
 # 添加和管理 SSH 服务器
 
-## v0.3 管理命令
+> 在不向 Agent 暴露连接信息的前提下，添加密码或私钥认证服务器。
+
+[项目首页](../README.zh-CN.md) · **服务器配置** · [Agent 使用](agent-usage.zh-CN.md) · [运维](operations.zh-CN.md) · [安全](../SECURITY.zh-CN.md) · [English](server-setup.md)
+
+## 快速查表
+
+| 目标 | 命令 | Broker 状态 |
+| --- | --- | --- |
+| 添加服务器 | `aegis-ssh server add` | 已停止 |
+| 查看脱敏详情 | `aegis-ssh server show <别名>` | 任意 |
+| 测试认证 | `aegis-ssh server test <别名>` | 任意 |
+| 编辑或删除 | `aegis-ssh server edit\|remove <别名>` | 已停止 |
+| 查看已存密码 | `aegis-ssh server password <别名>` | 需验证主密码 |
+
+> [!IMPORTANT]
+> 必须在真实终端中执行添加流程。不得将连接信息或凭据放入命令参数、环境变量、MCP 配置或 Agent 提示词。
+
+## 管理命令
 
 `server add` 现在是六步交互向导。SSH 端口直接回车使用默认值 `22`；程序会自动发现权限安全的 `~/.ssh/id_ed25519`、`id_ecdsa` 或 `id_rsa`。私钥内容导入加密 vault，源路径不会保存。
 
@@ -13,8 +30,6 @@ aegis-ssh server edit prod
 ```
 
 修改本地服务器存储前运行 `aegis-ssh stop`。`lock` 现在只清除内存凭据并保持 broker 运行。
-
-[English](server-setup.md) | 简体中文
 
 本文介绍首次初始化 vault、添加多台服务器、密码和私钥认证、校验主机密钥、测试连接、轮换凭据和删除服务器的完整流程。
 
@@ -103,7 +118,7 @@ server key-prod added
 
 程序会读取并解析私钥，然后把私钥内容导入加密 vault。程序不会保存原始路径，后续 SSH 连接也不依赖原文件继续存在。符号链接、非普通文件、组或其他用户拥有权限的文件、无效私钥以及超过 1 MiB 的文件都会被拒绝。
 
-添加服务器时，程序不会执行认证。它只会先建立足以获取主机密钥的连接，要求你核对并固定该密钥，然后保存选定的凭据。
+向导会先获取主机密钥，要求你核对并固定，然后使用所填凭据测试 SSH 认证。只有测试成功才会保存服务器。
 
 ## 3. 添加多台服务器
 
@@ -163,7 +178,7 @@ Codex 加载 MCP 配置后也可以使用同一个别名。与 Agent 对话时�
 修改前先停止 daemon：
 
 ```bash
-aegis-ssh lock
+aegis-ssh stop
 ```
 
 替换服务器描述和全部连接字段，包括认证方式、凭据及已固定的主机密钥：
@@ -195,3 +210,7 @@ aegis-ssh server remove prod
 ## 本机 Codex 安装完成后
 
 重新启动 Codex，使其发现新安装的 Skill 和 MCP 配置。运行 `aegis-ssh start` 后即可关闭终端，然后通过别名让 Codex 操作服务器，例如：`使用 Aegis SSH 在 prod 上执行 uptime。` 完整配置和提示词示例见[让 Agent 使用 Aegis SSH](agent-usage.zh-CN.md)。
+
+---
+
+[返回项目首页](../README.zh-CN.md) · [下一步：连接 Agent](agent-usage.zh-CN.md) · [运维参考](operations.zh-CN.md)

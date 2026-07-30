@@ -1,36 +1,66 @@
 # Security
 
-English | [简体中文](SECURITY.zh-CN.md)
+> Aegis SSH isolates SSH credentials from normal AI-agent interfaces. It does not turn arbitrary remote shell access into a sandbox.
 
-## Boundary
+[README](README.md) · [Server setup](docs/server-setup.md) · [Agent usage](docs/agent-usage.md) · [Operations](docs/operations.md) · **Security** · [简体中文](SECURITY.zh-CN.md)
 
-Aegis SSH protects password- and private-key-based connection details from normal AI-agent interfaces. Credentials are encrypted at rest, entered or imported through `/dev/tty`, held by the daemon, and omitted from MCP schemas, CLI arguments, logs, and public result types. Imported private-key contents and passphrases are encrypted in the vault; the source key path is not stored. SSH host keys are pinned and checked on every connection.
+## Security boundary
 
-This is credential isolation and best-effort disclosure control, not a remote shell sandbox.
+| Protected by Aegis SSH | Outside the guarantee |
+| --- | --- |
+| Credentials encrypted at rest | A determined Agent with arbitrary shell access |
+| Secrets entered through `/dev/tty` | Malicious code running as the same OS user |
+| No connection secrets in MCP schemas or CLI arguments | A compromised local host or SSH server |
+| Pinned SSH host keys checked on every connection | Data encoded to evade static analysis or redaction |
+| Local approval, output filtering, and audit records | Recovery from a lost password without prior recovery setup |
 
-## Accepted Limitations
+Imported private-key contents and passphrases are encrypted in the vault; the source key path is not stored. The daemon owns decrypted credentials and uses them for SSH authentication. Agents receive public aliases and filtered results.
 
-An agent allowed to execute arbitrary remote shell can construct commands that evade static analysis or encode sensitive data in forms the output filter does not recognize. Approval and redaction reduce accidental disclosure; they cannot guarantee containment against a determined command author.
+> [!IMPORTANT]
+> This is credential isolation and best-effort disclosure control, not a remote shell sandbox.
 
-A malicious process running as the same local OS user can inspect process memory, interact with the user's Unix socket, trace the daemon, or modify the user's files. Use a separate OS account or stronger host isolation when defending against same-user local code.
+## Accepted limitations
 
-The broker cannot cryptographically prove that an approval reply came from a human. The companion Skill requires agents to wait for the user's exact reply, and the audit log records approval lifecycle events.
+An Agent allowed to execute arbitrary remote shell can construct commands that evade static analysis or encode sensitive data in forms the output filter does not recognize. Local approval and redaction reduce accidental disclosure; they cannot guarantee containment against a determined command author.
 
-## Operational Rules
+A malicious process running as the same local OS user may inspect process memory, interact with the Unix socket, trace the daemon, or modify user files. Use a separate OS account or stronger host isolation when defending against same-user local code.
 
-- Keep `~/.aegis-ssh`, backups, and the local user account private.
-- Clear in-memory credentials with `aegis-ssh lock`; stop the process with `aegis-ssh stop` when it is not needed.
-- Verify host-key fingerprints through a trusted channel before enrollment.
-- Do not pass passwords, private keys, private-key paths, or passphrases through flags, environment variables, prompts, or MCP configuration.
-- Treat redaction markers as final; do not ask an agent to bypass them.
-- Back up `config.yaml` and `vault.enc` together while the daemon is stopped.
+Local approval prevents the Agent from self-approving through MCP, but it cannot prove who controls the local terminal. Protect the local account and review the exact alias, risk categories, and command before approval.
 
-## Safe Diagnostics
+## Operational rules
 
-Share only the output of `aegis-ssh status`, public aliases from `aegis-ssh server list`, error codes, and audit lines reviewed to contain only aliases, command hashes/previews, decisions, and redaction counts. Preserve every redaction marker.
+- Protect `~/.aegis-ssh`, timestamped recovery archives, backups, recovery codes, and the local user account.
+- Run `aegis-ssh lock` to clear in-memory credentials; run `aegis-ssh stop` when the broker is not needed.
+- Verify host-key fingerprints through an independent trusted channel before enrollment.
+- Never pass credentials or recovery material through flags, environment variables, Agent prompts, MCP configuration, tickets, or chat.
+- Treat every `[REDACTED:...]` marker and truncation warning as final.
+- Back up `config.yaml`, `vault.enc`, and `recovery.enc` together while the broker is stopped.
+- Use `server password <alias>` only in a private terminal; terminal recording and clipboard tools may capture the displayed password.
 
-Never share `vault.enc`, master or SSH passwords, private keys, private-key passphrases or source paths, process memory/core dumps, socket traffic, terminal recordings from enrollment, or raw remote output that triggered approval. Remove private aliases and command previews from public reports when they identify infrastructure or workloads.
+## Safe diagnostics
 
-## Reporting
+| Usually safe after review | Never share |
+| --- | --- |
+| `aegis-ssh status` | `vault.enc`, `recovery.enc`, or archived vault files |
+| Public aliases from `server list` | Master, recovery, SSH, or private-key passwords |
+| Stable error codes | Private keys, passphrases, or source paths |
+| Reviewed operational log records | Process memory, core dumps, debugger output, or socket traffic |
+| Sanitized audit metadata | Enrollment/password-reveal terminal recordings |
+| Preserved redaction markers | Raw remote output that triggered sensitive approval |
 
-Do not publish suspected vulnerabilities with real credentials, hostnames, addresses, audit records, or vault files. Open a private maintainer contact first when one is available; otherwise open a minimal public issue containing only sanitized reproduction steps and request a private channel.
+Private aliases and command previews may still identify infrastructure or workloads. Remove them from public reports when necessary.
+
+## Vulnerability reporting
+
+Do not publish real credentials, hosts, addresses, audit records, recovery codes, or vault files in an issue. Open a minimal public issue containing only sanitized reproduction steps and ask the maintainers for a private reporting channel.
+
+Include:
+
+- affected version and operating system;
+- sanitized reproduction steps;
+- expected and observed security behavior;
+- whether the issue is reproducible without real infrastructure.
+
+---
+
+[Back to README](README.md) · [Operations reference](docs/operations.md)
