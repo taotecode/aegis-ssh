@@ -1,195 +1,172 @@
+<div align="center">
+
 # Aegis SSH
 
-English | [简体中文](README.zh-CN.md)
+### Let AI agents operate your servers without handing over your SSH secrets.
 
-> **Give AI agents SSH access without giving them your SSH secrets.**
+[![CI](https://github.com/taotecode/aegis-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/taotecode/aegis-ssh/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/taotecode/aegis-ssh?display_name=tag&sort=semver)](https://github.com/taotecode/aegis-ssh/releases/latest)
+[![License](https://img.shields.io/github/license/taotecode/aegis-ssh)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-24292f)](#installation)
 
-Aegis SSH is a local privacy firewall between AI agents and your servers. Agents see aliases such as `prod`; passwords, imported private keys, hosts, usernames, fingerprints, and master-password material stay outside prompts, MCP parameters, logs, environment variables, and process arguments.
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Security](#security-boundary) · [Documentation](#documentation) · [简体中文](README.zh-CN.md)
 
-It is one Go binary for macOS and Linux. Agents use public aliases through standard MCP; the background broker owns the decrypted vault and performs SSH authentication with the Go SSH library.
+</div>
 
-## Install
+---
 
-Build and install locally:
+AI coding agents are useful on remote servers, but putting an SSH password, private key, host, or username into a prompt or MCP configuration creates a new disclosure path. **Aegis SSH keeps those details in a local encrypted vault and gives the agent only a public alias such as `prod`.**
+
+The agent asks Aegis SSH to run a command. A local broker authenticates, evaluates risk, requests local approval when needed, filters output, and records an audit trail. Credentials never become tool arguments or model context.
+
+## What stays private
+
+| The agent can see | The local broker keeps |
+| --- | --- |
+| Public aliases and descriptions | Hosts, ports, usernames, and host fingerprints |
+| Exact command it requested | SSH passwords and imported private keys |
+| Filtered stdout/stderr | Private-key passphrases and master-password material |
+| Risk result and redaction markers | Encrypted vault contents and recovery material |
+
+## Highlights
+
+- **Credential isolation** - password and private-key authentication stay behind a local Unix socket.
+- **Local approval** - risky requests wait for `approval approve|deny`; no approval codes pollute agent chat.
+- **Three risk modes** - choose `enforce`, `warn`, or `off` without disabling credential isolation, host-key checks, or audit.
+- **Fleet execution** - run one command concurrently across named aliases or every configured server.
+- **Background lifecycle** - `start`, `stop`, `lock`, `unlock`, status reporting, and optional launchd/systemd login service.
+- **Operational visibility** - structured JSONL logs, configurable levels, bounded output, redaction, and audit records.
+- **Recovery and local reveal** - opt in to an offline recovery code; reveal a stored server password only after local master-password verification.
+- **One portable binary** - macOS and Linux builds for amd64 and arm64, with English and Chinese CLI output.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[AI Agent] -->|alias + command| M[Standard MCP]
+    M --> B[Aegis SSH broker]
+    U[Local user] -->|unlock / approve| B
+    V[(Encrypted vault)] -->|credentials stay local| B
+    B -->|Go SSH client| S[SSH server]
+    S -->|command output| B
+    B -->|filtered result| A
+```
+
+The broker is deliberately small: one Go binary owns the decrypted vault and SSH connections. MCP clients receive aliases and filtered command results, never connection fields.
+
+## Quick start
+
+### 1. Installation
+
+Download a package from [GitHub Releases](https://github.com/taotecode/aegis-ssh/releases/latest), extract it, and run:
 
 ```bash
+scripts/install.sh --binary ./aegis-ssh --skill-dir "$HOME/.codex/skills"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Or build directly from source (Go 1.25+):
+
+```bash
+git clone https://github.com/taotecode/aegis-ssh.git
+cd aegis-ssh
 scripts/install.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Install a packaged binary and the companion Skill explicitly:
+The installer does not initialize or read `~/.aegis-ssh`.
 
-```bash
-scripts/install.sh --binary ./aegis-ssh --skill-dir "$HOME/.codex/skills"
-```
-
-The installer never initializes or reads `~/.aegis-ssh`.
-
-## Initialize
-
-Create encrypted local storage and choose a master password:
+### 2. Enroll a server
 
 ```bash
 aegis-ssh init
-```
-
-Run `server add` once for each server. Every server gets a unique public alias, so the same vault can hold `prod`, `staging`, `db-primary`, and any other servers you add.
-
-```bash
 aegis-ssh server add
-aegis-ssh server list
+aegis-ssh server test <alias>
+aegis-ssh recovery enable   # store the displayed code offline
 ```
 
-Enable recovery while you still know the master password, then store the one-time displayed recovery code offline:
+Enrollment is an interactive six-step wizard. Port `22` and common private-key paths have sensible defaults. Connection fields and credentials are read only from `/dev/tty`; verify the presented host-key fingerprint through a trusted channel before accepting it.
 
-```bash
-aegis-ssh recovery enable
-aegis-ssh recovery restore  # reset a forgotten master password without losing servers
-```
-
-Vaults created before recovery was enabled cannot be decrypted after the master password is lost. `aegis-ssh recovery reset` archives the old encrypted files and creates a new empty vault.
-
-Password authentication prompts:
-
-```text
-Master password: [hidden]
-Alias: prod
-Description: Production application server
-Host: <server-host>
-Port: 22
-User: <ssh-user>
-Authentication method (password/private-key): password
-Host key fingerprint: SHA256:<fingerprint>
-Type TRUST to pin this host key: TRUST
-SSH password: [hidden]
-```
-
-Private-key authentication uses the same fields, but select `private-key`:
-
-```text
-Authentication method (password/private-key): private-key
-Host key fingerprint: SHA256:<fingerprint>
-Type TRUST to pin this host key: TRUST
-Private key file: ~/.ssh/id_ed25519
-Private key passphrase: [hidden, prompted only when the key is encrypted]
-```
-
-The private key file is read locally, validated, and imported into `vault.enc`; its path is not stored. All connection fields are read from `/dev/tty`. Verify the displayed host-key fingerprint through a trusted channel before typing `TRUST`.
-
-See [Add And Manage SSH Servers](docs/server-setup.md) for multiple-server examples, every prompt, key-file requirements, trusted host-key verification, credential rotation, removal, and troubleshooting.
-
-Edit or remove an alias only while the daemon is stopped:
-
-```bash
-aegis-ssh server edit prod
-aegis-ssh server remove prod
-```
-
-## Background operation
-
-Start the broker, unlock it, and then close the terminal:
+### 3. Start the broker
 
 ```bash
 aegis-ssh start
-```
-
-From another terminal:
-
-```bash
 aegis-ssh status
-aegis-ssh exec prod -- 'uptime'
-aegis-ssh exec prod -- 'cd /srv/app && git status --short'
 ```
 
-Quote the complete command after `--`. Commands selected by the default `enforce` risk policy wait for approval in the local approval center; approval codes no longer enter agent chat.
+Enter the master password at the hidden prompt. The terminal can be closed after startup.
 
-```bash
-aegis-ssh lock
-aegis-ssh unlock
-aegis-ssh stop
-```
+### 4. Connect an agent
 
-Use `aegis-ssh service install` for an optional launchd/systemd user service. It starts locked and never stores the master password.
-
-## Risk policy, batching, and logs
-
-```bash
-aegis-ssh config set risk-policy enforce  # enforce | warn | off
-aegis-ssh config set log-level debug      # debug | info | warn | error | off
-aegis-ssh approval list
-aegis-ssh exec --servers prod,staging -- 'uptime'
-aegis-ssh exec --all -- 'df -h'
-```
-
-Credential isolation, host-key verification, audit logging, and output redaction remain active in every risk mode. Operational logs are available with `aegis-ssh log path`, `aegis-ssh log show`, and `aegis-ssh log follow`.
-
-## MCP
-
-Every supported client launches the same stdio server:
-
-```text
-aegis-ssh mcp
-```
-
-Register it in Codex with the installed binary's absolute path:
+Register the installed MCP server in Codex:
 
 ```bash
 codex mcp add aegis-ssh -- "$HOME/.local/bin/aegis-ssh" mcp
 codex mcp list
 ```
 
-Restart Codex after installing or updating the MCP configuration or Skill.
-
-Copy the matching example from `examples/mcp/` into the client's MCP configuration:
-
-- `codex.toml`
-- `claude-code.json`
-- `cursor.json`
-- `openclaw.json`
-
-The tools are `get_ssh_broker_status`, `list_ssh_servers`, `ssh_execute`, and `ssh_execute_batch`. They expose aliases and filtered command results, never connection fields.
-
-Install `skills/aegis-ssh` into the agent's Skill directory or point the client at that directory. The Skill tells agents to prefer MCP, wait for real user approval, and preserve redaction markers.
-
-After running `aegis-ssh start`, ask the Agent by alias:
+Restart Codex, then ask by alias:
 
 ```text
-Use Aegis SSH to list the configured servers.
-Use Aegis SSH to run uptime on prod.
-Use Aegis SSH to run `cd /srv/app && git status --short` on staging.
+Use Aegis SSH to run `uptime` on prod.
+Use Aegis SSH to run `df -h` on prod and staging.
 ```
 
-See [Use Aegis SSH With Agents](docs/agent-usage.md) for Codex setup, the MCP/Skill relationship, tool-call flow, prompt examples, approvals, and troubleshooting.
+Examples for Codex, Claude Code, Cursor, and OpenClaw are under [`examples/mcp/`](examples/mcp/).
 
-## Storage And Operations
+## Everyday commands
 
-State is stored under `~/.aegis-ssh/` with private permissions:
+```bash
+# Lifecycle
+aegis-ssh start
+aegis-ssh lock
+aegis-ssh unlock
+aegis-ssh stop
 
-- `config.yaml`: aliases, descriptions, limits, and policy settings only
-- `vault.enc`: encrypted connection details and pinned host keys
-- `audit/audit.jsonl`: bounded command metadata, decisions, and redaction counts
-- `run/aegis.sock`: local user-owned broker socket while the daemon runs
+# Server management
+aegis-ssh server list
+aegis-ssh server show prod
+aegis-ssh server edit prod
+aegis-ssh server password prod     # master password required; /dev/tty only
 
-Back up `config.yaml` and `vault.enc` together while the daemon is stopped. Keep the backup private. The master password is not recoverable; losing it makes the vault unusable.
+# Execution
+aegis-ssh exec prod -- 'uptime'
+aegis-ssh exec --servers prod,staging -- 'df -h'
+aegis-ssh exec --all -- 'uname -a'
 
-Rotate a server password or replace a private key with `aegis-ssh server edit <alias>`, then run `aegis-ssh start`. Reconfirm the host key only against a trusted source.
+# Policy, approvals, and diagnostics
+aegis-ssh config set risk-policy enforce   # enforce | warn | off
+aegis-ssh config set log-level info        # debug | info | warn | error | off
+aegis-ssh approval list
+aegis-ssh log follow
+```
 
-To reveal a password-authenticated server's password locally, run `aegis-ssh server password <alias>` and enter the master password. The password is written only to the controlling terminal, never MCP or redirected stdout.
+## Recovery
 
-## Troubleshooting
+Enable recovery **before** losing the master password and store the displayed recovery code offline:
 
-- `daemon: unavailable`: run `aegis-ssh start`.
-- `credential vault is locked` or storage failure at startup: verify the master password and private ownership/modes under `~/.aegis-ssh`.
-- Host-key verification failure: stop and investigate the server identity; do not bypass pinning.
-- Authentication failure: stop the daemon, run `server edit`, and enter the current password or import the current private key.
-- Server changes are refused: run `aegis-ssh stop`, then retry the management command.
-- Output contains `[REDACTED:...]`: the broker intentionally withheld sensitive data. Do not attempt to reconstruct it.
+```bash
+aegis-ssh recovery enable
+aegis-ssh recovery restore
+```
 
-## Releases
+`restore` resets the master password while preserving configured servers. A legacy vault without recovery cannot be decrypted after its master password is lost; `aegis-ssh recovery reset` archives the unreadable encrypted files and creates a new empty vault.
 
-Published versions and platform archives are available from [GitHub Releases](https://github.com/taotecode/aegis-ssh/releases).
+## Security boundary
 
-Maintainers release a version by adding a non-empty, bilingual `.github/releases/vX.Y.Z.md` file and pushing the matching `vX.Y.Z` tag. The Release workflow runs tests on macOS and Linux, builds all supported archives, verifies checksums, and publishes the GitHub Release. A missing release-notes file fails the workflow, so every published version has an explicit description.
+Aegis SSH provides credential isolation, pinned SSH host keys, local approvals, best-effort command-risk analysis, output redaction, and audit logging. It is **not a remote shell sandbox**. An agent allowed to execute arbitrary shell commands may evade static analysis or encode data in a form the output filter does not recognize.
+
+A malicious process running as the same local OS user may inspect process memory or interact with user-owned files and sockets. Use a separate OS account or stronger host isolation when that threat is in scope. Read [SECURITY.md](SECURITY.md) before production use.
+
+## Documentation
+
+| Guide | English | 简体中文 |
+| --- | --- | --- |
+| Add, edit, test, and remove servers | [Server setup](docs/server-setup.md) | [服务器配置](docs/server-setup.zh-CN.md) |
+| Configure Codex and other agents | [Agent usage](docs/agent-usage.md) | [Agent 使用指南](docs/agent-usage.zh-CN.md) |
+| Lifecycle, services, logs, and recovery | [Operations](docs/operations.md) | [运维指南](docs/operations.zh-CN.md) |
+| Threat model and disclosure policy | [Security](SECURITY.md) | [安全说明](SECURITY.zh-CN.md) |
 
 ## Development
 
@@ -200,8 +177,8 @@ go vet ./...
 scripts/package.sh ./dist
 ```
 
-See [SECURITY.md](SECURITY.md) for the security boundary and reporting policy. A complete Chinese translation is available in [SECURITY.zh-CN.md](SECURITY.zh-CN.md).
+Releases are built and checksum-verified by GitHub Actions for macOS and Linux on amd64 and arm64.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+[Apache License 2.0](LICENSE)
