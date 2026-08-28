@@ -75,15 +75,14 @@ func PermsOK(path string) error {
 }
 
 // WriteAtomic writes data to path via a same-directory temp file plus an
-// atomic replace, applying private permissions. On Windows the replace uses
-// MoveFileEx so an existing destination can be overwritten.
+// atomic replace, applying private permissions to the file itself. Missing
+// parent directories are created with 0700; an existing parent is not
+// forcibly re-chmodded (directory-mode enforcement is the job of
+// EnsurePrivateDir and doctor).
 func WriteAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create parent directory: %w", err)
-	}
-	if err := ensurePrivateDir(dir); err != nil {
-		return err
 	}
 	return writeAtomic(path, data)
 }
